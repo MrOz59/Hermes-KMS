@@ -30,6 +30,7 @@ The current code starts the real driver path:
 - simple display pipe;
 - GEM DMA helper base for future PRIME/DMA-BUF work;
 - Hermes/apps communication UAPI through DRM ioctls;
+- scanout/frame metadata tracking for future DMA-BUF export;
 - debug/control tool: `tools/hermes-kmsctl/hermes-kmsctl`;
 - 640x480 through 3840x2160 mode range, with 1920x1080 preferred;
 - no Hermes integration yet.
@@ -79,6 +80,16 @@ Initial ioctls:
 - `DRM_IOCTL_HERMES_KMS_SET_OUTPUT`
 
 This gives Hermes and diagnostic tools a stable driver contract before the final DMA-BUF frame export path exists.
+
+`GET_STATUS` now reports scanout/frame metadata:
+
+- frame sequence counter;
+- last update/enable/disable timestamps;
+- framebuffer ID;
+- framebuffer width/height;
+- DRM fourcc format;
+- modifier;
+- per-plane pitch/offset.
 
 ## Roadmap
 

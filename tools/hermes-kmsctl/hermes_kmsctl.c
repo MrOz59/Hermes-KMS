@@ -141,6 +141,10 @@ static int print_status(int fd)
 	       (status.flags & HERMES_KMS_STATUS_CONNECTED) ? "true" : "false");
 	printf("scanout_active=%s\n",
 	       (status.flags & HERMES_KMS_STATUS_SCANOUT_ACTIVE) ? "true" : "false");
+	printf("frame_valid=%s\n",
+	       (status.flags & HERMES_KMS_STATUS_FRAME_VALID) ? "true" : "false");
+	printf("dmabuf_export_ready=%s\n",
+	       (status.flags & HERMES_KMS_STATUS_DMABUF_EXPORT_READY) ? "true" : "false");
 	printf("connector_id=%u\n", status.connector_id);
 	printf("crtc_id=%u\n", status.crtc_id);
 	printf("plane_id=%u\n", status.plane_id);
@@ -153,6 +157,28 @@ static int print_status(int fd)
 	       status.active_width,
 	       status.active_height,
 	       status.active_refresh_hz);
+	printf("frame_sequence=%llu\n",
+	       (unsigned long long)status.frame_sequence);
+	printf("last_update_ns=%llu\n",
+	       (unsigned long long)status.last_update_ns);
+	printf("last_enable_ns=%llu\n",
+	       (unsigned long long)status.last_enable_ns);
+	printf("last_disable_ns=%llu\n",
+	       (unsigned long long)status.last_disable_ns);
+	printf("framebuffer_id=%u\n", status.framebuffer_id);
+	printf("framebuffer_size=%ux%u\n",
+	       status.framebuffer_width,
+	       status.framebuffer_height);
+	printf("framebuffer_format=0x%08x\n", status.framebuffer_format);
+	printf("framebuffer_modifier=0x%016llx\n",
+	       (unsigned long long)status.framebuffer_modifier);
+	printf("framebuffer_plane_count=%u\n", status.framebuffer_plane_count);
+	for (uint32_t i = 0; i < status.framebuffer_plane_count && i < 4; i++) {
+		printf("framebuffer_plane_%u_pitch=%u\n",
+		       i, status.framebuffer_pitch[i]);
+		printf("framebuffer_plane_%u_offset=%u\n",
+		       i, status.framebuffer_offset[i]);
+	}
 
 	return 0;
 }

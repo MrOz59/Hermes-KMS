@@ -52,6 +52,22 @@ This is deliberately small. It can be safely extended with append-only structs a
 - latency counters;
 - per-client ownership/session IDs.
 
+## Frame and scanout tracking
+
+The driver tracks the current simple-pipe framebuffer on every enable/update callback and exposes the metadata through `GET_STATUS`.
+
+Tracked fields include:
+
+- monotonically increasing frame sequence;
+- update/enable/disable timestamps from `ktime_get_ns()`;
+- framebuffer object ID;
+- framebuffer size;
+- DRM fourcc format;
+- modifier;
+- per-plane pitch and offset.
+
+This does not export a DMA-BUF yet. It creates the stable state model that the future export/acquire ioctl can use without changing the basic Hermes discovery path.
+
 ## Current status
 
 The current code is a first PoC skeleton. It is meant to compile and load as a DRM driver, not yet provide the final zero-copy path.

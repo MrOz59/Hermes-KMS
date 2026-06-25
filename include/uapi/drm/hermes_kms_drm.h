@@ -29,6 +29,8 @@ extern "C" {
 #define HERMES_KMS_STATUS_OUTPUT_ENABLED	(1ULL << 0)
 #define HERMES_KMS_STATUS_CONNECTED		(1ULL << 1)
 #define HERMES_KMS_STATUS_SCANOUT_ACTIVE	(1ULL << 2)
+#define HERMES_KMS_STATUS_FRAME_VALID		(1ULL << 3)
+#define HERMES_KMS_STATUS_DMABUF_EXPORT_READY	(1ULL << 4)
 
 struct drm_hermes_kms_version {
 	__u32 uapi_version;
@@ -52,6 +54,10 @@ struct drm_hermes_kms_caps {
 
 struct drm_hermes_kms_status {
 	__u64 flags;
+	__u64 frame_sequence;
+	__u64 last_update_ns;
+	__u64 last_enable_ns;
+	__u64 last_disable_ns;
 	__u32 connector_id;
 	__u32 crtc_id;
 	__u32 plane_id;
@@ -62,7 +68,15 @@ struct drm_hermes_kms_status {
 	__u32 active_width;
 	__u32 active_height;
 	__u32 active_refresh_hz;
-	__u32 reserved0;
+	__u32 framebuffer_id;
+	__u32 framebuffer_width;
+	__u32 framebuffer_height;
+	__u32 framebuffer_format;
+	__u32 framebuffer_plane_count;
+	__u32 framebuffer_pitch[4];
+	__u32 framebuffer_offset[4];
+	__u64 framebuffer_modifier;
+	__u64 reserved[8];
 };
 
 struct drm_hermes_kms_set_output {

@@ -9,6 +9,7 @@
 
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/ktime.h>
 #include <linux/platform_device.h>
 
 #include <drm/hermes_kms_drm.h>
@@ -19,6 +20,7 @@
 #include <drm/drm_edid.h>
 #include <drm/drm_file.h>
 #include <drm/drm_fourcc.h>
+#include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_managed.h>
@@ -54,6 +56,18 @@ struct hermes_kms_device {
 	u32 requested_width;
 	u32 requested_height;
 	u32 requested_refresh_hz;
+	u64 frame_sequence;
+	u64 last_update_ns;
+	u64 last_enable_ns;
+	u64 last_disable_ns;
+	u32 framebuffer_id;
+	u32 framebuffer_width;
+	u32 framebuffer_height;
+	u32 framebuffer_format;
+	u32 framebuffer_plane_count;
+	u32 framebuffer_pitch[4];
+	u32 framebuffer_offset[4];
+	u64 framebuffer_modifier;
 };
 
 static inline struct hermes_kms_device *to_hermes_kms(struct drm_device *drm)
@@ -65,6 +79,57 @@ static const u32 hermes_kms_formats[] = {
 	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_ARGB8888,
 };
+
+static void hermes_kms_clear_frame_locked(struct hermes_kms_device *hdev)
+{
+	hdev->framebuffer_id = 0;
+	hdev->framebuffer_width = 0;
+	hdev->framebuffer_height = 0;
+	hdev->framebuffer_format = 0;
+	hdev->framebuffer_plane_count = 0;
+	memset(hdev->framebuffer_pitch, 0, sizeof(hdev->framebuffer_pitch));
+	memset(hdev->framebuffer_offset, 0, sizeof(hdev->framebuffer_offset));
+	hdev->framebuffer_modifier = 0;
+}
+
+static void hermes_kms_track_frame(struct hermes_kms_device *hdev,
+				   struct drm_framebuffer *fb)
+{
+	unsigned int i;
+	unsigned int plane_count = 0;
+
+	mutex_lock(&hdev->state_lock);
+	hdev->frame_sequence++;
+	hdev->last_update_ns = ktime_get_ns();
+
+	if (!fb) {
+		hermes_kms_clear_frame_locked(hdev);
+		mutex_unlock(&hdev->state_lock);
+		return;
+	}
+
+	hdev->framebuffer_id = fb->base.id;
+	hdev->framebuffer_width = fb->width;
+	hdev->framebuffer_height = fb->height;
+	hdev->framebuffer_format = fb->format->format;
+	hdev->framebuffer_modifier = fb->modifier;
+
+	if (fb->format->num_planes > ARRAY_SIZE(hdev->framebuffer_pitch))
+		plane_count = ARRAY_SIZE(hdev->framebuffer_pitch);
+	else
+		plane_count = fb->format->num_planes;
+
+	hdev->framebuffer_plane_count = plane_count;
+	memset(hdev->framebuffer_pitch, 0, sizeof(hdev->framebuffer_pitch));
+	memset(hdev->framebuffer_offset, 0, sizeof(hdev->framebuffer_offset));
+
+	for (i = 0; i < plane_count; i++) {
+		hdev->framebuffer_pitch[i] = fb->pitches[i];
+		hdev->framebuffer_offset[i] = fb->offsets[i];
+	}
+
+	mutex_unlock(&hdev->state_lock);
+}
 
 static enum drm_connector_status
 hermes_kms_connector_detect(struct drm_connector *connector, bool force)
@@ -146,6 +211,13 @@ static void hermes_kms_pipe_enable(struct drm_simple_display_pipe *pipe,
 				   struct drm_plane_state *plane_state)
 {
 	struct drm_device *drm = pipe->crtc.dev;
+	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+
+	mutex_lock(&hdev->state_lock);
+	hdev->last_enable_ns = ktime_get_ns();
+	mutex_unlock(&hdev->state_lock);
+
+	hermes_kms_track_frame(hdev, plane_state ? plane_state->fb : NULL);
 
 	drm_info(drm, "enabled virtual display %ux%u@%d\n",
 		 crtc_state->mode.hdisplay,
@@ -155,6 +227,13 @@ static void hermes_kms_pipe_enable(struct drm_simple_display_pipe *pipe,
 
 static void hermes_kms_pipe_disable(struct drm_simple_display_pipe *pipe)
 {
+	struct hermes_kms_device *hdev = to_hermes_kms(pipe->crtc.dev);
+
+	mutex_lock(&hdev->state_lock);
+	hdev->last_disable_ns = ktime_get_ns();
+	hermes_kms_clear_frame_locked(hdev);
+	mutex_unlock(&hdev->state_lock);
+
 	drm_info(pipe->crtc.dev, "disabled virtual display\n");
 }
 
@@ -163,6 +242,10 @@ static void hermes_kms_pipe_update(struct drm_simple_display_pipe *pipe,
 {
 	struct drm_crtc *crtc = &pipe->crtc;
 	struct drm_pending_vblank_event *event = crtc->state->event;
+	struct hermes_kms_device *hdev = to_hermes_kms(crtc->dev);
+	struct drm_plane_state *plane_state = pipe->plane.state;
+
+	hermes_kms_track_frame(hdev, plane_state ? plane_state->fb : NULL);
 
 	if (event) {
 		crtc->state->event = NULL;
@@ -242,6 +325,22 @@ static int hermes_kms_ioctl_get_status(struct drm_device *drm, void *data,
 	status->requested_width = hdev->requested_width;
 	status->requested_height = hdev->requested_height;
 	status->requested_refresh_hz = hdev->requested_refresh_hz;
+	status->frame_sequence = hdev->frame_sequence;
+	status->last_update_ns = hdev->last_update_ns;
+	status->last_enable_ns = hdev->last_enable_ns;
+	status->last_disable_ns = hdev->last_disable_ns;
+	status->framebuffer_id = hdev->framebuffer_id;
+	status->framebuffer_width = hdev->framebuffer_width;
+	status->framebuffer_height = hdev->framebuffer_height;
+	status->framebuffer_format = hdev->framebuffer_format;
+	status->framebuffer_plane_count = hdev->framebuffer_plane_count;
+	memcpy(status->framebuffer_pitch, hdev->framebuffer_pitch,
+	       sizeof(status->framebuffer_pitch));
+	memcpy(status->framebuffer_offset, hdev->framebuffer_offset,
+	       sizeof(status->framebuffer_offset));
+	status->framebuffer_modifier = hdev->framebuffer_modifier;
+	if (hdev->framebuffer_id)
+		status->flags |= HERMES_KMS_STATUS_FRAME_VALID;
 	mutex_unlock(&hdev->state_lock);
 
 	status->connector_id = hdev->connector.base.id;
