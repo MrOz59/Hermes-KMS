@@ -33,6 +33,25 @@ stream
 7. Implement PRIME/DMA-BUF frame export path.
 8. Measure whether the encoder path is actually zero-copy.
 
+## Communication with Hermes
+
+Hermes-KMS should be controlled through explicit DRM ioctls, not by scraping logs or guessing connector names.
+
+The first UAPI lives in `include/uapi/drm/hermes_kms_drm.h` and provides:
+
+- version discovery;
+- capability discovery;
+- current output status;
+- requested output enable/disable and preferred mode.
+
+This is deliberately small. It can be safely extended with append-only structs and new ioctls for:
+
+- frame queue descriptors;
+- DMA-BUF export/acquire;
+- explicit sync fences;
+- latency counters;
+- per-client ownership/session IDs.
+
 ## Current status
 
 The current code is a first PoC skeleton. It is meant to compile and load as a DRM driver, not yet provide the final zero-copy path.

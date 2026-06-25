@@ -8,7 +8,10 @@
  */
 
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
+
+#include <drm/hermes_kms_drm.h>
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
@@ -31,11 +34,26 @@
 #define HERMES_KMS_DRIVER_DATE "20260625"
 #define HERMES_KMS_DRIVER_MAJOR 0
 #define HERMES_KMS_DRIVER_MINOR 1
+#define HERMES_KMS_DRIVER_PATCH 0
+
+#define HERMES_KMS_MIN_WIDTH 640
+#define HERMES_KMS_MIN_HEIGHT 480
+#define HERMES_KMS_MAX_WIDTH 3840
+#define HERMES_KMS_MAX_HEIGHT 2160
+#define HERMES_KMS_DEFAULT_WIDTH 1920
+#define HERMES_KMS_DEFAULT_HEIGHT 1080
+#define HERMES_KMS_DEFAULT_REFRESH_HZ 60
+#define HERMES_KMS_MAX_REFRESH_HZ 240
 
 struct hermes_kms_device {
 	struct drm_device drm;
 	struct drm_simple_display_pipe pipe;
 	struct drm_connector connector;
+	struct mutex state_lock;
+	bool output_enabled;
+	u32 requested_width;
+	u32 requested_height;
+	u32 requested_refresh_hz;
 };
 
 static inline struct hermes_kms_device *to_hermes_kms(struct drm_device *drm)
@@ -51,15 +69,32 @@ static const u32 hermes_kms_formats[] = {
 static enum drm_connector_status
 hermes_kms_connector_detect(struct drm_connector *connector, bool force)
 {
-	return connector_status_connected;
+	struct hermes_kms_device *hdev = to_hermes_kms(connector->dev);
+	enum drm_connector_status status;
+
+	mutex_lock(&hdev->state_lock);
+	status = hdev->output_enabled ? connector_status_connected :
+					connector_status_disconnected;
+	mutex_unlock(&hdev->state_lock);
+
+	return status;
 }
 
 static int hermes_kms_connector_get_modes(struct drm_connector *connector)
 {
 	int count;
+	struct hermes_kms_device *hdev = to_hermes_kms(connector->dev);
+	u32 preferred_width;
+	u32 preferred_height;
 
-	count = drm_add_modes_noedid(connector, 3840, 2160);
-	drm_set_preferred_mode(connector, 1920, 1080);
+	mutex_lock(&hdev->state_lock);
+	preferred_width = hdev->requested_width;
+	preferred_height = hdev->requested_height;
+	mutex_unlock(&hdev->state_lock);
+
+	count = drm_add_modes_noedid(connector, HERMES_KMS_MAX_WIDTH,
+				     HERMES_KMS_MAX_HEIGHT);
+	drm_set_preferred_mode(connector, preferred_width, preferred_height);
 
 	return count;
 }
@@ -81,13 +116,15 @@ static enum drm_mode_status
 hermes_kms_pipe_mode_valid(struct drm_simple_display_pipe *pipe,
 			   const struct drm_display_mode *mode)
 {
-	if (mode->hdisplay < 640 || mode->vdisplay < 480)
+	if (mode->hdisplay < HERMES_KMS_MIN_WIDTH ||
+	    mode->vdisplay < HERMES_KMS_MIN_HEIGHT)
 		return MODE_BAD;
 
-	if (mode->hdisplay > 3840 || mode->vdisplay > 2160)
+	if (mode->hdisplay > HERMES_KMS_MAX_WIDTH ||
+	    mode->vdisplay > HERMES_KMS_MAX_HEIGHT)
 		return MODE_VIRTUAL_X;
 
-	if (drm_mode_vrefresh(mode) > 240)
+	if (drm_mode_vrefresh(mode) > HERMES_KMS_MAX_REFRESH_HZ)
 		return MODE_CLOCK_HIGH;
 
 	return MODE_OK;
@@ -149,6 +186,147 @@ static const struct drm_mode_config_funcs hermes_kms_mode_config_funcs = {
 	.atomic_commit = drm_atomic_helper_commit,
 };
 
+static int hermes_kms_ioctl_get_version(struct drm_device *drm, void *data,
+					struct drm_file *file)
+{
+	struct drm_hermes_kms_version *version = data;
+
+	memset(version, 0, sizeof(*version));
+	version->uapi_version = HERMES_KMS_UAPI_VERSION;
+	version->driver_major = HERMES_KMS_DRIVER_MAJOR;
+	version->driver_minor = HERMES_KMS_DRIVER_MINOR;
+	version->driver_patch = HERMES_KMS_DRIVER_PATCH;
+	strscpy(version->driver_name, HERMES_KMS_DRIVER_NAME,
+		sizeof(version->driver_name));
+
+	return 0;
+}
+
+static int hermes_kms_ioctl_get_caps(struct drm_device *drm, void *data,
+				     struct drm_file *file)
+{
+	struct drm_hermes_kms_caps *caps = data;
+
+	memset(caps, 0, sizeof(*caps));
+	caps->flags = HERMES_KMS_CAP_VIRTUAL_OUTPUT |
+		      HERMES_KMS_CAP_OUTPUT_CONTROL |
+		      HERMES_KMS_CAP_DUMB_BUFFERS |
+		      HERMES_KMS_CAP_PRIME_IMPORT |
+		      HERMES_KMS_CAP_DMABUF_EXPORT_PLANNED |
+		      HERMES_KMS_CAP_ZERO_COPY_TARGET;
+	caps->min_width = HERMES_KMS_MIN_WIDTH;
+	caps->min_height = HERMES_KMS_MIN_HEIGHT;
+	caps->max_width = HERMES_KMS_MAX_WIDTH;
+	caps->max_height = HERMES_KMS_MAX_HEIGHT;
+	caps->preferred_width = HERMES_KMS_DEFAULT_WIDTH;
+	caps->preferred_height = HERMES_KMS_DEFAULT_HEIGHT;
+	caps->max_refresh_hz = HERMES_KMS_MAX_REFRESH_HZ;
+
+	return 0;
+}
+
+static int hermes_kms_ioctl_get_status(struct drm_device *drm, void *data,
+				       struct drm_file *file)
+{
+	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct drm_hermes_kms_status *status = data;
+	struct drm_crtc_state *crtc_state;
+
+	memset(status, 0, sizeof(*status));
+
+	mutex_lock(&hdev->state_lock);
+	if (hdev->output_enabled)
+		status->flags |= HERMES_KMS_STATUS_OUTPUT_ENABLED |
+				 HERMES_KMS_STATUS_CONNECTED;
+
+	status->requested_width = hdev->requested_width;
+	status->requested_height = hdev->requested_height;
+	status->requested_refresh_hz = hdev->requested_refresh_hz;
+	mutex_unlock(&hdev->state_lock);
+
+	status->connector_id = hdev->connector.base.id;
+	status->crtc_id = hdev->pipe.crtc.base.id;
+	status->plane_id = hdev->pipe.plane.base.id;
+	status->encoder_id = hdev->pipe.encoder.base.id;
+
+	crtc_state = hdev->pipe.crtc.state;
+	if (crtc_state && crtc_state->enable) {
+		status->flags |= HERMES_KMS_STATUS_SCANOUT_ACTIVE;
+		status->active_width = crtc_state->mode.hdisplay;
+		status->active_height = crtc_state->mode.vdisplay;
+		status->active_refresh_hz = drm_mode_vrefresh(&crtc_state->mode);
+	}
+
+	return 0;
+}
+
+static bool hermes_kms_valid_requested_mode(u32 width, u32 height,
+					    u32 refresh_hz)
+{
+	return width >= HERMES_KMS_MIN_WIDTH &&
+	       height >= HERMES_KMS_MIN_HEIGHT &&
+	       width <= HERMES_KMS_MAX_WIDTH &&
+	       height <= HERMES_KMS_MAX_HEIGHT &&
+	       refresh_hz > 0 &&
+	       refresh_hz <= HERMES_KMS_MAX_REFRESH_HZ;
+}
+
+static int hermes_kms_ioctl_set_output(struct drm_device *drm, void *data,
+				       struct drm_file *file)
+{
+	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct drm_hermes_kms_set_output *request = data;
+	u32 width = request->width;
+	u32 height = request->height;
+	u32 refresh_hz = request->refresh_hz;
+
+	if (!request->enabled) {
+		mutex_lock(&hdev->state_lock);
+		hdev->output_enabled = false;
+		mutex_unlock(&hdev->state_lock);
+		drm_kms_helper_hotplug_event(drm);
+		return 0;
+	}
+
+	if (!width)
+		width = HERMES_KMS_DEFAULT_WIDTH;
+	if (!height)
+		height = HERMES_KMS_DEFAULT_HEIGHT;
+	if (!refresh_hz)
+		refresh_hz = HERMES_KMS_DEFAULT_REFRESH_HZ;
+
+	if (!hermes_kms_valid_requested_mode(width, height, refresh_hz))
+		return -EINVAL;
+
+	mutex_lock(&hdev->state_lock);
+	hdev->output_enabled = true;
+	hdev->requested_width = width;
+	hdev->requested_height = height;
+	hdev->requested_refresh_hz = refresh_hz;
+	mutex_unlock(&hdev->state_lock);
+
+	drm_kms_helper_hotplug_event(drm);
+	drm_info(drm, "requested virtual output %ux%u@%u\n",
+		 width, height, refresh_hz);
+
+	return 0;
+}
+
+static const struct drm_ioctl_desc hermes_kms_ioctls[] = {
+	DRM_IOCTL_DEF_DRV(HERMES_KMS_GET_VERSION,
+			  hermes_kms_ioctl_get_version,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(HERMES_KMS_GET_CAPS,
+			  hermes_kms_ioctl_get_caps,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(HERMES_KMS_GET_STATUS,
+			  hermes_kms_ioctl_get_status,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(HERMES_KMS_SET_OUTPUT,
+			  hermes_kms_ioctl_set_output,
+			  DRM_AUTH | DRM_MASTER),
+};
+
 static const struct file_operations hermes_kms_fops = {
 	.owner = THIS_MODULE,
 	.open = drm_open,
@@ -168,6 +346,8 @@ static const struct drm_driver hermes_kms_driver = {
 	.major = HERMES_KMS_DRIVER_MAJOR,
 	.minor = HERMES_KMS_DRIVER_MINOR,
 	.fops = &hermes_kms_fops,
+	.ioctls = hermes_kms_ioctls,
+	.num_ioctls = ARRAY_SIZE(hermes_kms_ioctls),
 	DRM_GEM_DMA_DRIVER_OPS,
 };
 
@@ -180,10 +360,10 @@ static int hermes_kms_modeset_init(struct hermes_kms_device *hdev)
 	if (ret)
 		return ret;
 
-	drm->mode_config.min_width = 640;
-	drm->mode_config.min_height = 480;
-	drm->mode_config.max_width = 3840;
-	drm->mode_config.max_height = 2160;
+	drm->mode_config.min_width = HERMES_KMS_MIN_WIDTH;
+	drm->mode_config.min_height = HERMES_KMS_MIN_HEIGHT;
+	drm->mode_config.max_width = HERMES_KMS_MAX_WIDTH;
+	drm->mode_config.max_height = HERMES_KMS_MAX_HEIGHT;
 	drm->mode_config.preferred_depth = 24;
 	drm->mode_config.funcs = &hermes_kms_mode_config_funcs;
 
@@ -225,6 +405,11 @@ static int hermes_kms_probe(struct platform_device *pdev)
 
 	drm = &hdev->drm;
 	platform_set_drvdata(pdev, hdev);
+	mutex_init(&hdev->state_lock);
+	hdev->output_enabled = true;
+	hdev->requested_width = HERMES_KMS_DEFAULT_WIDTH;
+	hdev->requested_height = HERMES_KMS_DEFAULT_HEIGHT;
+	hdev->requested_refresh_hz = HERMES_KMS_DEFAULT_REFRESH_HZ;
 
 	ret = hermes_kms_modeset_init(hdev);
 	if (ret)

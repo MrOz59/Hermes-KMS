@@ -29,6 +29,8 @@ The current code starts the real driver path:
 - virtual connector using DRM/KMS helpers;
 - simple display pipe;
 - GEM DMA helper base for future PRIME/DMA-BUF work;
+- Hermes/apps communication UAPI through DRM ioctls;
+- debug/control tool: `tools/hermes-kmsctl/hermes-kmsctl`;
 - 640x480 through 3840x2160 mode range, with 1920x1080 preferred;
 - no Hermes integration yet.
 
@@ -54,12 +56,29 @@ Loading an unsigned experimental kernel module can destabilize the session. Use 
 
 ```bash
 sudo insmod kernel/hermes-kms/hermes_kms.ko
+tools/hermes-kmsctl/hermes-kmsctl version
+tools/hermes-kmsctl/hermes-kmsctl caps
+tools/hermes-kmsctl/hermes-kmsctl status
+tools/hermes-kmsctl/hermes-kmsctl enable 1920x1080@60
 ls -l /dev/dri/
 modetest -c
 drm_info
 journalctl -k -g hermes-kms
 sudo rmmod hermes_kms
 ```
+
+## Userspace communication
+
+Hermes-KMS exposes a small DRM ioctl UAPI in [include/uapi/drm/hermes_kms_drm.h](include/uapi/drm/hermes_kms_drm.h).
+
+Initial ioctls:
+
+- `DRM_IOCTL_HERMES_KMS_GET_VERSION`
+- `DRM_IOCTL_HERMES_KMS_GET_CAPS`
+- `DRM_IOCTL_HERMES_KMS_GET_STATUS`
+- `DRM_IOCTL_HERMES_KMS_SET_OUTPUT`
+
+This gives Hermes and diagnostic tools a stable driver contract before the final DMA-BUF frame export path exists.
 
 ## Roadmap
 
