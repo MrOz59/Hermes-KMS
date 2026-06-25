@@ -68,6 +68,13 @@ journalctl -k -g hermes-kms
 sudo rmmod hermes_kms
 ```
 
+Optional initial mode/state parameters:
+
+```bash
+sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=1 initial_width=1920 initial_height=1080 initial_refresh_hz=60
+sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0
+```
+
 ## Userspace communication
 
 Hermes-KMS exposes a small DRM ioctl UAPI in [include/uapi/drm/hermes_kms_drm.h](include/uapi/drm/hermes_kms_drm.h).

@@ -87,6 +87,17 @@ Future behavior:
 
 This avoids a compatibility trap: Hermes can start using one ioctl shape now, while the driver remains honest about not being zero-copy capable yet.
 
+## Initial load configuration
+
+The module supports simple load-time parameters for test safety:
+
+- `initial_enabled`
+- `initial_width`
+- `initial_height`
+- `initial_refresh_hz`
+
+This allows testing the DRM device with the connector initially disconnected, or with a specific preferred mode, before Hermes has an installer/service integration.
+
 ## Current status
 
 The current code is a first PoC skeleton. It is meant to compile and load as a DRM driver, not yet provide the final zero-copy path.

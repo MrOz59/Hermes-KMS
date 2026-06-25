@@ -47,6 +47,20 @@
 #define HERMES_KMS_DEFAULT_REFRESH_HZ 60
 #define HERMES_KMS_MAX_REFRESH_HZ 240
 
+static bool initial_enabled = true;
+static unsigned int initial_width = HERMES_KMS_DEFAULT_WIDTH;
+static unsigned int initial_height = HERMES_KMS_DEFAULT_HEIGHT;
+static unsigned int initial_refresh_hz = HERMES_KMS_DEFAULT_REFRESH_HZ;
+
+module_param(initial_enabled, bool, 0644);
+MODULE_PARM_DESC(initial_enabled, "Initial virtual output state");
+module_param(initial_width, uint, 0644);
+MODULE_PARM_DESC(initial_width, "Initial virtual output width");
+module_param(initial_height, uint, 0644);
+MODULE_PARM_DESC(initial_height, "Initial virtual output height");
+module_param(initial_refresh_hz, uint, 0644);
+MODULE_PARM_DESC(initial_refresh_hz, "Initial virtual output refresh rate");
+
 struct hermes_kms_device {
 	struct drm_device drm;
 	struct drm_simple_display_pipe pipe;
@@ -418,6 +432,31 @@ static bool hermes_kms_valid_requested_mode(u32 width, u32 height,
 	       refresh_hz <= HERMES_KMS_MAX_REFRESH_HZ;
 }
 
+static void hermes_kms_init_output_state(struct drm_device *drm,
+					 struct hermes_kms_device *hdev)
+{
+	u32 width = initial_width;
+	u32 height = initial_height;
+	u32 refresh_hz = initial_refresh_hz;
+
+	if (!hermes_kms_valid_requested_mode(width, height, refresh_hz)) {
+		drm_warn(drm,
+			 "invalid initial mode %ux%u@%u, falling back to %ux%u@%u\n",
+			 width, height, refresh_hz,
+			 HERMES_KMS_DEFAULT_WIDTH,
+			 HERMES_KMS_DEFAULT_HEIGHT,
+			 HERMES_KMS_DEFAULT_REFRESH_HZ);
+		width = HERMES_KMS_DEFAULT_WIDTH;
+		height = HERMES_KMS_DEFAULT_HEIGHT;
+		refresh_hz = HERMES_KMS_DEFAULT_REFRESH_HZ;
+	}
+
+	hdev->output_enabled = initial_enabled;
+	hdev->requested_width = width;
+	hdev->requested_height = height;
+	hdev->requested_refresh_hz = refresh_hz;
+}
+
 static int hermes_kms_ioctl_set_output(struct drm_device *drm, void *data,
 				       struct drm_file *file)
 {
@@ -556,10 +595,7 @@ static int hermes_kms_probe(struct platform_device *pdev)
 	drm = &hdev->drm;
 	platform_set_drvdata(pdev, hdev);
 	mutex_init(&hdev->state_lock);
-	hdev->output_enabled = true;
-	hdev->requested_width = HERMES_KMS_DEFAULT_WIDTH;
-	hdev->requested_height = HERMES_KMS_DEFAULT_HEIGHT;
-	hdev->requested_refresh_hz = HERMES_KMS_DEFAULT_REFRESH_HZ;
+	hermes_kms_init_output_state(drm, hdev);
 
 	ret = hermes_kms_modeset_init(hdev);
 	if (ret)
