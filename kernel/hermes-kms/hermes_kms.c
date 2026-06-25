@@ -21,8 +21,8 @@
 #include <drm/drm_file.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
-#include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_modeset_helper_vtables.h>
@@ -537,7 +537,7 @@ static const struct drm_driver hermes_kms_driver = {
 	.fops = &hermes_kms_fops,
 	.ioctls = hermes_kms_ioctls,
 	.num_ioctls = ARRAY_SIZE(hermes_kms_ioctls),
-	DRM_GEM_DMA_DRIVER_OPS,
+	DRM_GEM_SHMEM_DRIVER_OPS,
 };
 
 static int hermes_kms_modeset_init(struct hermes_kms_device *hdev)

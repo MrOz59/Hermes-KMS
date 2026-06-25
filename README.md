@@ -28,7 +28,7 @@ The current code starts the real driver path:
 - DRM device registration skeleton;
 - virtual connector using DRM/KMS helpers;
 - simple display pipe;
-- GEM DMA helper base for future PRIME/DMA-BUF work;
+- GEM shmem helper base for first functional buffers;
 - Hermes/apps communication UAPI through DRM ioctls;
 - scanout/frame metadata tracking for future DMA-BUF export;
 - debug/control tool: `tools/hermes-kmsctl/hermes-kmsctl`;
@@ -54,6 +54,8 @@ make clean
 ## Local test commands
 
 Loading an unsigned experimental kernel module can destabilize the session. Use this only on a test machine.
+
+Use `insmod` from the repo directory while the module is still local-only:
 
 ```bash
 sudo insmod kernel/hermes-kms/hermes_kms.ko

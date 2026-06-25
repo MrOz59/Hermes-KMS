@@ -28,7 +28,7 @@ stream
 2. Register a DRM device safely.
 3. Expose a virtual connector named by DRM as `Virtual-*` initially, with user-facing target `HERMES-1`.
 4. Support simple modes such as `1920x1080@60`.
-5. Use GEM/DMA helpers as the first buffer-management base.
+5. Use DRM GEM helpers as the first buffer-management base.
 6. Add explicit Hermes control/diagnostic interface.
 7. Implement PRIME/DMA-BUF frame export path.
 8. Measure whether the encoder path is actually zero-copy.
