@@ -1,0 +1,15 @@
+build/
+compile_commands.json
+*.o
+*.ko
+*.mod
+*.mod.c
+*.order
+*.symvers
+*.cmd
+*.log
+.cache.mk
+.tmp_versions/
+Module.markers
+modules.builtin
+modules.order
