@@ -59,9 +59,11 @@ Use `insmod` from the repo directory while the module is still local-only:
 
 ```bash
 sudo insmod kernel/hermes-kms/hermes_kms.ko
+sleep 1
 tools/hermes-kmsctl/hermes-kmsctl version
 tools/hermes-kmsctl/hermes-kmsctl caps
 tools/hermes-kmsctl/hermes-kmsctl status
+tools/hermes-kmsctl/hermes-kmsctl --verbose status
 tools/hermes-kmsctl/hermes-kmsctl enable 1920x1080@60
 ls -l /dev/dri/
 modetest -c

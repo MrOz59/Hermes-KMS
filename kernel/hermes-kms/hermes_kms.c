@@ -518,6 +518,7 @@ static const struct drm_ioctl_desc hermes_kms_ioctls[] = {
 
 static const struct file_operations hermes_kms_fops = {
 	.owner = THIS_MODULE,
+	.fop_flags = FOP_UNSIGNED_OFFSET,
 	.open = drm_open,
 	.release = drm_release,
 	.unlocked_ioctl = drm_ioctl,

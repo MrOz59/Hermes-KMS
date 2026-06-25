@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -17,42 +18,51 @@ static void usage(const char *argv0)
 {
 	fprintf(stderr,
 		"Usage:\n"
-		"  %s [--device /dev/dri/cardN] version\n"
-		"  %s [--device /dev/dri/cardN] caps\n"
-		"  %s [--device /dev/dri/cardN] status\n"
-		"  %s [--device /dev/dri/cardN] frame [--require-dmabuf]\n"
-		"  %s [--device /dev/dri/cardN] enable [WIDTHxHEIGHT@HZ]\n"
-		"  %s [--device /dev/dri/cardN] disable\n",
+		"  %s [--device /dev/dri/cardN] [--verbose] version\n"
+		"  %s [--device /dev/dri/cardN] [--verbose] caps\n"
+		"  %s [--device /dev/dri/cardN] [--verbose] status\n"
+		"  %s [--device /dev/dri/cardN] [--verbose] frame [--require-dmabuf]\n"
+		"  %s [--device /dev/dri/cardN] [--verbose] enable [WIDTHxHEIGHT@HZ]\n"
+		"  %s [--device /dev/dri/cardN] [--verbose] disable\n",
 		argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
-static int open_if_hermes(const char *path)
+static int open_if_hermes(const char *path, bool verbose)
 {
 	struct drm_hermes_kms_version version;
 	int fd;
 
 	fd = open(path, O_RDWR | O_CLOEXEC);
-	if (fd < 0)
+	if (fd < 0) {
+		if (verbose)
+			fprintf(stderr, "%s: open failed: %s\n", path, strerror(errno));
 		return -1;
+	}
 
 	memset(&version, 0, sizeof(version));
 	if (ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_VERSION, &version) == 0 &&
 	    strcmp(version.driver_name, "hermes-kms") == 0)
 		return fd;
 
+	if (verbose)
+		fprintf(stderr, "%s: not Hermes-KMS\n", path);
+
 	close(fd);
 	return -1;
 }
 
-static int open_auto_device(void)
+static int open_auto_device(bool verbose)
 {
 	struct dirent *entry;
 	DIR *dir;
 	int fd = -1;
 
 	dir = opendir("/dev/dri");
-	if (!dir)
+	if (!dir) {
+		if (verbose)
+			fprintf(stderr, "/dev/dri: open failed: %s\n", strerror(errno));
 		return -1;
+	}
 
 	while ((entry = readdir(dir)) != NULL) {
 		char path[PATH_MAX];
@@ -61,7 +71,7 @@ static int open_auto_device(void)
 			continue;
 
 		snprintf(path, sizeof(path), "/dev/dri/%s", entry->d_name);
-		fd = open_if_hermes(path);
+		fd = open_if_hermes(path, verbose);
 		if (fd >= 0)
 			break;
 	}
@@ -70,12 +80,12 @@ static int open_auto_device(void)
 	return fd;
 }
 
-static int open_device(const char *path)
+static int open_device(const char *path, bool verbose)
 {
 	if (path)
-		return open_if_hermes(path);
+		return open_if_hermes(path, verbose);
 
-	return open_auto_device();
+	return open_auto_device(verbose);
 }
 
 static int print_version(int fd)
@@ -274,6 +284,7 @@ int main(int argc, char **argv)
 	int argi = 1;
 	int fd;
 	int ret;
+	bool verbose = false;
 
 	if (argc < 2) {
 		usage(argv[0]);
@@ -285,13 +296,18 @@ int main(int argc, char **argv)
 		argi += 2;
 	}
 
+	if (argi < argc && strcmp(argv[argi], "--verbose") == 0) {
+		verbose = true;
+		argi++;
+	}
+
 	if (argi >= argc) {
 		usage(argv[0]);
 		return 2;
 	}
 
 	command = argv[argi++];
-	fd = open_device(device);
+	fd = open_device(device, verbose);
 	if (fd < 0) {
 		fprintf(stderr, "Could not find/open Hermes-KMS DRM device");
 		if (device)
