@@ -68,6 +68,25 @@ Tracked fields include:
 
 This does not export a DMA-BUF yet. It creates the stable state model that the future export/acquire ioctl can use without changing the basic Hermes discovery path.
 
+## Frame acquire contract
+
+`DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME` is the initial userspace-facing frame contract.
+
+Current behavior:
+
+- without flags, returns the latest tracked frame metadata;
+- returns `-ENODATA` if no frame has been tracked yet;
+- returns `-EOPNOTSUPP` if userspace requests DMA-BUF fds with `HERMES_KMS_FRAME_REQUEST_DMABUF`.
+
+Future behavior:
+
+- return one or more DMA-BUF fds;
+- return an explicit sync-file fd when required;
+- preserve pitch, offset, modifier, format, and sequence metadata;
+- set `HERMES_KMS_FRAME_DMABUF_VALID` only when the exported fds are usable by Hermes.
+
+This avoids a compatibility trap: Hermes can start using one ioctl shape now, while the driver remains honest about not being zero-copy capable yet.
+
 ## Current status
 
 The current code is a first PoC skeleton. It is meant to compile and load as a DRM driver, not yet provide the final zero-copy path.

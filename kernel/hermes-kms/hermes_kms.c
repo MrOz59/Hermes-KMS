@@ -295,6 +295,8 @@ static int hermes_kms_ioctl_get_caps(struct drm_device *drm, void *data,
 		      HERMES_KMS_CAP_OUTPUT_CONTROL |
 		      HERMES_KMS_CAP_DUMB_BUFFERS |
 		      HERMES_KMS_CAP_PRIME_IMPORT |
+		      HERMES_KMS_CAP_FRAME_METADATA |
+		      HERMES_KMS_CAP_FRAME_ACQUIRE |
 		      HERMES_KMS_CAP_DMABUF_EXPORT_PLANNED |
 		      HERMES_KMS_CAP_ZERO_COPY_TARGET;
 	caps->min_width = HERMES_KMS_MIN_WIDTH;
@@ -355,6 +357,52 @@ static int hermes_kms_ioctl_get_status(struct drm_device *drm, void *data,
 		status->active_height = crtc_state->mode.vdisplay;
 		status->active_refresh_hz = drm_mode_vrefresh(&crtc_state->mode);
 	}
+
+	return 0;
+}
+
+static void hermes_kms_init_invalid_frame_fds(struct drm_hermes_kms_acquire_frame *frame)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(frame->dma_buf_fd); i++)
+		frame->dma_buf_fd[i] = -1;
+
+	frame->sync_file_fd = -1;
+}
+
+static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
+					  struct drm_file *file)
+{
+	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct drm_hermes_kms_acquire_frame *frame = data;
+	u64 requested_flags = frame->flags;
+
+	memset(frame, 0, sizeof(*frame));
+	hermes_kms_init_invalid_frame_fds(frame);
+
+	mutex_lock(&hdev->state_lock);
+	if (!hdev->framebuffer_id) {
+		mutex_unlock(&hdev->state_lock);
+		return -ENODATA;
+	}
+
+	frame->flags = HERMES_KMS_FRAME_METADATA_VALID |
+		       HERMES_KMS_FRAME_COPY_FALLBACK_REQUIRED;
+	frame->sequence = hdev->frame_sequence;
+	frame->timestamp_ns = hdev->last_update_ns;
+	frame->modifier = hdev->framebuffer_modifier;
+	frame->framebuffer_id = hdev->framebuffer_id;
+	frame->width = hdev->framebuffer_width;
+	frame->height = hdev->framebuffer_height;
+	frame->format = hdev->framebuffer_format;
+	frame->plane_count = hdev->framebuffer_plane_count;
+	memcpy(frame->pitch, hdev->framebuffer_pitch, sizeof(frame->pitch));
+	memcpy(frame->offset, hdev->framebuffer_offset, sizeof(frame->offset));
+	mutex_unlock(&hdev->state_lock);
+
+	if (requested_flags & HERMES_KMS_FRAME_REQUEST_DMABUF)
+		return -EOPNOTSUPP;
 
 	return 0;
 }
@@ -424,6 +472,9 @@ static const struct drm_ioctl_desc hermes_kms_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(HERMES_KMS_SET_OUTPUT,
 			  hermes_kms_ioctl_set_output,
 			  DRM_AUTH | DRM_MASTER),
+	DRM_IOCTL_DEF_DRV(HERMES_KMS_ACQUIRE_FRAME,
+			  hermes_kms_ioctl_acquire_frame,
+			  DRM_RENDER_ALLOW),
 };
 
 static const struct file_operations hermes_kms_fops = {

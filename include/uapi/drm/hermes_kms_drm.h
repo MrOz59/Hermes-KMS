@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define HERMES_KMS_UAPI_VERSION 1
+#define HERMES_KMS_UAPI_VERSION 2
 
 #define HERMES_KMS_NAME_LEN 32
 
@@ -23,6 +23,8 @@ extern "C" {
 #define HERMES_KMS_CAP_OUTPUT_CONTROL		(1ULL << 1)
 #define HERMES_KMS_CAP_DUMB_BUFFERS		(1ULL << 2)
 #define HERMES_KMS_CAP_PRIME_IMPORT		(1ULL << 3)
+#define HERMES_KMS_CAP_FRAME_METADATA		(1ULL << 4)
+#define HERMES_KMS_CAP_FRAME_ACQUIRE		(1ULL << 5)
 #define HERMES_KMS_CAP_DMABUF_EXPORT_PLANNED	(1ULL << 32)
 #define HERMES_KMS_CAP_ZERO_COPY_TARGET		(1ULL << 33)
 
@@ -31,6 +33,12 @@ extern "C" {
 #define HERMES_KMS_STATUS_SCANOUT_ACTIVE	(1ULL << 2)
 #define HERMES_KMS_STATUS_FRAME_VALID		(1ULL << 3)
 #define HERMES_KMS_STATUS_DMABUF_EXPORT_READY	(1ULL << 4)
+
+#define HERMES_KMS_FRAME_REQUEST_DMABUF		(1ULL << 0)
+#define HERMES_KMS_FRAME_METADATA_VALID		(1ULL << 1)
+#define HERMES_KMS_FRAME_DMABUF_VALID		(1ULL << 2)
+#define HERMES_KMS_FRAME_SYNC_FILE_VALID	(1ULL << 3)
+#define HERMES_KMS_FRAME_COPY_FALLBACK_REQUIRED	(1ULL << 4)
 
 struct drm_hermes_kms_version {
 	__u32 uapi_version;
@@ -87,10 +95,29 @@ struct drm_hermes_kms_set_output {
 	__u32 reserved[4];
 };
 
+struct drm_hermes_kms_acquire_frame {
+	__u64 flags;
+	__u64 sequence;
+	__u64 timestamp_ns;
+	__u64 modifier;
+	__u32 framebuffer_id;
+	__u32 width;
+	__u32 height;
+	__u32 format;
+	__u32 plane_count;
+	__u32 pitch[4];
+	__u32 offset[4];
+	__s32 dma_buf_fd[4];
+	__s32 sync_file_fd;
+	__u32 reserved0;
+	__u64 reserved[8];
+};
+
 #define DRM_HERMES_KMS_GET_VERSION	0x00
 #define DRM_HERMES_KMS_GET_CAPS		0x01
 #define DRM_HERMES_KMS_GET_STATUS	0x02
 #define DRM_HERMES_KMS_SET_OUTPUT	0x03
+#define DRM_HERMES_KMS_ACQUIRE_FRAME	0x04
 
 #define DRM_IOCTL_HERMES_KMS_GET_VERSION \
 	DRM_IOR(DRM_COMMAND_BASE + DRM_HERMES_KMS_GET_VERSION, struct drm_hermes_kms_version)
@@ -100,6 +127,8 @@ struct drm_hermes_kms_set_output {
 	DRM_IOR(DRM_COMMAND_BASE + DRM_HERMES_KMS_GET_STATUS, struct drm_hermes_kms_status)
 #define DRM_IOCTL_HERMES_KMS_SET_OUTPUT \
 	DRM_IOW(DRM_COMMAND_BASE + DRM_HERMES_KMS_SET_OUTPUT, struct drm_hermes_kms_set_output)
+#define DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_HERMES_KMS_ACQUIRE_FRAME, struct drm_hermes_kms_acquire_frame)
 
 #if defined(__cplusplus)
 }

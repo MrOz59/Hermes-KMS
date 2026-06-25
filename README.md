@@ -78,6 +78,7 @@ Initial ioctls:
 - `DRM_IOCTL_HERMES_KMS_GET_CAPS`
 - `DRM_IOCTL_HERMES_KMS_GET_STATUS`
 - `DRM_IOCTL_HERMES_KMS_SET_OUTPUT`
+- `DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME`
 
 This gives Hermes and diagnostic tools a stable driver contract before the final DMA-BUF frame export path exists.
 
@@ -90,6 +91,15 @@ This gives Hermes and diagnostic tools a stable driver contract before the final
 - DRM fourcc format;
 - modifier;
 - per-plane pitch/offset.
+
+`ACQUIRE_FRAME` currently supports metadata-only acquisition. If userspace sets `HERMES_KMS_FRAME_REQUEST_DMABUF`, the driver returns `-EOPNOTSUPP` until real DMA-BUF export is implemented. This is intentional: Hermes can code against the final API shape without Hermes-KMS falsely claiming zero-copy is ready.
+
+Diagnostic command:
+
+```bash
+tools/hermes-kmsctl/hermes-kmsctl frame
+tools/hermes-kmsctl/hermes-kmsctl frame --require-dmabuf
+```
 
 ## Roadmap
 

@@ -20,9 +20,10 @@ static void usage(const char *argv0)
 		"  %s [--device /dev/dri/cardN] version\n"
 		"  %s [--device /dev/dri/cardN] caps\n"
 		"  %s [--device /dev/dri/cardN] status\n"
+		"  %s [--device /dev/dri/cardN] frame [--require-dmabuf]\n"
 		"  %s [--device /dev/dri/cardN] enable [WIDTHxHEIGHT@HZ]\n"
 		"  %s [--device /dev/dri/cardN] disable\n",
-		argv0, argv0, argv0, argv0, argv0);
+		argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 static int open_if_hermes(const char *path)
@@ -116,10 +117,53 @@ static int print_caps(int fd)
 	       (caps.flags & HERMES_KMS_CAP_VIRTUAL_OUTPUT) ? "true" : "false");
 	printf("output_control=%s\n",
 	       (caps.flags & HERMES_KMS_CAP_OUTPUT_CONTROL) ? "true" : "false");
+	printf("frame_metadata=%s\n",
+	       (caps.flags & HERMES_KMS_CAP_FRAME_METADATA) ? "true" : "false");
+	printf("frame_acquire=%s\n",
+	       (caps.flags & HERMES_KMS_CAP_FRAME_ACQUIRE) ? "true" : "false");
 	printf("zero_copy_target=%s\n",
 	       (caps.flags & HERMES_KMS_CAP_ZERO_COPY_TARGET) ? "true" : "false");
 	printf("dmabuf_export_planned=%s\n",
 	       (caps.flags & HERMES_KMS_CAP_DMABUF_EXPORT_PLANNED) ? "true" : "false");
+
+	return 0;
+}
+
+static int print_frame(int fd, bool require_dmabuf)
+{
+	struct drm_hermes_kms_acquire_frame frame;
+
+	memset(&frame, 0, sizeof(frame));
+	if (require_dmabuf)
+		frame.flags = HERMES_KMS_FRAME_REQUEST_DMABUF;
+
+	if (ioctl(fd, DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME, &frame) < 0) {
+		perror("ACQUIRE_FRAME");
+		return 1;
+	}
+
+	printf("flags=0x%016llx\n", (unsigned long long)frame.flags);
+	printf("metadata_valid=%s\n",
+	       (frame.flags & HERMES_KMS_FRAME_METADATA_VALID) ? "true" : "false");
+	printf("dmabuf_valid=%s\n",
+	       (frame.flags & HERMES_KMS_FRAME_DMABUF_VALID) ? "true" : "false");
+	printf("sync_file_valid=%s\n",
+	       (frame.flags & HERMES_KMS_FRAME_SYNC_FILE_VALID) ? "true" : "false");
+	printf("copy_fallback_required=%s\n",
+	       (frame.flags & HERMES_KMS_FRAME_COPY_FALLBACK_REQUIRED) ? "true" : "false");
+	printf("sequence=%llu\n", (unsigned long long)frame.sequence);
+	printf("timestamp_ns=%llu\n", (unsigned long long)frame.timestamp_ns);
+	printf("framebuffer_id=%u\n", frame.framebuffer_id);
+	printf("size=%ux%u\n", frame.width, frame.height);
+	printf("format=0x%08x\n", frame.format);
+	printf("modifier=0x%016llx\n", (unsigned long long)frame.modifier);
+	printf("plane_count=%u\n", frame.plane_count);
+	for (uint32_t i = 0; i < frame.plane_count && i < 4; i++) {
+		printf("plane_%u_pitch=%u\n", i, frame.pitch[i]);
+		printf("plane_%u_offset=%u\n", i, frame.offset[i]);
+		printf("plane_%u_dma_buf_fd=%d\n", i, frame.dma_buf_fd[i]);
+	}
+	printf("sync_file_fd=%d\n", frame.sync_file_fd);
 
 	return 0;
 }
@@ -262,6 +306,9 @@ int main(int argc, char **argv)
 		ret = print_caps(fd);
 	else if (strcmp(command, "status") == 0)
 		ret = print_status(fd);
+	else if (strcmp(command, "frame") == 0)
+		ret = print_frame(fd, argi < argc &&
+				      strcmp(argv[argi], "--require-dmabuf") == 0);
 	else if (strcmp(command, "enable") == 0)
 		ret = set_output(fd, true, argi < argc ? argv[argi] : NULL);
 	else if (strcmp(command, "disable") == 0)
