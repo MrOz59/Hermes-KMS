@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define HERMES_KMS_UAPI_VERSION 2
+#define HERMES_KMS_UAPI_VERSION 7
 
 #define HERMES_KMS_NAME_LEN 32
 
@@ -25,20 +25,36 @@ extern "C" {
 #define HERMES_KMS_CAP_PRIME_IMPORT		(1ULL << 3)
 #define HERMES_KMS_CAP_FRAME_METADATA		(1ULL << 4)
 #define HERMES_KMS_CAP_FRAME_ACQUIRE		(1ULL << 5)
+#define HERMES_KMS_CAP_DMABUF_EXPORT		(1ULL << 6)
+#define HERMES_KMS_CAP_OUTPUT_IDENTITY		(1ULL << 7)
+#define HERMES_KMS_CAP_SESSION_OWNER		(1ULL << 8)
+#define HERMES_KMS_CAP_FRAME_WAIT		(1ULL << 9)
+#define HERMES_KMS_CAP_METRICS			(1ULL << 10)
 #define HERMES_KMS_CAP_DMABUF_EXPORT_PLANNED	(1ULL << 32)
 #define HERMES_KMS_CAP_ZERO_COPY_TARGET		(1ULL << 33)
+#define HERMES_KMS_CAP_WRITEBACK_CONNECTOR	(1ULL << 34)
+#define HERMES_KMS_CAP_SYNC_FILE		(1ULL << 35)
 
 #define HERMES_KMS_STATUS_OUTPUT_ENABLED	(1ULL << 0)
 #define HERMES_KMS_STATUS_CONNECTED		(1ULL << 1)
 #define HERMES_KMS_STATUS_SCANOUT_ACTIVE	(1ULL << 2)
 #define HERMES_KMS_STATUS_FRAME_VALID		(1ULL << 3)
 #define HERMES_KMS_STATUS_DMABUF_EXPORT_READY	(1ULL << 4)
+#define HERMES_KMS_STATUS_SESSION_OWNED		(1ULL << 5)
+#define HERMES_KMS_STATUS_HOTPLUG_EVENTS_ENABLED (1ULL << 6)
 
 #define HERMES_KMS_FRAME_REQUEST_DMABUF		(1ULL << 0)
 #define HERMES_KMS_FRAME_METADATA_VALID		(1ULL << 1)
 #define HERMES_KMS_FRAME_DMABUF_VALID		(1ULL << 2)
 #define HERMES_KMS_FRAME_SYNC_FILE_VALID	(1ULL << 3)
 #define HERMES_KMS_FRAME_COPY_FALLBACK_REQUIRED	(1ULL << 4)
+#define HERMES_KMS_FRAME_REQUEST_SYNC_FILE	(1ULL << 5)
+
+#define HERMES_KMS_WAIT_FRAME_READY		(1ULL << 0)
+
+#define HERMES_KMS_SET_OUTPUT_RESULT_CONNECTED		(1U << 0)
+#define HERMES_KMS_SET_OUTPUT_RESULT_OWNER_ASSIGNED	(1U << 1)
+#define HERMES_KMS_SET_OUTPUT_RESULT_HOTPLUG_SENT	(1U << 2)
 
 struct drm_hermes_kms_version {
 	__u32 uapi_version;
@@ -84,7 +100,21 @@ struct drm_hermes_kms_status {
 	__u32 framebuffer_pitch[4];
 	__u32 framebuffer_offset[4];
 	__u64 framebuffer_modifier;
-	__u64 reserved[8];
+	__u64 session_id;
+	__s32 owner_pid;
+	__u32 reserved0;
+	__u64 reserved[6];
+};
+
+struct drm_hermes_kms_identity {
+	char driver_name[HERMES_KMS_NAME_LEN];
+	char output_name[HERMES_KMS_NAME_LEN];
+	char connector_name[HERMES_KMS_NAME_LEN];
+	__u32 connector_id;
+	__u32 crtc_id;
+	__u32 plane_id;
+	__u32 encoder_id;
+	__u32 reserved[8];
 };
 
 struct drm_hermes_kms_set_output {
@@ -92,7 +122,9 @@ struct drm_hermes_kms_set_output {
 	__u32 width;
 	__u32 height;
 	__u32 refresh_hz;
-	__u32 reserved[4];
+	__u32 flags;
+	__u32 result_flags;
+	__u64 session_id;
 };
 
 struct drm_hermes_kms_acquire_frame {
@@ -113,11 +145,52 @@ struct drm_hermes_kms_acquire_frame {
 	__u64 reserved[8];
 };
 
+struct drm_hermes_kms_wait_frame {
+	__u64 flags;
+	__u64 after_sequence;
+	__u64 sequence;
+	__u64 timestamp_ns;
+	__u64 status_flags;
+	__u32 timeout_ms;
+	__u32 reserved0;
+	__u64 reserved[6];
+};
+
+struct drm_hermes_kms_metrics {
+	__u64 frame_sequence;
+	__u64 frame_update_count;
+	__u64 acquire_count;
+	__u64 acquire_no_frame_count;
+	__u64 dmabuf_export_count;
+	__u64 dmabuf_export_fail_count;
+	__u64 sync_file_export_count;
+	__u64 sync_file_export_fail_count;
+	__u64 wait_count;
+	__u64 wait_ready_count;
+	__u64 wait_timeout_count;
+	__u64 wait_interrupted_count;
+	__u64 output_enable_count;
+	__u64 output_disable_count;
+	__u64 hotplug_event_count;
+	__u64 owner_close_disconnect_count;
+	__u64 last_update_ns;
+	__u64 last_acquire_ns;
+	__u64 last_wait_start_ns;
+	__u64 last_wait_end_ns;
+	__u64 last_wait_duration_ns;
+	__u64 last_dmabuf_export_ns;
+	__u64 last_sync_file_export_ns;
+	__u64 reserved[16];
+};
+
 #define DRM_HERMES_KMS_GET_VERSION	0x00
 #define DRM_HERMES_KMS_GET_CAPS		0x01
 #define DRM_HERMES_KMS_GET_STATUS	0x02
 #define DRM_HERMES_KMS_SET_OUTPUT	0x03
 #define DRM_HERMES_KMS_ACQUIRE_FRAME	0x04
+#define DRM_HERMES_KMS_GET_IDENTITY	0x05
+#define DRM_HERMES_KMS_WAIT_FRAME	0x06
+#define DRM_HERMES_KMS_GET_METRICS	0x07
 
 #define DRM_IOCTL_HERMES_KMS_GET_VERSION \
 	DRM_IOR(DRM_COMMAND_BASE + DRM_HERMES_KMS_GET_VERSION, struct drm_hermes_kms_version)
@@ -126,9 +199,15 @@ struct drm_hermes_kms_acquire_frame {
 #define DRM_IOCTL_HERMES_KMS_GET_STATUS \
 	DRM_IOR(DRM_COMMAND_BASE + DRM_HERMES_KMS_GET_STATUS, struct drm_hermes_kms_status)
 #define DRM_IOCTL_HERMES_KMS_SET_OUTPUT \
-	DRM_IOW(DRM_COMMAND_BASE + DRM_HERMES_KMS_SET_OUTPUT, struct drm_hermes_kms_set_output)
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_HERMES_KMS_SET_OUTPUT, struct drm_hermes_kms_set_output)
 #define DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_HERMES_KMS_ACQUIRE_FRAME, struct drm_hermes_kms_acquire_frame)
+#define DRM_IOCTL_HERMES_KMS_GET_IDENTITY \
+	DRM_IOR(DRM_COMMAND_BASE + DRM_HERMES_KMS_GET_IDENTITY, struct drm_hermes_kms_identity)
+#define DRM_IOCTL_HERMES_KMS_WAIT_FRAME \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_HERMES_KMS_WAIT_FRAME, struct drm_hermes_kms_wait_frame)
+#define DRM_IOCTL_HERMES_KMS_GET_METRICS \
+	DRM_IOR(DRM_COMMAND_BASE + DRM_HERMES_KMS_GET_METRICS, struct drm_hermes_kms_metrics)
 
 #if defined(__cplusplus)
 }

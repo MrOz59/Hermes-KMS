@@ -1,0 +1,13 @@
+# Keep Hermes-KMS development devices away from logind-managed desktop compositors.
+#
+# KWin/Xwayland open DRM/KMS cards that appear on the active seat. During
+# driver development that can take DRM master before explicit tools such as
+# modetest, and can keep hermes_kms busy during unload/reload cycles.
+#
+# WARNING: this is for ISOLATED testing only. Removing the seat assignment also
+# prevents the compositor from adopting the Hermes output: KWin/GNOME only manage
+# GPUs on their own seat (KWin: `if (device->seat() != session->seat()) continue`).
+# For real compositor-driven streaming the card MUST stay on the seat, so do not
+# install this rule in that scenario - use scripts/remove-dev-seat-ignore.sh.
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms/drm/card*", GROUP="video", MODE="0660", TAG+="uaccess", TAG-="seat", TAG-="master-of-seat", ENV{ID_SEAT}="", ENV{ID_FOR_SEAT}="", ENV{ID_AUTOSEAT}="0"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*-Virtual-*", DEVPATH=="*/platform/hermes-kms/drm/card*/card*-Virtual-*", GROUP="video", MODE="0660", TAG+="uaccess", TAG-="seat", TAG-="master-of-seat", ENV{ID_SEAT}="", ENV{ID_FOR_SEAT}="", ENV{ID_AUTOSEAT}="0"

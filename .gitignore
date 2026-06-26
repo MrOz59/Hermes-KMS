@@ -14,3 +14,4 @@ Module.markers
 modules.builtin
 modules.order
 tools/hermes-kmsctl/hermes-kmsctl
+tools/hermes-kms-import-check/hermes-kms-import-check
