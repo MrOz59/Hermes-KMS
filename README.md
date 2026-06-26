@@ -5,8 +5,6 @@ Hermes-KMS is a Linux DRM/KMS virtual display driver for Hermes.
 It replaces EVDI with a virtual display backend that streams the compositor's
 scanout straight into a hardware encoder as a DMA-BUF, with no CPU readback.
 
-This repository is local-only for now. No GitHub remote is configured.
-
 ## What this is
 
 - A Linux kernel DRM/KMS driver (`hermes_kms.ko`).
