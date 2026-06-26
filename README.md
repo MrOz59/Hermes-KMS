@@ -1,42 +1,56 @@
 # Hermes-KMS
 
-Hermes-KMS is an experimental Linux DRM/KMS virtual display driver for Hermes.
+Hermes-KMS is a Linux DRM/KMS virtual display driver for Hermes.
 
-The goal is to replace EVDI for Hermes with a virtual display backend that can eventually support a lower-latency DMA-BUF / PRIME path into hardware encoders.
+It replaces EVDI with a virtual display backend that streams the compositor's
+scanout straight into a hardware encoder as a DMA-BUF, with no CPU readback.
 
 This repository is local-only for now. No GitHub remote is configured.
 
 ## What this is
 
-- A Linux kernel DRM/KMS driver project.
-- A future EVDI replacement for Hermes.
-- A virtual display target intended to expose a Hermes-owned output such as `HERMES-1`.
-- A foundation for GPU-native buffer sharing and encoder import.
+- A Linux kernel DRM/KMS driver (`hermes_kms.ko`).
+- An EVDI replacement for Hermes, integrated into the Hermes capture path.
+- A virtual display that exposes a Hermes-owned output (`HERMES-1`) which a
+  desktop compositor (KWin/GNOME) drives like a normal monitor.
+- A zero-copy DMA-BUF source for VAAPI/other hardware encoders.
 
 ## What this is not
 
-- It is not an EVDI manager.
-- It is not a userspace wrapper around EVDI.
-- It is not integrated into Hermes yet.
-- It is not end-to-end encoder zero-copy validated yet.
+- It is not an EVDI manager or a userspace wrapper around EVDI.
+- It is not a render GPU: it exports the compositor's framebuffer; the encode
+  still runs on a real GPU that imports the exported DMA-BUF.
 
-## Current milestone
+## How it works
 
-The current code starts the real driver path:
+The compositor owns the card and Hermes only consumes frames:
 
-- out-of-tree kernel module target: `hermes_kms.ko`;
-- DRM device registration skeleton;
-- virtual connector using DRM/KMS helpers;
-- simple display pipe;
-- GEM shmem helper base for first functional buffers;
-- Hermes/apps communication UAPI through DRM ioctls;
-- scanout/frame metadata tracking;
-- DMA-BUF export for the currently tracked scanout GEM framebuffer;
+1. The driver exposes a **render node** (`DRIVER_RENDER`). Without it, compositors
+   skip the GPU and never enumerate the virtual connector.
+2. The compositor (KWin/GNOME) takes DRM master on the primary node, enables
+   the `HERMES-1` connector, and scans out the desktop into its framebuffer.
+3. Hermes opens the **render node** (never the primary node, which would steal
+   DRM master and EBUSY-block the compositor) and pulls the current scanout as
+   DMA-BUFs via `ACQUIRE_FRAME` — all Hermes ioctls are `DRM_RENDER_ALLOW`.
+4. A real GPU imports those DMA-BUFs and encodes them. The frame never leaves
+   the GPU.
+
+Measured capture cost on KWin at 720p: ~8 us/frame (`ACQUIRE_FRAME`) versus
+~180 us/frame for EVDI's CPU copy, and constant regardless of resolution.
+
+## Features
+
+- out-of-tree kernel module: `hermes_kms.ko`;
+- virtual connector + simple display pipe via DRM/KMS helpers;
+- render node for masterless, zero-copy frame consumption;
+- synthetic EDID so compositors treat `HERMES-1` as a normal monitor;
+- exact requested mode synthesized via CVT and re-probed on `SET_OUTPUT`, so
+  arbitrary client geometries (e.g. 1280x720@30) modeset correctly;
+- DMA-BUF export of the tracked scanout framebuffer, cached per buffer object;
+- real `dma_resv` write fence exported as a sync_file;
+- Hermes/apps UAPI through DRM ioctls; frame/metric tracking;
 - debug/control tool: `tools/hermes-kmsctl/hermes-kmsctl`;
-- virtual output defaults to disconnected until a control/session fd enables it;
-- development udev rule for keeping local test cards off the active logind seat;
-- 640x480 through 3840x2160 mode range, with 1920x1080 preferred;
-- no Hermes integration yet.
+- 640x480 through 3840x2160 mode range, 1920x1080 preferred.
 
 ## Build
 
@@ -56,33 +70,14 @@ make clean
 
 ## Local test commands
 
-Loading an unsigned experimental kernel module can destabilize the session. Use this only on a test machine.
+Loading an unsigned experimental kernel module can destabilize the session. Use
+this only on a test machine. Two ways to drive the output are described below:
+compositor-driven (real streaming) and isolated `modetest` (driver validation).
 
-KDE/KWin opens DRM/KMS cards that appear on the active logind seat. During
-driver development this can keep `hermes_kms` in use and block `rmmod`.
-Install the dev udev rule before repeated load/unload testing:
-
-```bash
-sudo make install-dev-udev
-```
-
-If KWin already opened the Hermes-KMS card, install the rule, log out and back
-in once, then unload the old module:
+Inspect the driver with the control tool while it is loaded:
 
 ```bash
-sudo rmmod hermes_kms
-```
-
-Remove the rule when you want desktop compositors to see Hermes-KMS again:
-
-```bash
-sudo make uninstall-dev-udev
-```
-
-Use `insmod` from the repo directory while the module is still local-only:
-
-```bash
-sudo insmod kernel/hermes-kms/hermes_kms.ko
+sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=1
 sleep 1
 tools/hermes-kmsctl/hermes-kmsctl version
 tools/hermes-kmsctl/hermes-kmsctl identity
@@ -106,28 +101,54 @@ sudo insmod kernel/hermes-kms/hermes_kms.ko initial_width=1920 initial_height=10
 sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=1
 ```
 
-By default, Hermes-KMS creates the DRM device with its virtual connector
-disconnected. This prevents desktop compositors such as KWin from taking the
-test display immediately on module load. A userspace owner must enable the
-output through `SET_OUTPUT`; `hermes-kmsctl hold 1920x1080@60` keeps that owner
-fd open until Ctrl+C. This follows the EVDI-style model: control ioctls use the
-primary DRM node, the connector starts disconnected, and the compositor is only
-notified when userspace deliberately exposes a display. The connector is marked
-`non-desktop` so desktop sessions should ignore it unless explicitly
-configured. If the owner fd closes or the process crashes, the driver
-disconnects the virtual output and emits a hotplug event.
+There are two ways to drive the output, for two different purposes.
 
-For isolated `modetest` validation, load with `initial_enabled=1
-hotplug_events=0`. This exposes a connected connector without notifying the
-desktop session, so `modetest` can become DRM master and commit a primary-plane
-framebuffer.
+### Compositor-driven (real streaming)
+
+This is the path Hermes uses. Load the module enabled and let the desktop
+compositor adopt the connector:
+
+```bash
+sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=1
+```
+
+The card must stay on the active logind seat so the compositor opens it — do
+**not** install the dev seat-ignore rule for this. KWin/GNOME enable `HERMES-1`,
+commit a framebuffer, and Hermes pulls frames from the render node. A userspace
+owner may still call `SET_OUTPUT` (via the render node) to request the client's
+exact mode; that owner does not take DRM master, so the compositor keeps it.
+
+### Isolated `modetest` (driver validation, no compositor)
+
+To exercise the driver without a compositor, load it connected but silent so
+`modetest` can take DRM master itself:
+
+```bash
+sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=1 hotplug_events=0
+```
+
+For this path the card must be kept off the compositor's seat, otherwise
+KWin/Xwayland grab DRM master first. Install the development udev rule, which is
+**isolated-testing only** — it removes the seat assignment, which also stops the
+compositor from adopting the output:
+
+```bash
+sudo make install-dev-udev   # then log out/in once if KWin already opened the card
+```
+
+`scripts/test-driver-zero-copy.sh` automates this: it reloads an isolated
+module, drives a `modetest` producer, and verifies the DMA-BUF/sync_file path.
+
+Remove the rule to return to the compositor-driven path:
+
+```bash
+sudo make uninstall-dev-udev
+```
 
 The seat exclusion cannot live inside the kernel driver: `seat`,
 `master-of-seat`, `ID_SEAT`, and `ID_AUTOSEAT` are udev/logind userspace
-policy. The driver controls connector state and hotplug timing. The development
-udev rule keeps the DRM primary node away from compositor seat auto-pickup while
-setting `GROUP="video"`, `MODE="0660"`, and `TAG+="uaccess"` so Hermes control
-ioctls can run without root once normal device permissions are in place.
+policy. The dev udev rule also sets `GROUP="video"`, `MODE="0660"`, and
+`TAG+="uaccess"` so Hermes control ioctls can run without root.
 
 ## Userspace communication
 
@@ -166,10 +187,10 @@ output, clears the tracked frame, and emits hotplug.
 `ACQUIRE_FRAME` supports metadata-only acquisition by default. If userspace sets `HERMES_KMS_FRAME_REQUEST_DMABUF`, the driver exports DMA-BUF fds for the currently tracked scanout framebuffer and sets `HERMES_KMS_FRAME_DMABUF_VALID` on success.
 
 If userspace sets `HERMES_KMS_FRAME_REQUEST_SYNC_FILE`, `ACQUIRE_FRAME`
-returns a signaled sync_file fd for the tracked frame. This fence means the
-frame reached the Hermes-KMS atomic update path and is available to consume; it
-does not prove the downstream hardware encoder can import the buffer without an
-internal copy.
+returns a sync_file fd carrying the framebuffer's implicit write fence (from the
+buffer's `dma_resv`), or an already-signalled fence when the buffer is idle. The
+consumer waits on it before sampling, so a frame the compositor flipped while its
+GPU was still rendering is read only after that render completes.
 
 `WAIT_FRAME` lets Hermes block until `frame_sequence` advances past a known
 sequence, with a caller-provided timeout. This is the intended low-latency
@@ -182,7 +203,10 @@ import DMA-BUF into encoder
 after_sequence = returned sequence
 ```
 
-This proves the driver can hand userspace a shared buffer without a driver-side CPU readback. It does not, by itself, prove end-to-end hardware encoder zero-copy; Hermes still needs to validate format/modifier/import compatibility with VAAPI/NVENC/AMF.
+This hands userspace a shared buffer with no driver-side CPU readback. Hermes
+validates end-to-end zero-copy on VAAPI today (XRGB8888, linear): the captured
+DMA-BUF is imported by a real GPU and encoded directly. NVENC/AMF still need
+their own format/modifier/import validation.
 
 `GET_METRICS` reports counters and timestamps for frame updates, frame waits,
 acquires, DMA-BUF exports, sync_file exports, hotplug events, output lifecycle,
