@@ -10,6 +10,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/ktime.h>
+#include <linux/hrtimer.h>
 #include <linux/jiffies.h>
 #include <linux/platform_device.h>
 #include <linux/dma-buf.h>
@@ -23,23 +24,30 @@
 
 #include <drm/hermes_kms_drm.h>
 
+#include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_connector.h>
+#include <drm/drm_crtc.h>
+#include <drm/drm_crtc_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
+#include <drm/drm_encoder.h>
 #include <drm/drm_file.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_mode_object.h>
 #include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_plane.h>
+#include <drm/drm_plane_helper.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_print.h>
 #include <drm/drm_prime.h>
-#include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_vblank.h>
 
 #define HERMES_KMS_DRIVER_NAME "hermes-kms"
@@ -81,12 +89,30 @@ MODULE_PARM_DESC(initial_refresh_hz, "Initial virtual output refresh rate");
 
 struct hermes_kms_device {
 	struct drm_device drm;
-	struct drm_simple_display_pipe pipe;
+	/*
+	 * Explicit KMS objects (CRTC + encoder + primary plane), rather than
+	 * drm_simple_display_pipe, so we can drive a software vblank timer the
+	 * way vkms does. The simple pipe helper does not support timer-based
+	 * vblank, which a virtual display needs to pace the compositor at the
+	 * mode's refresh instead of its commit/ack loop (~40fps).
+	 */
+	struct drm_crtc crtc;
+	struct drm_encoder encoder;
+	struct drm_plane primary;
 	struct drm_connector connector;
 	struct mutex state_lock;
 	wait_queue_head_t frame_wait;
 	struct drm_framebuffer *framebuffer;
 	struct drm_file *owner_file;
+	/*
+	 * Software vblank timer. A virtual display has no hardware vblank, so the
+	 * compositor (KWin/GNOME) gets no periodic "present now" tick and ends up
+	 * composing at the speed of its commit/ack loop (~40fps) instead of the
+	 * mode's refresh rate. This hrtimer fires at the requested refresh so the
+	 * compositor composes at the full rate (60/120/144Hz). Modelled on vkms.
+	 */
+	struct hrtimer vblank_timer;
+	ktime_t vblank_period;  /* nanoseconds between vblanks for the active mode */
 	/*
 	 * Per-plane dma-buf export cache. drm_gem_prime_export() always
 	 * allocates a fresh dma_buf, so re-exporting the same scanout BO every
@@ -452,9 +478,190 @@ static const struct drm_connector_funcs hermes_kms_connector_funcs = {
 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
 };
 
+static inline struct hermes_kms_device *crtc_to_hermes_kms(struct drm_crtc *crtc)
+{
+	return container_of(crtc, struct hermes_kms_device, crtc);
+}
+
+/*
+ * Software vblank timer callback. Mirrors vkms: roll the timer forward, then
+ * signal the vblank to DRM (which delivers any armed page-flip event and lets
+ * the compositor schedule the next frame at the mode's refresh rate).
+ */
+static enum hrtimer_restart hermes_kms_vblank_timer(struct hrtimer *timer)
+{
+	struct hermes_kms_device *hdev =
+		container_of(timer, struct hermes_kms_device, vblank_timer);
+	struct drm_crtc *crtc = &hdev->crtc;
+	u64 ret_overrun;
+	bool ret;
+
+	ret_overrun = hrtimer_forward_now(&hdev->vblank_timer,
+					  hdev->vblank_period);
+	if (ret_overrun != 1)
+		drm_dbg_kms(&hdev->drm, "vblank timer overrun\n");
+
+	ret = drm_crtc_handle_vblank(crtc);
+	if (!ret)
+		drm_err(&hdev->drm, "hermes-kms failure on handling vblank\n");
+
+	return HRTIMER_RESTART;
+}
+
+static int hermes_kms_enable_vblank(struct drm_crtc *crtc)
+{
+	struct hermes_kms_device *hdev = crtc_to_hermes_kms(crtc);
+	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
+	unsigned int refresh = drm_mode_vrefresh(&crtc->mode);
+
+	if (!refresh)
+		refresh = HERMES_KMS_DEFAULT_REFRESH_HZ;
+
+	/*
+	 * Prefer the DRM-calculated per-frame duration (set up by
+	 * drm_calc_timestamping_constants() in the modeset path); fall back to a
+	 * direct computation if it is not available. This honours the active
+	 * mode's refresh, so 60/120/144Hz all work.
+	 */
+	if (vblank && vblank->framedur_ns)
+		hdev->vblank_period = ns_to_ktime(vblank->framedur_ns);
+	else
+		hdev->vblank_period = ns_to_ktime(NSEC_PER_SEC / refresh);
+
+	hrtimer_start(&hdev->vblank_timer, hdev->vblank_period,
+		      HRTIMER_MODE_REL);
+
+	return 0;
+}
+
+static void hermes_kms_disable_vblank(struct drm_crtc *crtc)
+{
+	struct hermes_kms_device *hdev = crtc_to_hermes_kms(crtc);
+
+	hrtimer_cancel(&hdev->vblank_timer);
+}
+
+/*
+ * Provide a vblank timestamp from the timer. Without this hook DRM cannot
+ * timestamp timer-driven vblanks and drm_crtc_handle_vblank() misbehaves.
+ * Mirrors vkms.
+ */
+static bool hermes_kms_get_vblank_timestamp(struct drm_crtc *crtc,
+					    int *max_error,
+					    ktime_t *vblank_time,
+					    bool in_vblank_irq)
+{
+	struct hermes_kms_device *hdev = crtc_to_hermes_kms(crtc);
+	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
+
+	if (!READ_ONCE(vblank->enabled)) {
+		*vblank_time = ktime_get();
+		return true;
+	}
+
+	*vblank_time = READ_ONCE(hdev->vblank_timer.node.expires);
+
+	if (WARN_ON(*vblank_time == vblank->time))
+		return true;
+
+	/* The timer was rolled forward before processing, so correct by one. */
+	*vblank_time -= hdev->vblank_period;
+
+	return true;
+}
+
+static const struct drm_crtc_funcs hermes_kms_crtc_funcs = {
+	.set_config = drm_atomic_helper_set_config,
+	.page_flip = drm_atomic_helper_page_flip,
+	.reset = drm_atomic_helper_crtc_reset,
+	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
+	.enable_vblank = hermes_kms_enable_vblank,
+	.disable_vblank = hermes_kms_disable_vblank,
+	.get_vblank_timestamp = hermes_kms_get_vblank_timestamp,
+};
+
+static int hermes_kms_crtc_atomic_check(struct drm_crtc *crtc,
+					struct drm_atomic_state *state)
+{
+	return 0;
+}
+
+static void hermes_kms_crtc_atomic_enable(struct drm_crtc *crtc,
+					  struct drm_atomic_state *state)
+{
+	struct hermes_kms_device *hdev = crtc_to_hermes_kms(crtc);
+
+	mutex_lock(&hdev->state_lock);
+	hdev->last_enable_ns = ktime_get_ns();
+	mutex_unlock(&hdev->state_lock);
+
+	/*
+	 * Compute the vblank timestamping constants (framedur_ns/linedur_ns)
+	 * for the active mode before enabling vblank, so the vblank timer period
+	 * and get_vblank_timestamp() are accurate. Required for timer-driven
+	 * vblank; without it framedur_ns stays zero.
+	 */
+	drm_calc_timestamping_constants(crtc, &crtc->state->mode);
+
+	drm_crtc_vblank_on(crtc);
+
+	drm_info(&hdev->drm, "enabled virtual display %ux%u@%d\n",
+		 crtc->state->mode.hdisplay,
+		 crtc->state->mode.vdisplay,
+		 drm_mode_vrefresh(&crtc->state->mode));
+}
+
+static void hermes_kms_crtc_atomic_disable(struct drm_crtc *crtc,
+					   struct drm_atomic_state *state)
+{
+	struct hermes_kms_device *hdev = crtc_to_hermes_kms(crtc);
+
+	drm_crtc_vblank_off(crtc);
+
+	mutex_lock(&hdev->state_lock);
+	hdev->last_disable_ns = ktime_get_ns();
+	mutex_unlock(&hdev->state_lock);
+	hermes_kms_track_frame(hdev, NULL);
+
+	drm_info(&hdev->drm, "disabled virtual display\n");
+}
+
+static void hermes_kms_crtc_atomic_flush(struct drm_crtc *crtc,
+					 struct drm_atomic_state *state)
+{
+	struct hermes_kms_device *hdev = crtc_to_hermes_kms(crtc);
+	struct drm_plane *plane = &hdev->primary;
+	struct drm_framebuffer *fb = plane->state ? plane->state->fb : NULL;
+
+	hermes_kms_track_frame(hdev, fb);
+
+	if (crtc->state->event) {
+		spin_lock_irq(&crtc->dev->event_lock);
+		/*
+		 * Pace the flip completion to the next vblank tick when vblank is
+		 * on (matching vkms). The reference from drm_crtc_vblank_get() is
+		 * released by DRM when the armed event fires; do not put it here.
+		 */
+		if (drm_crtc_vblank_get(crtc) != 0)
+			drm_crtc_send_vblank_event(crtc, crtc->state->event);
+		else
+			drm_crtc_arm_vblank_event(crtc, crtc->state->event);
+		spin_unlock_irq(&crtc->dev->event_lock);
+
+		crtc->state->event = NULL;
+	}
+}
+
+static const struct drm_crtc_helper_funcs hermes_kms_crtc_helper_funcs = {
+	.atomic_check = hermes_kms_crtc_atomic_check,
+	.atomic_enable = hermes_kms_crtc_atomic_enable,
+	.atomic_disable = hermes_kms_crtc_atomic_disable,
+	.atomic_flush = hermes_kms_crtc_atomic_flush,
+};
+
 static enum drm_mode_status
-hermes_kms_pipe_mode_valid(struct drm_simple_display_pipe *pipe,
-			   const struct drm_display_mode *mode)
+hermes_kms_plane_mode_valid(const struct drm_display_mode *mode)
 {
 	if (mode->hdisplay < HERMES_KMS_MIN_WIDTH ||
 	    mode->vdisplay < HERMES_KMS_MIN_HEIGHT)
@@ -470,72 +677,58 @@ hermes_kms_pipe_mode_valid(struct drm_simple_display_pipe *pipe,
 	return MODE_OK;
 }
 
-static int hermes_kms_pipe_check(struct drm_simple_display_pipe *pipe,
-				 struct drm_plane_state *plane_state,
-				 struct drm_crtc_state *crtc_state)
+static int hermes_kms_plane_atomic_check(struct drm_plane *plane,
+					 struct drm_atomic_state *state)
 {
-	if (!crtc_state->enable)
+	struct drm_plane_state *new_state =
+		drm_atomic_get_new_plane_state(state, plane);
+	struct drm_crtc_state *crtc_state;
+	int ret;
+
+	if (!new_state->crtc)
 		return 0;
 
-	crtc_state->no_vblank = true;
+	crtc_state = drm_atomic_get_new_crtc_state(state, new_state->crtc);
+
+	ret = drm_atomic_helper_check_plane_state(new_state, crtc_state,
+						  DRM_PLANE_NO_SCALING,
+						  DRM_PLANE_NO_SCALING,
+						  false, true);
+	if (ret)
+		return ret;
+
+	if (new_state->fb) {
+		enum drm_mode_status status =
+			hermes_kms_plane_mode_valid(&crtc_state->mode);
+
+		if (status != MODE_OK)
+			return -EINVAL;
+	}
+
 	return 0;
 }
 
-static void hermes_kms_pipe_enable(struct drm_simple_display_pipe *pipe,
-				   struct drm_crtc_state *crtc_state,
-				   struct drm_plane_state *plane_state)
+static void hermes_kms_plane_atomic_update(struct drm_plane *plane,
+					   struct drm_atomic_state *state)
 {
-	struct drm_device *drm = pipe->crtc.dev;
-	struct hermes_kms_device *hdev = to_hermes_kms(drm);
-
-	mutex_lock(&hdev->state_lock);
-	hdev->last_enable_ns = ktime_get_ns();
-	mutex_unlock(&hdev->state_lock);
-
-	hermes_kms_track_frame(hdev, plane_state ? plane_state->fb : NULL);
-
-	drm_info(drm, "enabled virtual display %ux%u@%d\n",
-		 crtc_state->mode.hdisplay,
-		 crtc_state->mode.vdisplay,
-		 drm_mode_vrefresh(&crtc_state->mode));
+	/* Frame tracking happens in the CRTC atomic_flush after the commit. */
 }
 
-static void hermes_kms_pipe_disable(struct drm_simple_display_pipe *pipe)
-{
-	struct hermes_kms_device *hdev = to_hermes_kms(pipe->crtc.dev);
+static const struct drm_plane_helper_funcs hermes_kms_plane_helper_funcs = {
+	.atomic_check = hermes_kms_plane_atomic_check,
+	.atomic_update = hermes_kms_plane_atomic_update,
+};
 
-	mutex_lock(&hdev->state_lock);
-	hdev->last_disable_ns = ktime_get_ns();
-	mutex_unlock(&hdev->state_lock);
-	hermes_kms_track_frame(hdev, NULL);
+static const struct drm_plane_funcs hermes_kms_plane_funcs = {
+	.update_plane = drm_atomic_helper_update_plane,
+	.disable_plane = drm_atomic_helper_disable_plane,
+	.reset = drm_atomic_helper_plane_reset,
+	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
+};
 
-	drm_info(pipe->crtc.dev, "disabled virtual display\n");
-}
-
-static void hermes_kms_pipe_update(struct drm_simple_display_pipe *pipe,
-				   struct drm_plane_state *old_plane_state)
-{
-	struct drm_crtc *crtc = &pipe->crtc;
-	struct drm_pending_vblank_event *event = crtc->state->event;
-	struct hermes_kms_device *hdev = to_hermes_kms(crtc->dev);
-	struct drm_plane_state *plane_state = pipe->plane.state;
-
-	hermes_kms_track_frame(hdev, plane_state ? plane_state->fb : NULL);
-
-	if (event) {
-		crtc->state->event = NULL;
-		spin_lock_irq(&crtc->dev->event_lock);
-		drm_crtc_send_vblank_event(crtc, event);
-		spin_unlock_irq(&crtc->dev->event_lock);
-	}
-}
-
-static const struct drm_simple_display_pipe_funcs hermes_kms_pipe_funcs = {
-	.mode_valid = hermes_kms_pipe_mode_valid,
-	.check = hermes_kms_pipe_check,
-	.enable = hermes_kms_pipe_enable,
-	.disable = hermes_kms_pipe_disable,
-	.update = hermes_kms_pipe_update,
+static const struct drm_encoder_funcs hermes_kms_encoder_funcs = {
+	.destroy = drm_encoder_cleanup,
 };
 
 static const struct drm_mode_config_funcs hermes_kms_mode_config_funcs = {
@@ -634,24 +827,24 @@ static int hermes_kms_ioctl_get_status(struct drm_device *drm, void *data,
 	mutex_unlock(&hdev->state_lock);
 
 	status->connector_id = hdev->connector.base.id;
-	status->crtc_id = hdev->pipe.crtc.base.id;
-	status->plane_id = hdev->pipe.plane.base.id;
-	status->encoder_id = hdev->pipe.encoder.base.id;
+	status->crtc_id = hdev->crtc.base.id;
+	status->plane_id = hdev->primary.base.id;
+	status->encoder_id = hdev->encoder.base.id;
 
 	/*
 	 * crtc->state is swapped under the CRTC modeset lock during an atomic
 	 * commit; take it so we never dereference a state being freed. This is
 	 * a diagnostic path, so blocking briefly on a concurrent commit is fine.
 	 */
-	drm_modeset_lock(&hdev->pipe.crtc.mutex, NULL);
-	crtc_state = hdev->pipe.crtc.state;
+	drm_modeset_lock(&hdev->crtc.mutex, NULL);
+	crtc_state = hdev->crtc.state;
 	if (crtc_state && crtc_state->enable) {
 		status->flags |= HERMES_KMS_STATUS_SCANOUT_ACTIVE;
 		status->active_width = crtc_state->mode.hdisplay;
 		status->active_height = crtc_state->mode.vdisplay;
 		status->active_refresh_hz = drm_mode_vrefresh(&crtc_state->mode);
 	}
-	drm_modeset_unlock(&hdev->pipe.crtc.mutex);
+	drm_modeset_unlock(&hdev->crtc.mutex);
 
 	return 0;
 }
@@ -710,9 +903,9 @@ static int hermes_kms_ioctl_get_identity(struct drm_device *drm, void *data,
 			sizeof(identity->connector_name));
 
 	identity->connector_id = hdev->connector.base.id;
-	identity->crtc_id = hdev->pipe.crtc.base.id;
-	identity->plane_id = hdev->pipe.plane.base.id;
-	identity->encoder_id = hdev->pipe.encoder.base.id;
+	identity->crtc_id = hdev->crtc.base.id;
+	identity->plane_id = hdev->primary.base.id;
+	identity->encoder_id = hdev->encoder.base.id;
 
 	return 0;
 }
@@ -1319,12 +1512,39 @@ static int hermes_kms_modeset_init(struct hermes_kms_device *hdev)
 	hdev->connector.polled = DRM_CONNECTOR_POLL_CONNECT |
 				 DRM_CONNECTOR_POLL_DISCONNECT;
 
-	ret = drm_simple_display_pipe_init(drm, &hdev->pipe,
-					   &hermes_kms_pipe_funcs,
-					   hermes_kms_formats,
-					   ARRAY_SIZE(hermes_kms_formats),
-					   NULL,
-					   &hdev->connector);
+	/* Primary plane. */
+	ret = drm_universal_plane_init(drm, &hdev->primary, 0,
+				       &hermes_kms_plane_funcs,
+				       hermes_kms_formats,
+				       ARRAY_SIZE(hermes_kms_formats),
+				       NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
+	if (ret)
+		return ret;
+	drm_plane_helper_add(&hdev->primary, &hermes_kms_plane_helper_funcs);
+
+	/* CRTC driven by the software vblank timer. Use the managed variant to
+	 * match vkms and pair with devm_drm_dev_alloc(). */
+	drm_dbg_kms(drm, "primary plane type=%d (PRIMARY=%d) before crtc init\n",
+		    hdev->primary.type, DRM_PLANE_TYPE_PRIMARY);
+	ret = drmm_crtc_init_with_planes(drm, &hdev->crtc, &hdev->primary, NULL,
+					 &hermes_kms_crtc_funcs, NULL);
+	if (ret)
+		return ret;
+	drm_crtc_helper_add(&hdev->crtc, &hermes_kms_crtc_helper_funcs);
+
+	/* Encoder linking the CRTC to the connector. */
+	hdev->encoder.possible_crtcs = drm_crtc_mask(&hdev->crtc);
+	ret = drm_encoder_init(drm, &hdev->encoder, &hermes_kms_encoder_funcs,
+			       DRM_MODE_ENCODER_VIRTUAL, NULL);
+	if (ret)
+		return ret;
+
+	ret = drm_connector_attach_encoder(&hdev->connector, &hdev->encoder);
+	if (ret)
+		return ret;
+
+	/* One CRTC, with a software vblank timer driving its refresh. */
+	ret = drm_vblank_init(drm, 1);
 	if (ret)
 		return ret;
 
@@ -1348,6 +1568,8 @@ static int hermes_kms_probe(struct platform_device *pdev)
 	mutex_init(&hdev->state_lock);
 	mutex_init(&hdev->export_lock);
 	init_waitqueue_head(&hdev->frame_wait);
+	hrtimer_setup(&hdev->vblank_timer, hermes_kms_vblank_timer,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	hdev->next_session_id = 1;
 	hermes_kms_init_output_state(drm, hdev);
 
@@ -1385,6 +1607,8 @@ static void hermes_kms_remove(struct platform_device *pdev)
 	hermes_kms_clear_owner_locked(hdev);
 	mutex_unlock(&hdev->state_lock);
 	hermes_kms_track_frame(hdev, NULL);
+
+	hrtimer_cancel(&hdev->vblank_timer);
 
 	drm_dev_unregister(&hdev->drm);
 	drm_atomic_helper_shutdown(&hdev->drm);
