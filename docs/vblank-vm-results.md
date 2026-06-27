@@ -80,10 +80,33 @@ but `frame_sequence` stayed at 1 because a shadow-framebuffer compositor with no
 real damage doesn't page-flip continuously — that's a test artifact, not a vblank
 problem. The vblank rate itself (measured directly by modetest -v) is correct.
 
-## Recommended next step
+## Recommended next step (host test — for the morning)
 
-The driver is kernel-validated. The remaining question — does the vblank timer
-make KWin compose at full refresh (60+) instead of ~40 — is a **rendering**
-question that needs a GPU. Best measured on the host with the now-fixed driver
-loaded `non_desktop` (so it doesn't blank the physical monitor), capturing the
-compositor FPS via the driver's `frame_sequence` while a client streams.
+The driver is **kernel-validated and lockdep-clean**; the vblank fires at
+60/120/144Hz. The only remaining question — does the vblank make KWin compose a
+game at full refresh instead of ~40 — needs a real GPU, so it must be tested on
+the host. The kernel-level bugs that soft-locked the host are fixed, so this is
+much lower risk now.
+
+To test on the host WITHOUT blanking the physical monitor, the open question is
+the KWin-steals-the-desktop problem. Two things to try, in order:
+
+1. Load with `non_desktop=1`:
+   `sudo insmod hermes_kms.ko initial_enabled=1 non_desktop=1`
+   A non-desktop connector is not adopted as a session monitor by KWin. RISK:
+   it may also stop KWin composing on it at all (EVDI is NOT non_desktop and
+   relies on Apollo's kscreen-doctor to place the virtual output as secondary).
+   So test whether the stream still works with non_desktop=1.
+2. If non_desktop breaks streaming, keep non_desktop=0 but let Apollo manage the
+   layout via kscreen-doctor (as it already does for EVDI) so the virtual output
+   is added as secondary, not made primary. The blank-screen happened in the
+   bare modetest/isolated test where nothing manages the layout — it may not
+   happen in the real Apollo flow.
+
+DO NOT change the non_desktop default blind — it needs a host test to confirm it
+doesn't break the streaming capture path. Decide with a real test.
+
+Measure compositor FPS on the host while a game streams: the driver's
+`frame_update_count` (via `hermes-kmsctl metrics`) advances once per page-flip,
+so its rate is the real compositor FPS. Compare against the pre-vblank ~40 and
+against EVDI (~40 with ~2x our spikes).
