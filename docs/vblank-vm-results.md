@@ -61,9 +61,18 @@ freq: 60.00Hz
 freq: 60.00Hz
 ```
 
-The software vblank timer delivers a rock-steady **60.00Hz** tick (and @120/@144
-when those modes are set). This is the whole point: the compositor now gets a
-real per-frame "present now" signal at the mode's refresh, which is what was
+All three refresh rates verified (modetest -v, mode matched by name so the CVT
+preferred mode is used):
+
+```text
+target  60Hz -> freq: 60.00Hz
+target 120Hz -> freq: 119.96 / 119.97Hz
+target 144Hz -> freq: 143.90 / 143.91Hz
+```
+
+The software vblank timer delivers a rock-steady tick at the requested refresh
+(60/120/144Hz — configurable). This is the whole point: the compositor now gets
+a real per-frame "present now" signal at the mode's refresh, which is what was
 missing (no_vblank=true → compositor paced by its commit/ack loop at ~40fps).
 
 Note: a Weston run with `--renderer=pixman` adopted Virtual-1 and scanned out,
