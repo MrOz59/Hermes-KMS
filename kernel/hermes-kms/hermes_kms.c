@@ -31,6 +31,7 @@
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_crtc_helper.h>
+#include <drm/drm_damage_helper.h>
 #include <drm/drm_debugfs.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
@@ -101,6 +102,7 @@ struct hermes_kms_device {
 	struct drm_crtc crtc;
 	struct drm_encoder encoder;
 	struct drm_plane primary;
+	struct drm_plane cursor;
 	struct drm_connector connector;
 	struct mutex state_lock;
 	wait_queue_head_t frame_wait;
@@ -146,6 +148,17 @@ struct hermes_kms_device {
 	u32 framebuffer_pitch[4];
 	u32 framebuffer_offset[4];
 	u64 framebuffer_modifier;
+	/*
+	 * Damage region accumulated for the in-progress frame, set by the plane
+	 * atomic_update from FB_DAMAGE_CLIPS and latched into the frame at flush.
+	 * damage_valid is cleared when the compositor provides no damage (treat
+	 * the whole frame as dirty). Protected by state_lock.
+	 */
+	bool framebuffer_damage_valid;
+	u32 framebuffer_damage_x1;
+	u32 framebuffer_damage_y1;
+	u32 framebuffer_damage_x2;
+	u32 framebuffer_damage_y2;
 	u64 frame_update_count;
 	u64 vblank_count;	   /* vblanks the software timer has fired */
 	u64 vblank_overrun_count;  /* timer ticks that fell behind (dropped flips) */
@@ -194,6 +207,11 @@ static void hermes_kms_drop_export_cache_locked(struct hermes_kms_device *hdev)
 
 static const u32 hermes_kms_formats[] = {
 	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+};
+
+/* The cursor plane only needs the standard alpha cursor format. */
+static const u32 hermes_kms_cursor_formats[] = {
 	DRM_FORMAT_ARGB8888,
 };
 
@@ -487,6 +505,12 @@ static inline struct hermes_kms_device *crtc_to_hermes_kms(struct drm_crtc *crtc
 	return container_of(crtc, struct hermes_kms_device, crtc);
 }
 
+static inline struct hermes_kms_device *
+plane_to_hermes_kms(struct drm_plane *plane)
+{
+	return container_of(plane, struct hermes_kms_device, primary);
+}
+
 /*
  * Software vblank timer callback. Mirrors vkms: roll the timer forward, then
  * signal the vblank to DRM (which delivers any armed page-flip event and lets
@@ -766,7 +790,38 @@ static int hermes_kms_plane_atomic_check(struct drm_plane *plane,
 static void hermes_kms_plane_atomic_update(struct drm_plane *plane,
 					   struct drm_atomic_state *state)
 {
-	/* Frame tracking happens in the CRTC atomic_flush after the commit. */
+	struct hermes_kms_device *hdev = plane_to_hermes_kms(plane);
+	struct drm_plane_state *old_state =
+		drm_atomic_get_old_plane_state(state, plane);
+	struct drm_plane_state *new_state =
+		drm_atomic_get_new_plane_state(state, plane);
+	struct drm_rect damage;
+	bool have_damage = false;
+
+	/*
+	 * Capture the compositor's FB_DAMAGE_CLIPS for this commit and latch it
+	 * so ACQUIRE_FRAME can hand the consumer a single merged dirty rect
+	 * (the consumer encodes only the changed region). If no damage was
+	 * supplied, fall back to "whole frame dirty" so correctness never
+	 * depends on a compositor providing damage. Actual scanout bookkeeping
+	 * still happens in the CRTC atomic_flush.
+	 */
+	if (new_state && new_state->fb && new_state->crtc)
+		have_damage = drm_atomic_helper_damage_merged(old_state,
+							      new_state,
+							      &damage);
+
+	mutex_lock(&hdev->state_lock);
+	if (have_damage) {
+		hdev->framebuffer_damage_valid = true;
+		hdev->framebuffer_damage_x1 = max(damage.x1, 0);
+		hdev->framebuffer_damage_y1 = max(damage.y1, 0);
+		hdev->framebuffer_damage_x2 = max(damage.x2, 0);
+		hdev->framebuffer_damage_y2 = max(damage.y2, 0);
+	} else {
+		hdev->framebuffer_damage_valid = false;
+	}
+	mutex_unlock(&hdev->state_lock);
 }
 
 static const struct drm_plane_helper_funcs hermes_kms_plane_helper_funcs = {
@@ -775,6 +830,57 @@ static const struct drm_plane_helper_funcs hermes_kms_plane_helper_funcs = {
 };
 
 static const struct drm_plane_funcs hermes_kms_plane_funcs = {
+	.update_plane = drm_atomic_helper_update_plane,
+	.disable_plane = drm_atomic_helper_disable_plane,
+	.destroy = drm_plane_cleanup,
+	.reset = drm_atomic_helper_plane_reset,
+	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
+};
+
+/*
+ * Cursor plane. Exposing a cursor plane lets the compositor (KWin/GNOME) move
+ * the pointer without recompositing the whole output every frame, which keeps
+ * the captured primary framebuffer stable on cursor-only motion. The capture
+ * consumer (Apollo) detects the cursor plane separately and renders it
+ * client-side (Moonlight overlays the cursor), so the cursor does not need to
+ * be blended into the streamed primary plane here.
+ */
+static int hermes_kms_cursor_atomic_check(struct drm_plane *plane,
+					  struct drm_atomic_state *state)
+{
+	struct drm_plane_state *new_state =
+		drm_atomic_get_new_plane_state(state, plane);
+	struct drm_crtc_state *crtc_state;
+
+	if (!new_state->crtc)
+		return 0;
+
+	crtc_state = drm_atomic_get_new_crtc_state(state, new_state->crtc);
+
+	/* Cursor may sit partly off-screen and is never scaled or clipped. */
+	return drm_atomic_helper_check_plane_state(new_state, crtc_state,
+						   DRM_PLANE_NO_SCALING,
+						   DRM_PLANE_NO_SCALING,
+						   true, true);
+}
+
+static void hermes_kms_cursor_atomic_update(struct drm_plane *plane,
+					    struct drm_atomic_state *state)
+{
+	/*
+	 * Nothing to scan out: the cursor is consumed client-side. The update
+	 * exists so the compositor's cursor commits succeed and stay off the
+	 * primary plane's damage path.
+	 */
+}
+
+static const struct drm_plane_helper_funcs hermes_kms_cursor_helper_funcs = {
+	.atomic_check = hermes_kms_cursor_atomic_check,
+	.atomic_update = hermes_kms_cursor_atomic_update,
+};
+
+static const struct drm_plane_funcs hermes_kms_cursor_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane = drm_atomic_helper_disable_plane,
 	.destroy = drm_plane_cleanup,
@@ -1264,6 +1370,13 @@ static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 	frame->plane_count = hdev->framebuffer_plane_count;
 	memcpy(frame->pitch, hdev->framebuffer_pitch, sizeof(frame->pitch));
 	memcpy(frame->offset, hdev->framebuffer_offset, sizeof(frame->offset));
+	if (hdev->framebuffer_damage_valid) {
+		frame->flags |= HERMES_KMS_FRAME_DAMAGE_VALID;
+		frame->damage_x1 = hdev->framebuffer_damage_x1;
+		frame->damage_y1 = hdev->framebuffer_damage_y1;
+		frame->damage_x2 = hdev->framebuffer_damage_x2;
+		frame->damage_y2 = hdev->framebuffer_damage_y2;
+	}
 	mutex_unlock(&hdev->state_lock);
 
 	if (requested_flags & HERMES_KMS_FRAME_REQUEST_DMABUF) {
@@ -1600,6 +1713,9 @@ static int hermes_kms_modeset_init(struct hermes_kms_device *hdev)
 	drm->mode_config.max_width = HERMES_KMS_MAX_WIDTH;
 	drm->mode_config.max_height = HERMES_KMS_MAX_HEIGHT;
 	drm->mode_config.preferred_depth = 24;
+	/* Standard 256x256 cursor envelope so compositors size HW cursors. */
+	drm->mode_config.cursor_width = 256;
+	drm->mode_config.cursor_height = 256;
 	drm->mode_config.funcs = &hermes_kms_mode_config_funcs;
 
 	ret = drm_connector_init(drm, &hdev->connector,
@@ -1639,11 +1755,30 @@ static int hermes_kms_modeset_init(struct hermes_kms_device *hdev)
 		return ret;
 	drm_plane_helper_add(&hdev->primary, &hermes_kms_plane_helper_funcs);
 
+	/*
+	 * Advertise FB_DAMAGE_CLIPS so the compositor can tell us which region
+	 * changed each frame; we forward it to the capture consumer via
+	 * ACQUIRE_FRAME's damage rect so only the dirty region is encoded.
+	 */
+	drm_plane_enable_fb_damage_clips(&hdev->primary);
+
+	/* Cursor plane: lets the compositor offload pointer motion (no full
+	 * recomposite per move). Consumed client-side, not blended into capture. */
+	ret = drm_universal_plane_init(drm, &hdev->cursor, 0,
+				       &hermes_kms_cursor_funcs,
+				       hermes_kms_cursor_formats,
+				       ARRAY_SIZE(hermes_kms_cursor_formats),
+				       NULL, DRM_PLANE_TYPE_CURSOR, NULL);
+	if (ret)
+		return ret;
+	drm_plane_helper_add(&hdev->cursor, &hermes_kms_cursor_helper_funcs);
+
 	/* CRTC driven by the software vblank timer. Use the managed variant to
 	 * match vkms and pair with devm_drm_dev_alloc(). */
 	drm_dbg_kms(drm, "primary plane type=%d (PRIMARY=%d) before crtc init\n",
 		    hdev->primary.type, DRM_PLANE_TYPE_PRIMARY);
-	ret = drmm_crtc_init_with_planes(drm, &hdev->crtc, &hdev->primary, NULL,
+	ret = drmm_crtc_init_with_planes(drm, &hdev->crtc, &hdev->primary,
+					 &hdev->cursor,
 					 &hermes_kms_crtc_funcs, NULL);
 	if (ret)
 		return ret;

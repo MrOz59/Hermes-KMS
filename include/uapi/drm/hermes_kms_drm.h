@@ -49,6 +49,13 @@ extern "C" {
 #define HERMES_KMS_FRAME_SYNC_FILE_VALID	(1ULL << 3)
 #define HERMES_KMS_FRAME_COPY_FALLBACK_REQUIRED	(1ULL << 4)
 #define HERMES_KMS_FRAME_REQUEST_SYNC_FILE	(1ULL << 5)
+/*
+ * Set when damage_x1/y1/x2/y2 describe the region changed since the previous
+ * frame (from the compositor's FB_DAMAGE_CLIPS). When DAMAGE_VALID is clear the
+ * consumer must treat the whole frame as dirty. damage is a half-open rect:
+ * [x1,x2) x [y1,y2); an empty rect (x1==x2 || y1==y2) means "no change".
+ */
+#define HERMES_KMS_FRAME_DAMAGE_VALID		(1ULL << 6)
 
 #define HERMES_KMS_WAIT_FRAME_READY		(1ULL << 0)
 
@@ -142,7 +149,16 @@ struct drm_hermes_kms_acquire_frame {
 	__s32 dma_buf_fd[4];
 	__s32 sync_file_fd;
 	__u32 reserved0;
-	__u64 reserved[8];
+	/*
+	 * Damage rectangle for this frame, valid only when
+	 * HERMES_KMS_FRAME_DAMAGE_VALID is set in flags (half-open:
+	 * [damage_x1, damage_x2) x [damage_y1, damage_y2), in pixels).
+	 */
+	__u32 damage_x1;
+	__u32 damage_y1;
+	__u32 damage_x2;
+	__u32 damage_y2;
+	__u64 reserved[6];
 };
 
 struct drm_hermes_kms_wait_frame {
