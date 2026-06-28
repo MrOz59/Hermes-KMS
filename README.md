@@ -39,7 +39,11 @@ Measured capture cost on KWin at 720p: ~8 us/frame (`ACQUIRE_FRAME`) versus
 ## Features
 
 - out-of-tree kernel module: `hermes_kms.ko`;
-- virtual connector + simple display pipe via DRM/KMS helpers;
+- explicit CRTC/encoder/plane modeset with a software vblank timer, so the
+  compositor composes the virtual output at its full refresh (60/120/144 Hz);
+- cursor plane so the compositor offloads pointer motion;
+- damage tracking (`FB_DAMAGE_CLIPS`) forwarded to the capture consumer via
+  `ACQUIRE_FRAME`;
 - render node for masterless, zero-copy frame consumption;
 - synthetic EDID so compositors treat `HERMES-1` as a normal monitor;
 - exact requested mode synthesized via CVT and re-probed on `SET_OUTPUT`, so
@@ -47,6 +51,7 @@ Measured capture cost on KWin at 720p: ~8 us/frame (`ACQUIRE_FRAME`) versus
 - DMA-BUF export of the tracked scanout framebuffer, cached per buffer object;
 - real `dma_resv` write fence exported as a sync_file;
 - Hermes/apps UAPI through DRM ioctls; frame/metric tracking;
+- debugfs telemetry at `/sys/kernel/debug/dri/<n>/hermes_kms_stats`;
 - debug/control tool: `tools/hermes-kmsctl/hermes-kmsctl`;
 - 640x480 through 3840x2160 mode range, 1920x1080 preferred.
 
@@ -137,6 +142,16 @@ sudo make install-dev-udev   # then log out/in once if KWin already opened the c
 `scripts/test-driver-zero-copy.sh` automates this: it reloads an isolated
 module, drives a `modetest` producer, and verifies the DMA-BUF/sync_file path.
 
+Other validation scripts (run as root, in the virtme-ng VM or on the host):
+
+- `scripts/vm-pacing-test.sh` — asserts the vblank timer fires at exactly
+  60/120/144 Hz with no missed vblanks (uses `hermes-vblank-meter.c`);
+- `scripts/vm-export-stress.sh` — hammers `ACQUIRE_FRAME` from many threads
+  while the scanout buffer churns, to catch dma-buf/fence lifetime bugs (run
+  under `slub_debug=FZPU`);
+- `scripts/host-vblank-isolated.sh` — isolated vblank-rate check on real
+  hardware; `scripts/host-restore-display.sh` re-enables the physical monitor.
+
 Remove the rule to return to the compositor-driven path:
 
 ```bash
@@ -189,6 +204,11 @@ returns a sync_file fd carrying the framebuffer's implicit write fence (from the
 buffer's `dma_resv`), or an already-signalled fence when the buffer is idle. The
 consumer waits on it before sampling, so a frame the compositor flipped while its
 GPU was still rendering is read only after that render completes.
+
+When the compositor supplies damage (`FB_DAMAGE_CLIPS`), `ACQUIRE_FRAME` also
+returns the merged dirty rectangle (`damage_x1..y2`, flagged by
+`HERMES_KMS_FRAME_DAMAGE_VALID`) so the consumer can encode only the changed
+region. With no damage the whole frame is treated as dirty.
 
 `WAIT_FRAME` lets Hermes block until `frame_sequence` advances past a known
 sequence, with a caller-provided timeout. This is the intended low-latency
