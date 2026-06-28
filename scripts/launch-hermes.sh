@@ -5,9 +5,9 @@
 set -u
 
 APP_DIR=/home/ozzy/Projects/Apollo-Linux
-# Use the build symlink so it always points at the freshest binary
-# (the hashed name changes every commit).
-APOLLO="$APP_DIR/build/sunshine"
+# Resolve the build symlink to the real hashed binary: the name changes every
+# commit, and setcap refuses to operate on a symlink.
+APOLLO="$(readlink -f "$APP_DIR/build/sunshine")"
 WEB_SRC="$APP_DIR/build/assets/web/"
 WEB_DST=/usr/share/apollo/web/
 LOG=/home/ozzy/hermes-stream-test.log
