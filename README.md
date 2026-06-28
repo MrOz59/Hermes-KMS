@@ -260,4 +260,4 @@ producer is still active:
 
 ## Roadmap
 
-See [hermes-linux-virtual-display-backend-roadmap.md](hermes-linux-virtual-display-backend-roadmap.md) and [docs/driver-design.md](docs/driver-design.md).
+See [docs/roadmap.md](docs/roadmap.md) and [docs/driver-design.md](docs/driver-design.md).

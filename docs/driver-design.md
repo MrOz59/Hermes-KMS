@@ -1,8 +1,7 @@
 # Hermes-KMS driver design
 
-Hermes-KMS is intended to be a Linux DRM/KMS virtual display driver that can replace EVDI for Hermes.
-
-The target is not to manage EVDI. EVDI remains a temporary Hermes fallback until Hermes-KMS is mature enough.
+Hermes-KMS is a Linux DRM/KMS virtual display driver that replaces EVDI for
+Hermes. It does not manage EVDI; EVDI remains a supported fallback.
 
 ## Target architecture
 
@@ -22,16 +21,17 @@ VAAPI / future NVENC import
 stream
 ```
 
-## Development order
+## Modeset model
 
-1. Buildable out-of-tree kernel module.
-2. Register a DRM device safely.
-3. Expose a virtual connector named by DRM as `Virtual-*` initially, with user-facing target `HERMES-1`.
-4. Support simple modes such as `1920x1080@60`.
-5. Use DRM GEM helpers as the first buffer-management base.
-6. Add explicit Hermes control/diagnostic interface.
-7. Implement PRIME/DMA-BUF frame export path.
-8. Measure whether the encoder path is actually zero-copy.
+The CRTC, encoder, and primary plane are initialized explicitly (mirroring
+vkms) rather than through `drm_simple_display_pipe`. This is what lets the
+driver run a software vblank timer: an hrtimer fires `drm_crtc_handle_vblank()`
+at the active mode's refresh, so the compositor composes the virtual output at
+its full rate (60/120/144 Hz) and page-flip events are paced to the vblank.
+
+A cursor plane lets the compositor offload pointer motion without recompositing
+the whole output, and `FB_DAMAGE_CLIPS` on the primary plane lets the driver
+forward the changed region to the capture consumer.
 
 ## Communication with Hermes
 
@@ -59,7 +59,7 @@ instead of scraping connector names.
 
 ## Frame and scanout tracking
 
-The driver tracks the current simple-pipe framebuffer on every enable/update callback and exposes the metadata through `GET_STATUS` and `ACQUIRE_FRAME`.
+The driver tracks the current scanout framebuffer on every enable/update/flush callback and exposes the metadata through `GET_STATUS` and `ACQUIRE_FRAME`.
 
 Tracked fields include:
 
@@ -83,7 +83,8 @@ Current behavior:
 - without flags, returns the latest tracked frame metadata;
 - returns `-ENODATA` if no frame has been tracked yet;
 - exports DMA-BUF fds for the tracked framebuffer if userspace requests `HERMES_KMS_FRAME_REQUEST_DMABUF`;
-- sets `HERMES_KMS_FRAME_DMABUF_VALID` only after all requested plane fds were exported successfully.
+- sets `HERMES_KMS_FRAME_DMABUF_VALID` only after all requested plane fds were exported successfully;
+- returns the merged damage rectangle (`damage_x1..y2`, flagged by `HERMES_KMS_FRAME_DAMAGE_VALID`) when the compositor supplied `FB_DAMAGE_CLIPS`, so the consumer can encode only the dirty region.
 
 Future behavior:
 
@@ -127,6 +128,7 @@ wait for the newest sequence and acquire only the latest framebuffer.
 can sample during streaming:
 
 - frame update count and current frame sequence;
+- vblank count and vblank-overrun count (dropped page-flip slots);
 - acquire count and no-frame acquire count;
 - DMA-BUF and sync_file export success/failure counts;
 - wait success, timeout, and interruption counts;
@@ -136,7 +138,8 @@ can sample during streaming:
 
 These metrics are intentionally driver-local and monotonic for the module
 lifetime. Hermes should use them for diagnostics and latency telemetry, not as a
-stable persisted session log.
+stable persisted session log. The same counters are also readable as text at
+`/sys/kernel/debug/dri/<n>/hermes_kms_stats`.
 
 ## Encoder Import Preflight
 
@@ -179,13 +182,16 @@ stream state, and avoid an immediate status round-trip just to discover the
 owner session.
 
 For debug sessions, `tools/hermes-kmsctl/hermes-kmsctl hold 1920x1080@60`
-enables the output and keeps the owner fd open until interrupted. Hermes-KMS
-intentionally follows the EVDI-style control model and uses the primary DRM node
-for control ioctls instead of exposing a render node. The connector starts
-disconnected; Hermes connects it when a stream starts, and the compositor owns
-the real modeset path after the hotplug event. During development the connector
-is marked `non-desktop`, which lets explicit tools use it while discouraging the
-active desktop session from automatically taking DRM master.
+enables the output and keeps the owner fd open until interrupted. The connector
+starts disconnected; Hermes connects it when a stream starts, and the compositor
+owns the real modeset path after the hotplug event.
+
+The driver exposes a **render node** (`DRIVER_RENDER`), and all Hermes ioctls are
+`DRM_RENDER_ALLOW`. Hermes opens the render node — never the primary node, which
+would steal DRM master and EBUSY-block the compositor — so the compositor keeps
+master and drives the modeset while Hermes pulls frames through the side channel.
+`non_desktop` is a load-time parameter (default off) for cases where a compositor
+should treat the output as non-desktop.
 
 For isolated tests with `modetest`, the module can be loaded with
 `initial_enabled=1 hotplug_events=0`. This creates a connected connector without
@@ -203,15 +209,17 @@ root when the local user has normal device access.
 
 ## Current status
 
-The current code is a first PoC driver with a virtual connector, scanout tracking, owner-fd lifecycle, stable output identity, and DMA-BUF export for the tracked framebuffer.
+Implemented and validated: explicit CRTC/encoder/plane modeset with a software
+vblank timer (60/120/144 Hz, lockdep-clean, deterministic pacing), cursor plane,
+damage tracking, render node for masterless zero-copy consumption, scanout
+tracking, owner-fd lifecycle, stable output identity, DMA-BUF + sync_file export,
+strict atomic check, and debugfs telemetry. End-to-end zero-copy is validated on
+VAAPI (XRGB8888, linear).
 
-Still not implemented:
+Not yet implemented:
 
 - a real DRM writeback connector;
-- VAAPI/NVENC/AMF import validation;
-- full compositor recovery handling beyond owner-fd disconnect and hotplug;
-- final distro packaging policy for installing the udev rule.
-
-It does not yet prove the final encoder zero-copy path.
-
-This avoids a bad architectural trap: building a userspace wrapper around EVDI. Hermes-KMS must become its own driver.
+- NVENC/AMF import validation (VAAPI is validated);
+- NV12/P010 scanout and HDR (the compositor composes in RGB; the encoder does
+  RGB→NV12 on the real GPU today);
+- full compositor recovery handling beyond owner-fd disconnect and hotplug.
