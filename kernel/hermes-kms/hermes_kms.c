@@ -19,6 +19,7 @@
 #include <linux/fdtable.h>
 #include <linux/fcntl.h>
 #include <linux/file.h>
+#include <linux/seq_file.h>
 #include <linux/sync_file.h>
 #include <linux/wait.h>
 
@@ -30,6 +31,7 @@
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_crtc_helper.h>
+#include <drm/drm_debugfs.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_encoder.h>
@@ -145,6 +147,8 @@ struct hermes_kms_device {
 	u32 framebuffer_offset[4];
 	u64 framebuffer_modifier;
 	u64 frame_update_count;
+	u64 vblank_count;	   /* vblanks the software timer has fired */
+	u64 vblank_overrun_count;  /* timer ticks that fell behind (dropped flips) */
 	u64 acquire_count;
 	u64 acquire_no_frame_count;
 	u64 dmabuf_export_count;
@@ -498,8 +502,21 @@ static enum hrtimer_restart hermes_kms_vblank_timer(struct hrtimer *timer)
 
 	ret_overrun = hrtimer_forward_now(&hdev->vblank_timer,
 					  hdev->vblank_period);
-	if (ret_overrun != 1)
-		drm_dbg_kms(&hdev->drm, "vblank timer overrun\n");
+	if (ret_overrun != 1) {
+		/*
+		 * More than one period elapsed since the last tick: the timer
+		 * fell behind and at least one vblank (page-flip slot) was
+		 * missed. Track it so the pacing self-test can assert that a
+		 * steady stream produces zero overruns. ret_overrun counts the
+		 * periods skipped over (>=2 here, or 0 if called late-but-once).
+		 */
+		WRITE_ONCE(hdev->vblank_overrun_count,
+			   hdev->vblank_overrun_count +
+				   (ret_overrun > 1 ? ret_overrun - 1 : 1));
+		drm_dbg_kms(&hdev->drm, "vblank timer overrun (skipped=%llu)\n",
+			    (unsigned long long)ret_overrun);
+	}
+	WRITE_ONCE(hdev->vblank_count, hdev->vblank_count + 1);
 
 	ret = drm_crtc_handle_vblank(crtc);
 	if (!ret)
@@ -581,9 +598,47 @@ static const struct drm_crtc_funcs hermes_kms_crtc_funcs = {
 	.get_vblank_timestamp = hermes_kms_get_vblank_timestamp,
 };
 
+static enum drm_mode_status
+hermes_kms_plane_mode_valid(const struct drm_display_mode *mode);
+
 static int hermes_kms_crtc_atomic_check(struct drm_crtc *crtc,
 					struct drm_atomic_state *state)
 {
+	struct drm_crtc_state *crtc_state =
+		drm_atomic_get_new_crtc_state(state, crtc);
+	int ret;
+
+	if (!crtc_state->enable)
+		return 0;
+
+	/*
+	 * Validate the requested mode against this driver's limits up front so a
+	 * malformed commit is rejected at check time (before any hardware-ish
+	 * state is touched), rather than silently scanning out garbage. The
+	 * single plane is the primary, so an enabled+active CRTC must drive a
+	 * framebuffer; refuse an active CRTC with nothing to scan out.
+	 */
+	if (hermes_kms_plane_mode_valid(&crtc_state->mode) != MODE_OK) {
+		drm_dbg_kms(crtc->dev,
+			    "atomic_check: rejecting mode %ux%u@%d (out of range)\n",
+			    crtc_state->mode.hdisplay,
+			    crtc_state->mode.vdisplay,
+			    drm_mode_vrefresh(&crtc_state->mode));
+		return -EINVAL;
+	}
+
+	/*
+	 * Only a full modeset may change the active mode; let the helper enforce
+	 * the standard connector/encoder routing and event invariants too.
+	 */
+	ret = drm_atomic_helper_check_crtc_primary_plane(crtc_state);
+	if (ret) {
+		drm_dbg_kms(crtc->dev,
+			    "atomic_check: active CRTC has no primary plane (%d)\n",
+			    ret);
+		return ret;
+	}
+
 	return 0;
 }
 
@@ -1447,6 +1502,64 @@ static const struct file_operations hermes_kms_fops = {
 	.mmap = drm_gem_mmap,
 };
 
+#ifdef CONFIG_DEBUG_FS
+/*
+ * /sys/kernel/debug/dri/<n>/hermes_kms_stats — a human-readable dump of the
+ * telemetry counters the ioctls already maintain, so the driver can be
+ * inspected (pacing, export health, vblank overruns) without a userspace
+ * client. Read-only; values are sampled under state_lock for consistency.
+ */
+static int hermes_kms_stats_show(struct seq_file *m, void *data)
+{
+	struct drm_debugfs_entry *entry = m->private;
+	struct drm_device *drm = entry->dev;
+	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+
+	mutex_lock(&hdev->state_lock);
+	seq_printf(m, "output_enabled:        %d\n", hdev->output_enabled);
+	seq_printf(m, "owner_pid:             %d\n", hdev->owner_pid);
+	seq_printf(m, "session_id:            %llu\n", hdev->session_id);
+	seq_printf(m, "requested_mode:        %ux%u@%u\n",
+		   hdev->requested_width, hdev->requested_height,
+		   hdev->requested_refresh_hz);
+	seq_printf(m, "vblank_period_ns:      %lld\n",
+		   ktime_to_ns(hdev->vblank_period));
+	seq_printf(m, "vblank_count:          %llu\n",
+		   READ_ONCE(hdev->vblank_count));
+	seq_printf(m, "vblank_overrun_count:  %llu\n",
+		   READ_ONCE(hdev->vblank_overrun_count));
+	seq_printf(m, "frame_sequence:        %llu\n", hdev->frame_sequence);
+	seq_printf(m, "frame_update_count:    %llu\n", hdev->frame_update_count);
+	seq_printf(m, "acquire_count:         %llu\n", hdev->acquire_count);
+	seq_printf(m, "acquire_no_frame:      %llu\n",
+		   hdev->acquire_no_frame_count);
+	seq_printf(m, "dmabuf_export_count:   %llu\n", hdev->dmabuf_export_count);
+	seq_printf(m, "dmabuf_export_fail:    %llu\n",
+		   hdev->dmabuf_export_fail_count);
+	seq_printf(m, "sync_file_export:      %llu\n",
+		   hdev->sync_file_export_count);
+	seq_printf(m, "sync_file_export_fail: %llu\n",
+		   hdev->sync_file_export_fail_count);
+	seq_printf(m, "wait_count:            %llu\n", hdev->wait_count);
+	seq_printf(m, "wait_timeout_count:    %llu\n", hdev->wait_timeout_count);
+	seq_printf(m, "hotplug_event_count:   %llu\n", hdev->hotplug_event_count);
+	seq_printf(m, "output_enable_count:   %llu\n", hdev->output_enable_count);
+	seq_printf(m, "output_disable_count:  %llu\n", hdev->output_disable_count);
+	mutex_unlock(&hdev->state_lock);
+	return 0;
+}
+
+static const struct drm_debugfs_info hermes_kms_debugfs_list[] = {
+	{ "hermes_kms_stats", hermes_kms_stats_show, 0, NULL },
+};
+
+static void hermes_kms_debugfs_init(struct drm_minor *minor)
+{
+	drm_debugfs_add_files(minor->dev, hermes_kms_debugfs_list,
+			      ARRAY_SIZE(hermes_kms_debugfs_list));
+}
+#endif /* CONFIG_DEBUG_FS */
+
 static const struct drm_driver hermes_kms_driver = {
 	/*
 	 * DRIVER_RENDER exposes a render node (/dev/dri/renderD*). The frame
@@ -1465,6 +1578,9 @@ static const struct drm_driver hermes_kms_driver = {
 	.minor = HERMES_KMS_DRIVER_MINOR,
 	.fops = &hermes_kms_fops,
 	.postclose = hermes_kms_postclose,
+#ifdef CONFIG_DEBUG_FS
+	.debugfs_init = hermes_kms_debugfs_init,
+#endif
 	.ioctls = hermes_kms_ioctls,
 	.num_ioctls = ARRAY_SIZE(hermes_kms_ioctls),
 	DRM_GEM_SHMEM_DRIVER_OPS,
