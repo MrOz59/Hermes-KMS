@@ -1,16 +1,19 @@
 # Hermes-KMS
 
-Hermes-KMS is a Linux DRM/KMS virtual display driver for Hermes.
+Hermes-KMS is a Linux DRM/KMS virtual display driver.
 
-It replaces EVDI with a virtual display backend that streams the compositor's
-scanout straight into a hardware encoder as a DMA-BUF, with no CPU readback.
+It is an EVDI alternative: a virtual display backend that streams the
+compositor's scanout straight into a hardware encoder as a DMA-BUF, with no CPU
+readback. Hermes is the reference consumer, but the driver is not tied to it —
+any program that speaks its DRM ioctl UAPI can consume frames (see
+[Using it in other projects](#using-it-in-other-projects)).
 
 ## What this is
 
 - A Linux kernel DRM/KMS driver (`hermes_kms.ko`).
-- An EVDI replacement for Hermes, integrated into the Hermes capture path.
-- A virtual display that exposes a Hermes-owned output (`HERMES-1`) which a
-  desktop compositor (KWin/GNOME) drives like a normal monitor.
+- An EVDI alternative for low-latency screen capture, used by Hermes today.
+- A virtual display that exposes an output (`HERMES-1`) which a desktop
+  compositor (KWin/GNOME) drives like a normal monitor.
 - A zero-copy DMA-BUF source for VAAPI/other hardware encoders.
 
 ## What this is not
@@ -21,7 +24,7 @@ scanout straight into a hardware encoder as a DMA-BUF, with no CPU readback.
 
 ## How it works
 
-The compositor owns the card and Hermes only consumes frames:
+The compositor owns the card and the capture consumer only reads frames:
 
 1. The driver exposes a **render node** (`DRIVER_RENDER`). Without it, compositors
    skip the GPU and never enumerate the virtual connector.
@@ -35,6 +38,36 @@ The compositor owns the card and Hermes only consumes frames:
 
 Measured capture cost on KWin at 720p: ~8 us/frame (`ACQUIRE_FRAME`) versus
 ~180 us/frame for EVDI's CPU copy, and constant regardless of resolution.
+
+## Using it in other projects
+
+The driver is not Hermes-specific. "Hermes" here is the reference consumer, not
+a requirement: there is no per-process gating, no exported Hermes-only symbol,
+and the capture path is a plain DRM ioctl UAPI over the render node. Any
+userspace consumer — another streaming host such as Apollo/Sunshine, a recorder,
+or your own tool — can use it by talking the same UAPI, with no fork required:
+
+1. Open the render node and probe with `GET_VERSION` / `GET_CAPS`.
+2. Optionally `SET_OUTPUT` to request a specific mode (this does not take DRM
+   master, so the compositor keeps it).
+3. Run the `WAIT_FRAME` → `ACQUIRE_FRAME` loop and import the returned DMA-BUF
+   into your encoder.
+
+[tools/hermes-kmsctl](tools/hermes-kmsctl) and
+[tools/hermes-kms-import-check](tools/hermes-kms-import-check) are small,
+self-contained reference consumers you can read or copy. The UAPI is documented
+in [include/uapi/drm/hermes_kms_drm.h](include/uapi/drm/hermes_kms_drm.h) and in
+[Userspace communication](#userspace-communication) below.
+
+What is currently fixed (and would need a fork to rebrand, though not to use):
+the output name is `HERMES-1` and the UAPI symbols are prefixed `HERMES_KMS_`.
+
+What is currently validated: VAAPI with `XRGB8888`, linear. NVENC/AMF and
+NV12/P010/HDR are not validated yet — see the [Roadmap](#roadmap). Forks and
+contributions extending those paths are welcome under the project's license.
+
+The project is GPL-2.0 licensed, so forks are free and must stay open under the
+same terms — see [License](#license).
 
 ## Features
 
@@ -261,3 +294,16 @@ producer is still active:
 ## Roadmap
 
 See [docs/roadmap.md](docs/roadmap.md) and [docs/driver-design.md](docs/driver-design.md).
+
+## License
+
+Hermes-KMS is licensed under the **GNU General Public License, version 2**
+(GPL-2.0) — the same license as the Linux kernel, which an out-of-tree DRM/KMS
+module must use. See [LICENSE](LICENSE) for the full text; sources carry
+`SPDX-License-Identifier: GPL-2.0`.
+
+In short: you can use, modify, and redistribute it freely, and you can fork it.
+Any distributed fork or derivative must remain under GPL-2.0 and ship its source
+— it cannot be made proprietary. (Note that, like all GPL software, the license
+governs the freedoms above; it does not by itself forbid charging for copies, but
+recipients always keep the right to the source and to redistribute.)
