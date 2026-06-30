@@ -1,0 +1,48 @@
+name: 💡 Feature request / enhancement
+description: Suggest a capability, format, compositor target, or UAPI change.
+title: "[feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please skim [docs/roadmap.md](../../docs/roadmap.md) first — several common
+        asks (NVENC/AMF import, NV12/P010/HDR, partial-frame encode, wider compositor
+        coverage, writeback connector) are already tracked or explicitly out of scope.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What can't you do today, and why does it matter?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would the behavior, ioctl, format, or flag look like?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - "ioctl UAPI"
+        - "Format / modifier / HDR"
+        - "Encoder support (NVENC / AMF / ...)"
+        - "Compositor support (wlroots / GNOME / ...)"
+        - "Pacing / vblank"
+        - "Diagnostics / tooling / debugfs"
+        - "Packaging / distro"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

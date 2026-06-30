@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📐 Architecture & design questions
+    url: https://github.com/MrOz59/Hermes-KMS/blob/main/docs/driver-design.md
+    about: Read the driver design and roadmap before filing a design question. Open a Discussion for open-ended design topics.
+  - name: 🔒 Security / kernel safety report
+    url: https://github.com/MrOz59/Hermes-KMS/security/advisories/new
+    about: This is a kernel module that runs in ring 0. Report memory-safety, privilege, or DoS issues privately, not as a public issue.

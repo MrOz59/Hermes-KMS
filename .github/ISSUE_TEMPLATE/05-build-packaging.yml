@@ -1,0 +1,74 @@
+name: 📦 Build / DKMS / packaging issue
+description: Compilation failure, DKMS build error, kernel-version breakage, or packaging (PKGBUILD/Makefile) problems.
+title: "[build]: "
+labels: ["build", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Out-of-tree modules break against new kernels often. Please include the **full**
+        compiler/DKMS error (not just the last line) and your exact kernel headers —
+        most build failures are a kernel-API change we can pinpoint from the first error.
+
+  - type: dropdown
+    id: how
+    attributes:
+      label: How are you building?
+      options:
+        - "make (manual)"
+        - "DKMS (dkms install / autoinstall)"
+        - "PKGBUILD / makepkg (Arch/CachyOS)"
+        - "Other distro package"
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Full build error
+      description: First error onward. For DKMS, attach `/var/lib/dkms/hermes-kms/*/build/make.log`.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Target kernel version
+      description: "`uname -r` and, if different, the headers you built against."
+      placeholder: "7.0.9-1-cachyos"
+    validations:
+      required: true
+
+  - type: input
+    id: toolchain
+    attributes:
+      label: Toolchain
+      description: gcc/clang version. (The module has a known clang-vs-gcc build sensitivity.)
+      placeholder: "gcc 14.2 / clang 19"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Hermes-KMS commit / version
+      placeholder: "git rev-parse --short HEAD"
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Distro
+      placeholder: "CachyOS / Arch / Fedora 41 / Ubuntu 24.04"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: headers
+    attributes:
+      label: Checks
+      options:
+        - label: Kernel headers/devel package for the running kernel are installed.
+        - label: I tried a clean build (`make clean` / removed the DKMS build dir).

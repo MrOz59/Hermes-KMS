@@ -1,0 +1,96 @@
+name: 🎞️ Capture / encode / zero-copy issue
+description: DMA-BUF export, sync_file, format/modifier, or encoder-import (VAAPI/NVENC/AMF) problems.
+title: "[capture]: "
+labels: ["bug", "capture-pipeline", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for the consumer side: `ACQUIRE_FRAME`, DMA-BUF/sync_file export,
+        format/modifier negotiation, and importing the exported buffer into a hardware
+        encoder. The preflight tool `hermes-kms-import-check` resolves most of these,
+        so please run it and paste the result.
+
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: Symptom
+      options:
+        - "Encoder rejects the DMA-BUF (import fails)"
+        - "ACQUIRE_FRAME returns no DMA-BUF / DMABUF_VALID not set"
+        - "sync_file never signals / frame torn or stale"
+        - "Wrong / unsupported format or modifier"
+        - "Corrupted, green, or shifted output"
+        - "Damage rectangle wrong or missing"
+        - "Performance / latency regression"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: import-check
+    attributes:
+      label: Output of hermes-kms-import-check
+      description: |
+        ```
+        tools/hermes-kms-import-check/hermes-kms-import-check --wait-ms 1000
+        # if multiple render nodes:
+        tools/hermes-kms-import-check/hermes-kms-import-check --va-device /dev/dri/renderD128
+        ```
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: frame-status
+    attributes:
+      label: Frame metadata (status)
+      description: |
+        ```
+        tools/hermes-kmsctl/hermes-kmsctl status
+        tools/hermes-kmsctl/hermes-kmsctl frame --require-dmabuf --sync-file
+        ```
+        We especially need the **fourcc format, modifier, width/height, and per-plane pitch/offset**.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: encoder
+    attributes:
+      label: Encoder / API
+      placeholder: "VAAPI (radeonsi) / NVENC / AMF / ffmpeg vaapi"
+    validations:
+      required: true
+
+  - type: input
+    id: encode-gpu
+    attributes:
+      label: Encode GPU + driver/mesa version
+      placeholder: "AMD RX 6800, mesa 24.x / NVIDIA 560.x"
+    validations:
+      required: true
+
+  - type: input
+    id: mode
+    attributes:
+      label: Requested mode
+      description: Resolution / refresh / requested format (helps reproduce the negotiation).
+      placeholder: "1280x720@30, XRGB8888, linear"
+
+  - type: input
+    id: kernel-version
+    attributes:
+      label: Kernel + Hermes-KMS commit
+      placeholder: "7.0.9-1-cachyos / 0501306"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: |
+        Note that VAAPI XRGB8888/linear is the validated path today; NVENC/AMF and
+        NV12/P010/HDR are still being brought up (see roadmap). dmesg with
+        `dyndbg=+p`, ffmpeg logs, or a sample frame help.

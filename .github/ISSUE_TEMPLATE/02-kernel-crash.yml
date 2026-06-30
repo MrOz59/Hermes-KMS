@@ -1,0 +1,129 @@
+name: 💥 Kernel crash / oops / lockup / WARN
+description: A kernel oops, panic, soft/hard lockup, WARN_ON, BUG, lockdep splat, or KASAN report.
+title: "[crash]: "
+labels: ["bug", "kernel-crash", "needs-triage", "priority-high"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A crash in a ring-0 module is the highest-signal report we can get — and the
+        most dependent on a clean backtrace. Please capture the **full** splat, not a
+        screenshot of the last line, and tell us how the module was built (a tainted /
+        mismatched build changes everything).
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues for the same backtrace/symbol.
+          required: true
+        - label: I have included the complete splat (first WARN/BUG line through the call trace and "---[ end trace ]---").
+          required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Type of failure
+      options:
+        - "Oops / NULL deref / bad page"
+        - "Kernel panic"
+        - "Soft lockup / hard lockup / hung task"
+        - "WARN_ON / WARNING"
+        - "BUG / BUG_ON"
+        - "lockdep splat (possible deadlock / inconsistent lock state)"
+        - "KASAN report (use-after-free / out-of-bounds)"
+        - "RCU stall"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: trace
+    attributes:
+      label: Full kernel splat / call trace
+      description: |
+        From `sudo dmesg` or the serial/pstore console. Include the line that names the
+        failing condition and the entire `Call Trace:` block. Symbolized (with module
+        offsets, e.g. `hermes_kms+0x...`) is far more useful than a raw address.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: trigger
+    attributes:
+      label: What triggered it
+      description: Exact sequence — load/unload, modeset, stress script, compositor start, fd close, suspend/resume, etc.
+      placeholder: |
+        - Was running scripts/vm-export-stress.sh under slub_debug=FZPU
+        - Crash hit on the 3rd modeset cycle
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reproducible
+    attributes:
+      label: Reproducibility
+      options:
+        - "Every time"
+        - "Often (>50%)"
+        - "Intermittent / racy"
+        - "Once, could not reproduce"
+    validations:
+      required: true
+
+  - type: textarea
+    id: taint
+    attributes:
+      label: Taint / build info
+      description: |
+        Paste:
+        ```
+        cat /proc/sys/kernel/tainted
+        modinfo hermes_kms | grep -E 'vermagic|version|filename'
+        ```
+        Note if the module is signed, DKMS-built, or hand-built, and the toolchain (gcc vs clang).
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Hermes-KMS commit / version
+      placeholder: "git rev-parse --short HEAD"
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel version
+      description: "`uname -r`"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: debug-kernel
+    attributes:
+      label: Debug kernel features enabled?
+      description: lockdep/KASAN/etc. catch corruption far earlier; helps us a lot.
+      multiple: true
+      options:
+        - "CONFIG_PROVE_LOCKING (lockdep)"
+        - "CONFIG_KASAN"
+        - "CONFIG_DEBUG_KMEMLEAK"
+        - "slub_debug=FZPU"
+        - "CONFIG_DEBUG_ATOMIC_SLEEP"
+        - "None / stock kernel"
+        - "Don't know"
+
+  - type: textarea
+    id: vm
+    attributes:
+      label: Reproduces in the debug VM?
+      description: |
+        If you can repro under virtme-ng with a debug kernel it's much easier for us to
+        chase. Note the command used (see `scripts/vm-*.sh`) and whether it also happens
+        on bare metal.

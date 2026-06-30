@@ -1,0 +1,168 @@
+name: 🐞 Bug report
+description: A general defect in the Hermes-KMS kernel module or its userspace tools.
+title: "[bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Hermes-KMS is an out-of-tree DRM/KMS kernel module,
+        so good kernel diagnostics make the difference between a fixable report and
+        a guess. Please fill in as much as you can — `dmesg` and your kernel/compositor
+        versions are almost always needed.
+
+        > For a **crash, oops, lockup, or WARN** use the *Kernel crash / oops / lockup*
+        > template instead — it asks for the right backtrace fields.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I am on the latest commit / release, or I have noted my exact version below.
+          required: true
+        - label: This is not a security/memory-safety issue (those go through the security advisory link).
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences describing what is wrong.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      description: Where does the problem seem to live? Pick the closest.
+      options:
+        - "Module load / unload (insmod, rmmod, DKMS)"
+        - "Modeset (CRTC / encoder / plane / mode probe)"
+        - "Vblank timer / pacing / refresh rate"
+        - "EDID / connector / hotplug"
+        - "Cursor plane"
+        - "Damage tracking (FB_DAMAGE_CLIPS)"
+        - "DMA-BUF / sync_file export"
+        - "ioctl UAPI (set-output / acquire / wait / status / metrics)"
+        - "Render node / DRM master / seat / permissions"
+        - "Encoder import (VAAPI / NVENC / AMF)"
+        - "Compositor interaction (KWin / GNOME / wlroots)"
+        - "Packaging (PKGBUILD / DKMS / Makefile)"
+        - "Userspace tools (hermes-kmsctl, import-check, scripts)"
+        - "Other / not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands. Include the load sequence, compositor used, and any modetest/Hermes invocation.
+      placeholder: |
+        1. sudo modprobe hermes_kms
+        2. Start KWin and enable HERMES-1
+        3. tools/hermes-kmsctl/hermes-kmsctl frame --require-dmabuf
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual behavior
+      placeholder: |
+        Expected: ACQUIRE_FRAME returns a valid DMA-BUF.
+        Actual: ioctl returns -EINVAL.
+    validations:
+      required: true
+
+  - type: textarea
+    id: dmesg
+    attributes:
+      label: Kernel log (dmesg)
+      description: |
+        Run `sudo dmesg --ctime | grep -iE 'hermes|drm'` (or paste the relevant window).
+        For driver-internal detail, load with `dyndbg`: `sudo modprobe hermes_kms dyndbg=+p`.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Hermes-KMS version / commit
+      description: Output of `git rev-parse --short HEAD`, the DKMS version, or release tag.
+      placeholder: "0501306 / dkms 0.x"
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel version
+      description: "`uname -r`"
+      placeholder: "7.0.9-1-cachyos"
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Distro
+      placeholder: "CachyOS / Arch / Fedora 41 / ..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: compositor
+    attributes:
+      label: Compositor
+      options:
+        - "KWin (Wayland)"
+        - "KWin (X11)"
+        - "GNOME / Mutter (Wayland)"
+        - "wlroots-based (sway, Hyprland, ...)"
+        - "None / headless / modetest only"
+        - "Other"
+    validations:
+      required: true
+
+  - type: input
+    id: encoder-gpu
+    attributes:
+      label: Encode GPU / VA driver
+      description: The real GPU importing the DMA-BUF and its driver, if relevant.
+      placeholder: "AMD RX 6800 (radeonsi/VAAPI) / NVIDIA RTX 3070 (NVENC) / Intel iHD"
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Driver status / metrics (if applicable)
+      description: |
+        Helpful for capture/modeset/pacing issues:
+        ```
+        tools/hermes-kmsctl/hermes-kmsctl status
+        tools/hermes-kmsctl/hermes-kmsctl metrics
+        ```
+        And the KMS state: `modetest -M hermes_kms` (or `-c -p` for connectors/planes).
+      render: text
+
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Is this a regression?
+      options:
+        - "No / don't know"
+        - "Yes — it worked on an earlier commit/version (note which below)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Last-known-good commit, related issues, workarounds, screenshots/recordings.

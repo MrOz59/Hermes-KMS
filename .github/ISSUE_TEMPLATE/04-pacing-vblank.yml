@@ -1,0 +1,94 @@
+name: ⏱️ Vblank / pacing / refresh-rate issue
+description: Wrong refresh rate, missed vblanks, FPS cap, jitter, or the compositor not composing at full rate.
+title: "[pacing]: "
+labels: ["bug", "vblank-pacing", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The software vblank timer is what makes the compositor compose `HERMES-1` at its
+        full refresh. If FPS is capped, jittery, or the timer rate is wrong, the pacing
+        meter is the key artifact — please run it.
+
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: Symptom
+      options:
+        - "Stream capped below target (e.g. stuck ~35-40 FPS)"
+        - "Vblank timer fires at the wrong rate"
+        - "Missed / dropped vblanks"
+        - "Jitter / uneven frame pacing"
+        - "Refresh rate not applied after SET_OUTPUT"
+        - "Compositor not composing the virtual output at all"
+        - "Other"
+    validations:
+      required: true
+
+  - type: input
+    id: target-rate
+    attributes:
+      label: Target vs observed refresh
+      placeholder: "Target 120 Hz, observed ~40 FPS"
+    validations:
+      required: true
+
+  - type: textarea
+    id: meter
+    attributes:
+      label: Pacing meter output
+      description: |
+        On the host: `scripts/host-vblank-isolated.sh`
+        In the VM: `scripts/vm-pacing-test.sh`
+        (both use `scripts/hermes-vblank-meter.c`). Paste the measured rate / missed-vblank counts.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: metrics
+    attributes:
+      label: Driver metrics
+      description: "`tools/hermes-kmsctl/hermes-kmsctl metrics` (frame-update counters help separate driver vs compositor)."
+      render: text
+
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where does the cap appear?
+      description: |
+        Knowing whether the *timer* is correct but the *compositor* isn't composing
+        (or vice-versa) is the whole diagnosis here.
+      options:
+        - "Vblank timer rate itself is wrong"
+        - "Timer is correct but compositor composes slower"
+        - "Correct in VM/modetest, capped only with a real compositor"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: compositor
+    attributes:
+      label: Compositor
+      options:
+        - "KWin (Wayland)"
+        - "GNOME / Mutter (Wayland)"
+        - "wlroots-based"
+        - "modetest / none"
+        - "Other"
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Kernel + Hermes-KMS commit
+      placeholder: "7.0.9-1-cachyos / 0501306"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
