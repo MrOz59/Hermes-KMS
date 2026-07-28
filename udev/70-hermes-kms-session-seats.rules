@@ -1,0 +1,16 @@
+# The default devices=1 card keeps its legacy "hermes-kms" platform path and
+# remains on seat0. Multi-device paths are hermes-kms.0..7; give each one a
+# stable independent seat so one compositor and one tagged Hermes input set
+# can own each client session.
+#
+# Keep these names synchronized with Hermes getHermesKmsSeatName().
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.0/drm/card*", ENV{ID_SEAT}="hermes-kms-1", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.1/drm/card*", ENV{ID_SEAT}="hermes-kms-2", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.2/drm/card*", ENV{ID_SEAT}="hermes-kms-3", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.3/drm/card*", ENV{ID_SEAT}="hermes-kms-4", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.4/drm/card*", ENV{ID_SEAT}="hermes-kms-5", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.5/drm/card*", ENV{ID_SEAT}="hermes-kms-6", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.6/drm/card*", ENV{ID_SEAT}="hermes-kms-7", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.7/drm/card*", ENV{ID_SEAT}="hermes-kms-8", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
+
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", DEVPATH=="*/platform/hermes-kms.*/drm/renderD*", GROUP="video", MODE="0660", TAG+="uaccess"

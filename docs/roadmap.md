@@ -15,14 +15,19 @@
   and debugfs telemetry.
 - End-to-end zero-copy validated on VAAPI (XRGB8888, linear).
 - DKMS + Arch/CachyOS packaging.
+- UAPI v9 multi-device prototype with independent DRM-master domains and a
+  disposable two-device VM regression.
+- Packaged private seat-broker instances and a VM regression with two
+  unprivileged Weston DRM compositors scanning out concurrently on separate
+  Hermes cards.
 
 ## Next
 
-- Host/KWin validation of the multi-output prototype: compositor adoption,
-  persistent layout, two real concurrent capture sessions, and recovery. The
-  disposable VM test already validates two simultaneous owner fds and atomic
-  modesets, distinct framebuffer/DMA-BUF channels, independent disconnect, and
-  clean unload.
+- Real-host validation of the two concurrency models: KWin adoption and
+  persistence for `devices=1 outputs=N`, plus two simultaneous Moonlight
+  sessions for `devices=N outputs=1`. Disposable VM tests already validate
+  simultaneous owners/DRM masters, two concurrent Weston compositors, distinct
+  framebuffer/DMA-BUF channels, independent disconnect, and clean unload.
 - NVENC/AMF DMA-BUF import validation (VAAPI is validated).
 - NV12/P010 scanout and HDR. The compositor composes in RGB and the encoder
   does RGB→NV12 on the real GPU today, so this is an optimization, not a

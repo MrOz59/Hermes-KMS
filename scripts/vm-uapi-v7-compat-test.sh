@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Verify that an unmodified UAPI v7 client still controls only HERMES-1 when
-# the UAPI v8 driver exposes multiple outputs.
+# the current driver exposes multiple outputs.
 #
-# Build the old control binary from tag v0.1.2 and pass its path:
+# By default the script builds the old control binary from tag v0.1.2 in a
+# temporary directory. A prebuilt path may still be passed explicitly:
 #
 #   scripts/vm-uapi-v7-compat-test.sh /path/to/hermes-kmsctl-v0.1.2
 set -euo pipefail
@@ -11,6 +12,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KO="$REPO/kernel/hermes-kms/hermes_kms.ko"
 CTL="$REPO/tools/hermes-kmsctl/hermes-kmsctl"
 OLD_CTL="${1:-$REPO/tools/hermes-kmsctl/hermes-kmsctl-v0.1.2}"
+OLD_BUILD_DIR=""
 OLD_HOLD_PID=""
 NEW_HOLD_PID=""
 FAIL=0
@@ -28,6 +30,9 @@ cleanup()
 		wait "$pid" 2>/dev/null || true
 	done
 	timeout -k 1s 5s rmmod hermes_kms 2>/dev/null || true
+	if [ -n "$OLD_BUILD_DIR" ]; then
+		rm -rf -- "$OLD_BUILD_DIR"
+	fi
 }
 trap cleanup EXIT
 
@@ -58,6 +63,19 @@ require_value()
 }
 [ -f "$KO" ] || { printf 'module not built: %s\n' "$KO" >&2; exit 1; }
 [ -x "$CTL" ] || { printf 'control tool not built: %s\n' "$CTL" >&2; exit 1; }
+if [ ! -x "$OLD_CTL" ] && [ "$#" -eq 0 ]; then
+	OLD_BUILD_DIR="$(mktemp -d /tmp/hermes-kms-v0.1.2.XXXXXX)"
+	mkdir -p "$OLD_BUILD_DIR/include/drm"
+	git -c safe.directory="$REPO" -C "$REPO" \
+		show v0.1.2:tools/hermes-kmsctl/hermes_kmsctl.c \
+		>"$OLD_BUILD_DIR/hermes_kmsctl.c"
+	git -c safe.directory="$REPO" -C "$REPO" \
+		show v0.1.2:include/uapi/drm/hermes_kms_drm.h \
+		>"$OLD_BUILD_DIR/include/drm/hermes_kms_drm.h"
+	"${CC:-cc}" -O2 -Wall -Wextra -I"$OLD_BUILD_DIR/include" \
+		-o "$OLD_BUILD_DIR/hermes-kmsctl" "$OLD_BUILD_DIR/hermes_kmsctl.c"
+	OLD_CTL="$OLD_BUILD_DIR/hermes-kmsctl"
+fi
 [ -x "$OLD_CTL" ] || {
 	printf 'old v0.1.2 control tool not found: %s\n' "$OLD_CTL" >&2
 	exit 1
@@ -67,7 +85,7 @@ insmod "$KO" initial_enabled=0 hotplug_events=0 outputs=2
 sleep 0.5
 
 # These ioctl numbers and struct sizes must remain compatible.
-require_value "$("$OLD_CTL" version)" uapi_version 8
+require_value "$("$OLD_CTL" version)" uapi_version 9
 require_value "$("$OLD_CTL" identity)" output HERMES-1
 "$OLD_CTL" caps >/dev/null
 "$OLD_CTL" status >/dev/null
@@ -111,4 +129,4 @@ if [ "$FAIL" -ne 0 ]; then
 fi
 
 printf '%s\n' \
-	'PASS: unmodified v0.1.2 client remains bound to HERMES-1 under UAPI v8'
+	'PASS: unmodified v0.1.2 client remains bound to HERMES-1 under UAPI v9'

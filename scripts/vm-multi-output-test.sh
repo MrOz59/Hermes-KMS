@@ -87,9 +87,15 @@ command -v modetest >/dev/null || {
 insmod "$KO" initial_enabled=0 hotplug_events=0 outputs=2
 sleep 0.5
 
+[ -d /sys/devices/platform/hermes-kms ] &&
+	[ ! -e /sys/devices/platform/hermes-kms.0 ] || {
+	printf 'FAIL: devices=1 did not preserve the legacy hermes-kms platform path\n' >&2
+	exit 1
+}
+
 VERSION="$("$CTL" version)"
 CAPS="$("$CTL" caps)"
-require_value "$VERSION" uapi_version 8
+require_value "$VERSION" uapi_version 9
 require_value "$CAPS" output_count 2
 require_value "$CAPS" multi_output true
 

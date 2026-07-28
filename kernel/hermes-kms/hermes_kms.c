@@ -35,6 +35,7 @@
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_debugfs.h>
 #include <drm/drm_drv.h>
+#include <drm/drm_dumb_buffers.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_encoder.h>
 #include <drm/drm_file.h>
@@ -58,11 +59,13 @@
 #define HERMES_KMS_DRIVER_DESC "Hermes virtual KMS display"
 #define HERMES_KMS_DRIVER_DATE "20260625"
 #define HERMES_KMS_DRIVER_MAJOR 0
-#define HERMES_KMS_DRIVER_MINOR 2
+#define HERMES_KMS_DRIVER_MINOR 3
 #define HERMES_KMS_DRIVER_PATCH 0
 #define HERMES_KMS_OUTPUT_NAME_PREFIX "HERMES-"
 #define HERMES_KMS_DEFAULT_OUTPUTS 1
 #define HERMES_KMS_MAX_OUTPUTS 8
+#define HERMES_KMS_DEFAULT_DEVICES 1
+#define HERMES_KMS_MAX_DEVICES 8
 
 #define HERMES_KMS_MIN_WIDTH 640
 #define HERMES_KMS_MIN_HEIGHT 480
@@ -80,6 +83,7 @@ static unsigned int initial_width = HERMES_KMS_DEFAULT_WIDTH;
 static unsigned int initial_height = HERMES_KMS_DEFAULT_HEIGHT;
 static unsigned int initial_refresh_hz = HERMES_KMS_DEFAULT_REFRESH_HZ;
 static unsigned int outputs = HERMES_KMS_DEFAULT_OUTPUTS;
+static unsigned int devices = HERMES_KMS_DEFAULT_DEVICES;
 
 module_param(initial_enabled, bool, 0644);
 MODULE_PARM_DESC(initial_enabled, "Initial virtual output state");
@@ -95,6 +99,8 @@ module_param(initial_refresh_hz, uint, 0644);
 MODULE_PARM_DESC(initial_refresh_hz, "Initial virtual output refresh rate");
 module_param(outputs, uint, 0444);
 MODULE_PARM_DESC(outputs, "Number of virtual outputs on the DRM device (1-8, default 1)");
+module_param(devices, uint, 0444);
+MODULE_PARM_DESC(devices, "Number of independent virtual DRM devices (1-8, default 1)");
 
 struct hermes_kms_device;
 
@@ -199,6 +205,8 @@ struct hermes_kms_output {
 
 struct hermes_kms_device {
 	struct drm_device drm;
+	unsigned int device_index;
+	unsigned int device_count;
 	unsigned int output_count;
 	struct hermes_kms_output outputs[HERMES_KMS_MAX_OUTPUTS];
 };
@@ -457,6 +465,45 @@ hermes_kms_connector_detect(struct drm_connector *connector, bool force)
 	return status;
 }
 
+/*
+ * drm_cvt_mode() rounds hdisplay down to an eight-pixel character-cell
+ * boundary. That is appropriate for a physical CVT sink, but not for a
+ * virtual monitor whose visible size must match a remote client's framebuffer
+ * exactly (854 would otherwise become 848 and the encoded image would be
+ * cropped/scaled).
+ *
+ * Keep CVT's blanking and sync widths, translate the horizontal timings by the
+ * rounded delta, then recompute the pixel clock for the requested refresh.
+ * The GEM dumb-buffer pitch remains independently aligned for DMA-BUF/VAAPI.
+ */
+static struct drm_display_mode *
+hermes_kms_exact_cvt_mode(struct drm_device *drm, u32 width, u32 height,
+			  u32 refresh_hz)
+{
+	struct drm_display_mode *mode;
+	int horizontal_delta;
+
+	mode = drm_cvt_mode(drm, width, height, refresh_hz,
+			    false, false, false);
+	if (!mode)
+		return NULL;
+
+	horizontal_delta = (int)width - mode->hdisplay;
+	if (!horizontal_delta)
+		return mode;
+
+	mode->hdisplay += horizontal_delta;
+	mode->hsync_start += horizontal_delta;
+	mode->hsync_end += horizontal_delta;
+	mode->htotal += horizontal_delta;
+	mode->clock = DIV_ROUND_CLOSEST_ULL((u64)mode->htotal *
+					   mode->vtotal * refresh_hz,
+					   1000);
+	drm_mode_set_name(mode);
+
+	return mode;
+}
+
 static int hermes_kms_connector_get_modes(struct drm_connector *connector)
 {
 	int count = 0;
@@ -495,22 +542,25 @@ static int hermes_kms_connector_get_modes(struct drm_connector *connector)
 	 * 1280x720@30), which neither the EDID nor the generic ladder contains.
 	 * Without a matching mode the compositor/modetest atomic commit fails
 	 * with "failed to find mode". Add it via CVT and mark it preferred so it
-	 * is selected by default.
+	 * is selected by default. Preserve the visible width exactly: the generic
+	 * CVT helper rounds it to eight-pixel cells, which is not valid for a
+	 * remote framebuffer such as 854x480.
 	 */
 	if (width && height && refresh_hz) {
-		mode = drm_cvt_mode(connector->dev, width, height, refresh_hz,
-				    false, false, false);
+		mode = hermes_kms_exact_cvt_mode(connector->dev, width, height,
+						refresh_hz);
 		if (mode) {
 			mode->type |= DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER;
 			drm_mode_probed_add(connector, mode);
 			count++;
 			drm_info(connector->dev,
-				 "get_modes added preferred CVT mode %ux%u clock=%d vrefresh=%d name=%s\n",
-				 width, height, mode->clock,
+				 "get_modes added preferred exact mode requested=%ux%u active=%dx%d clock=%d vrefresh=%d name=%s\n",
+				 width, height, mode->hdisplay, mode->vdisplay,
+				 mode->clock,
 				 drm_mode_vrefresh(mode), mode->name);
 		} else {
 			drm_warn(connector->dev,
-				 "get_modes: drm_cvt_mode(%ux%u@%u) returned NULL\n",
+				 "get_modes: exact CVT mode %ux%u@%u returned NULL\n",
 				 width, height, refresh_hz);
 		}
 	}
@@ -989,6 +1039,8 @@ static int hermes_kms_ioctl_get_caps(struct drm_device *drm, void *data,
 		      HERMES_KMS_CAP_MULTI_OUTPUT |
 		      HERMES_KMS_CAP_ZERO_COPY_TARGET |
 		      HERMES_KMS_CAP_SYNC_FILE;
+	if (hdev->device_count > 1)
+		caps->flags |= HERMES_KMS_CAP_MULTI_DEVICE;
 	caps->min_width = HERMES_KMS_MIN_WIDTH;
 	caps->min_height = HERMES_KMS_MIN_HEIGHT;
 	caps->max_width = HERMES_KMS_MAX_WIDTH;
@@ -1169,6 +1221,8 @@ static int hermes_kms_ioctl_get_identity(struct drm_device *drm, void *data,
 	identity->encoder_id = output->encoder.base.id;
 	identity->output_index = output->index;
 	identity->output_count = hdev->output_count;
+	identity->device_index = hdev->device_index;
+	identity->device_count = hdev->device_count;
 
 	return 0;
 }
@@ -1827,6 +1881,33 @@ static void hermes_kms_debugfs_init(struct drm_minor *minor)
 }
 #endif /* CONFIG_DEBUG_FS */
 
+/*
+ * Cross-device DMA-BUF importers can impose stricter row-stride requirements
+ * than the generic shmem dumb-buffer helper. In particular, radeonsi requires
+ * a 256-byte-aligned pitch for linear ARGB/XRGB buffers. Keep the visible
+ * width unchanged while padding each backing row so every advertised mode can
+ * be imported by the encoding GPU, not only widths that happen to align.
+ */
+static int hermes_kms_dumb_create(struct drm_file *file,
+				  struct drm_device *drm,
+				  struct drm_mode_create_dumb *args)
+{
+	struct drm_gem_shmem_object *shmem;
+	int ret;
+
+	ret = drm_mode_size_dumb(drm, args, 256, 0);
+	if (ret)
+		return ret;
+
+	shmem = drm_gem_shmem_create(drm, args->size);
+	if (IS_ERR(shmem))
+		return PTR_ERR(shmem);
+
+	ret = drm_gem_handle_create(file, &shmem->base, &args->handle);
+	drm_gem_object_put(&shmem->base);
+	return ret;
+}
+
 static const struct drm_driver hermes_kms_driver = {
 	/*
 	 * DRIVER_RENDER exposes a render node (/dev/dri/renderD*). The frame
@@ -1843,6 +1924,7 @@ static const struct drm_driver hermes_kms_driver = {
 	.desc = HERMES_KMS_DRIVER_DESC,
 	.major = HERMES_KMS_DRIVER_MAJOR,
 	.minor = HERMES_KMS_DRIVER_MINOR,
+	.patchlevel = HERMES_KMS_DRIVER_PATCH,
 	.fops = &hermes_kms_fops,
 	.open = hermes_kms_open,
 	.postclose = hermes_kms_postclose,
@@ -1851,7 +1933,8 @@ static const struct drm_driver hermes_kms_driver = {
 #endif
 	.ioctls = hermes_kms_ioctls,
 	.num_ioctls = ARRAY_SIZE(hermes_kms_ioctls),
-	DRM_GEM_SHMEM_DRIVER_OPS,
+	.gem_prime_import = drm_gem_shmem_prime_import_no_map,
+	.dumb_create = hermes_kms_dumb_create,
 };
 
 static int hermes_kms_output_modeset_init(struct hermes_kms_output *output)
@@ -1995,6 +2078,8 @@ static int hermes_kms_probe(struct platform_device *pdev)
 
 	drm = &hdev->drm;
 	platform_set_drvdata(pdev, hdev);
+	hdev->device_index = pdev->id >= 0 ? pdev->id : 0;
+	hdev->device_count = devices;
 	if (output_count < 1 || output_count > HERMES_KMS_MAX_OUTPUTS) {
 		output_count = clamp(output_count, 1u,
 				     (unsigned int)HERMES_KMS_MAX_OUTPUTS);
@@ -2011,7 +2096,8 @@ static int hermes_kms_probe(struct platform_device *pdev)
 		output->hdev = hdev;
 		output->index = i;
 		snprintf(output->output_name, sizeof(output->output_name),
-			 HERMES_KMS_OUTPUT_NAME_PREFIX "%u", i + 1);
+			 HERMES_KMS_OUTPUT_NAME_PREFIX "%u",
+			 hdev->device_index * hdev->output_count + i + 1);
 
 		/*
 		 * Give every connector a stable, distinct EDID serial. KWin uses
@@ -2019,10 +2105,12 @@ static int hermes_kms_probe(struct platform_device *pdev)
 		 * would otherwise be easy to collapse or swap across restarts.
 		 */
 		memcpy(output->edid, hermes_kms_edid, sizeof(output->edid));
-		output->edid[12] = (i + 1) & 0xff;
-		output->edid[13] = ((i + 1) >> 8) & 0xff;
-		output->edid[14] = ((i + 1) >> 16) & 0xff;
-		output->edid[15] = ((i + 1) >> 24) & 0xff;
+		j = hdev->device_index * hdev->output_count + i + 1;
+		output->edid[12] = j & 0xff;
+		output->edid[13] = (j >> 8) & 0xff;
+		output->edid[14] = (j >> 16) & 0xff;
+		output->edid[15] = (j >> 24) & 0xff;
+		j = 0;
 		for (j = 0; j < sizeof(output->edid) - 1; j++)
 			checksum += output->edid[j];
 		output->edid[sizeof(output->edid) - 1] = -checksum;
@@ -2045,7 +2133,9 @@ static int hermes_kms_probe(struct platform_device *pdev)
 		return ret;
 
 	drm_info(drm,
-		 "registered Hermes-KMS virtual DRM device outputs=%u initial_enabled=%d hotplug_events=%d non_desktop=%d initial_mode=%ux%u@%u\n",
+		 "registered Hermes-KMS virtual DRM device index=%u/%u outputs=%u initial_enabled=%d hotplug_events=%d non_desktop=%d initial_mode=%ux%u@%u\n",
+		 hdev->device_index + 1,
+		 hdev->device_count,
 		 hdev->output_count,
 		 initial_enabled,
 		 hotplug_events,
@@ -2098,10 +2188,6 @@ static void hermes_kms_remove(struct platform_device *pdev)
 	}
 }
 
-static void hermes_kms_platform_release(struct device *dev)
-{
-}
-
 static struct platform_driver hermes_kms_platform_driver = {
 	.probe = hermes_kms_probe,
 	.remove = hermes_kms_remove,
@@ -2110,35 +2196,75 @@ static struct platform_driver hermes_kms_platform_driver = {
 	},
 };
 
-static struct platform_device hermes_kms_platform_device = {
-	.name = HERMES_KMS_DRIVER_NAME,
-	.id = PLATFORM_DEVID_NONE,
-	.dev = {
-		.release = hermes_kms_platform_release,
-	},
-};
+static struct platform_device *
+hermes_kms_platform_devices[HERMES_KMS_MAX_DEVICES];
 
 static int __init hermes_kms_init(void)
 {
+	unsigned int device_count = devices;
+	unsigned int i;
 	int ret;
+
+	if (device_count < 1 || device_count > HERMES_KMS_MAX_DEVICES) {
+		device_count = clamp(device_count, 1u,
+				     (unsigned int)HERMES_KMS_MAX_DEVICES);
+		pr_warn("%s: devices=%u out of range, using %u\n",
+			HERMES_KMS_DRIVER_NAME, devices, device_count);
+		devices = device_count;
+	}
 
 	ret = platform_driver_register(&hermes_kms_platform_driver);
 	if (ret)
 		return ret;
 
-	ret = platform_device_register(&hermes_kms_platform_device);
-	if (ret) {
-		platform_driver_unregister(&hermes_kms_platform_driver);
-		return ret;
+	for (i = 0; i < device_count; i++) {
+		struct platform_device *pdev;
+
+		/*
+		 * Preserve the original "hermes-kms" platform path for devices=1.
+		 * Multi-device mode deliberately uses hermes-kms.0..N so udev can
+		 * assign every independent DRM-master domain to a stable seat.
+		 */
+		pdev = platform_device_alloc(HERMES_KMS_DRIVER_NAME,
+					     device_count == 1 ?
+					     PLATFORM_DEVID_NONE : (int)i);
+		if (!pdev) {
+			ret = -ENOMEM;
+			goto err_unregister_devices;
+		}
+		ret = platform_device_add(pdev);
+		if (ret) {
+			platform_device_put(pdev);
+			goto err_unregister_devices;
+		}
+		hermes_kms_platform_devices[i] = pdev;
 	}
 
-	pr_info("%s: module loaded\n", HERMES_KMS_DRIVER_NAME);
+	pr_info("%s: module loaded devices=%u outputs_per_device=%u\n",
+		HERMES_KMS_DRIVER_NAME, device_count, outputs);
 	return 0;
+
+err_unregister_devices:
+	while (i > 0) {
+		i--;
+		platform_device_unregister(hermes_kms_platform_devices[i]);
+		hermes_kms_platform_devices[i] = NULL;
+	}
+	platform_driver_unregister(&hermes_kms_platform_driver);
+	return ret;
 }
 
 static void __exit hermes_kms_exit(void)
 {
-	platform_device_unregister(&hermes_kms_platform_device);
+	unsigned int i;
+
+	for (i = devices; i > 0; i--) {
+		if (hermes_kms_platform_devices[i - 1]) {
+			platform_device_unregister(
+				hermes_kms_platform_devices[i - 1]);
+			hermes_kms_platform_devices[i - 1] = NULL;
+		}
+	}
 	platform_driver_unregister(&hermes_kms_platform_driver);
 	pr_info("%s: module unloaded\n", HERMES_KMS_DRIVER_NAME);
 }

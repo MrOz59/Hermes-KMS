@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define HERMES_KMS_UAPI_VERSION 8
+#define HERMES_KMS_UAPI_VERSION 9
 
 #define HERMES_KMS_NAME_LEN 32
 
@@ -31,6 +31,7 @@ extern "C" {
 #define HERMES_KMS_CAP_FRAME_WAIT		(1ULL << 9)
 #define HERMES_KMS_CAP_METRICS			(1ULL << 10)
 #define HERMES_KMS_CAP_MULTI_OUTPUT		(1ULL << 11)
+#define HERMES_KMS_CAP_MULTI_DEVICE		(1ULL << 12)
 #define HERMES_KMS_CAP_DMABUF_EXPORT_PLANNED	(1ULL << 32)
 #define HERMES_KMS_CAP_ZERO_COPY_TARGET		(1ULL << 33)
 #define HERMES_KMS_CAP_WRITEBACK_CONNECTOR	(1ULL << 34)
@@ -126,7 +127,14 @@ struct drm_hermes_kms_identity {
 	/* 0-based selected output and total outputs (uapi >= 8). */
 	__u32 output_index;
 	__u32 output_count;
-	__u32 reserved[6];
+	/*
+	 * 0-based DRM device index and total devices created by this module
+	 * (uapi >= 9). Each device has an independent DRM-master domain, which
+	 * lets a separate compositor own each streaming session.
+	 */
+	__u32 device_index;
+	__u32 device_count;
+	__u32 reserved[4];
 };
 
 /*

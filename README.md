@@ -50,10 +50,13 @@ or your own tool — can use it by talking the same UAPI, with no fork required:
 
 1. Open the render node and probe with `GET_VERSION` / `GET_CAPS`.
 2. For UAPI v8 multi-output use, bind that fd with `SELECT_OUTPUT`; use one fd
-   per simultaneous virtual display. Unselected/legacy fds use `HERMES-1`.
-3. Optionally `SET_OUTPUT` to request a specific mode (this does not take DRM
+   per simultaneous virtual display. Unselected/legacy fds use the first output.
+3. For UAPI v9 independent sessions, discover every Hermes DRM card through
+   `GET_IDENTITY.device_index/device_count` and give each compositor a
+   different primary node. Each card is a separate DRM-master domain.
+4. Optionally `SET_OUTPUT` to request a specific mode (this does not take DRM
    master, so the compositor keeps it).
-4. Run the `WAIT_FRAME` → `ACQUIRE_FRAME` loop and import the returned DMA-BUF
+5. Run the `WAIT_FRAME` → `ACQUIRE_FRAME` loop and import the returned DMA-BUF
    into your encoder.
 
 [tools/hermes-kmsctl](tools/hermes-kmsctl) and
@@ -86,8 +89,14 @@ same terms — see [License](#license).
 - 1–8 independent outputs on one DRM card (`outputs=`, default 1 for
   compatibility), with separate KMS pipelines, sessions, frame channels, and
   EDID serials;
-- exact requested mode synthesized via CVT and re-probed on `SET_OUTPUT`, so
-  arbitrary client geometries (e.g. 1280x720@30) modeset correctly;
+- 1–8 independent DRM cards (`devices=`, default 1), each with its own
+  DRM-master domain so separate compositors can back separate graphical
+  sessions; `devices=N outputs=1` is the intended isolated-session layout.
+  The packaged udev rule assigns multi-device cards stable
+  `hermes-kms-1..8` seats while leaving the default `devices=1` card on seat0;
+- exact requested mode synthesized from CVT timings and re-probed on
+  `SET_OUTPUT`, preserving non-eight-aligned visible widths such as 854 pixels
+  while keeping the framebuffer pitch independently aligned for DMA-BUF;
 - DMA-BUF export of the tracked scanout framebuffer, cached per buffer object;
 - real `dma_resv` write fence exported as a sync_file;
 - Hermes/apps UAPI through DRM ioctls; frame/metric tracking;
@@ -146,7 +155,27 @@ Optional initial mode/state parameters:
 sudo insmod kernel/hermes-kms/hermes_kms.ko initial_width=1920 initial_height=1080 initial_refresh_hz=60
 sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=1
 sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0 outputs=2
+sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0 devices=2 outputs=1
 ```
+
+Independent compositors require the packaged
+`70-hermes-kms-session-seats.rules` and one packaged private seat broker per
+DRM device. For two devices, install `seatd`, add the Hermes user to the
+`seat` group, and start:
+
+```bash
+sudo systemctl enable --now hermes-kms-seatd@1.service hermes-kms-seatd@2.service
+```
+
+The sockets are exposed as
+`/run/hermes-kms-seatd/1/seatd.sock`,
+`/run/hermes-kms-seatd/2/seatd.sock`, and so on. Each service runs the stock
+`seatd` daemon inside its own mount namespace because the daemon has a
+compile-time socket path and only permits one active compositor per daemon.
+The default `devices=1` configuration keeps the legacy platform path and host
+seat, so existing KWin/GNOME use is unchanged. These private brokers are an
+experimental session mechanism, not a security boundary between mutually
+untrusted local users.
 
 There are two ways to drive the output, for two different purposes.
 
@@ -188,11 +217,18 @@ module, drives a `modetest` producer, and verifies the DMA-BUF/sync_file path.
 
 Other validation scripts (run as root, in the virtme-ng VM or on the host):
 
+- `scripts/vm-multi-device-test.sh` — creates two independent DRM cards, gives
+  each one a simultaneous DRM master, and verifies distinct owner/frame/DMA-BUF
+  channels, exact 854x480 visible geometry with an aligned pitch, and clean
+  teardown;
+- `scripts/vm-multi-compositor-test.sh` — starts two private seat brokers and
+  two Weston DRM compositors concurrently, one on each card, then verifies
+  independent scanout modes;
 - `scripts/vm-multi-output-test.sh` — drives two outputs concurrently at
   different modes and verifies distinct owners, framebuffers, DMA-BUFs,
   independent disconnect, and clean unload;
 - `scripts/vm-uapi-v7-compat-test.sh` — verifies an unmodified v0.1.2 control
-  client remains confined to `HERMES-1` under UAPI v8;
+  client remains confined to the first output under the current UAPI;
 - `scripts/vm-pacing-test.sh` — asserts the vblank timer fires at exactly
   60/120/144 Hz with no missed vblanks (uses `hermes-vblank-meter.c`);
 - `scripts/vm-export-stress.sh` — hammers `ACQUIRE_FRAME` from many threads
@@ -233,6 +269,10 @@ Initial ioctls:
 new fds default to output 0 for compatibility. `GET_IDENTITY` then exposes the
 selected stable Hermes-facing name (`HERMES-1`, `HERMES-2`, ...) while the DRM
 core may still expose connector objects as `Virtual-*`.
+UAPI v9 also exposes `GET_IDENTITY.device_index` and `device_count`.
+`HERMES_KMS_CAP_MULTI_DEVICE` means the module can create multiple independent
+DRM devices with `devices=N`; every device has its own DRM-master ownership
+domain and contains `output_count` selectable outputs.
 
 `GET_STATUS` now reports scanout/frame metadata:
 

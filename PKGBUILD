@@ -8,7 +8,7 @@
 
 pkgname=hermes-kms-dkms-git
 _pkgbase=hermes-kms
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Hermes-KMS zero-copy virtual display DRM/KMS driver (DKMS)"
 arch=('x86_64')
@@ -16,7 +16,8 @@ url="https://github.com/MrOz59/Hermes-KMS"
 license=('GPL2')
 depends=('dkms')
 makedepends=('git')
-optdepends=('libva: VAAPI import-check tool'
+optdepends=('seatd: independent compositor sessions via private seat brokers'
+            'libva: VAAPI import-check tool'
             'libdrm: VAAPI import-check tool'
             'kscreen: enable the virtual output on KDE/KWin')
 provides=('hermes-kms')
@@ -46,15 +47,21 @@ package() {
 
   # Ship the whole source tree so DKMS can build the module (the module Makefile
   # references ../../include/uapi, so the layout must be preserved).
-  cp -a Makefile dkms.conf include kernel tools udev scripts "$_dest/"
+  cp -a Makefile dkms.conf include kernel packaging tools udev scripts "$_dest/"
 
   # Make the DKMS package version match the directory DKMS expects.
   sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${pkgver}\"/" "$_dest/dkms.conf"
 
-  # Auto-load the module at boot with initial_enabled=1 so the compositor
-  # adopts the virtual output before the session starts.
+  # Auto-load the module disconnected; Hermes enables each connector only
+  # while a streaming session owns it.
   install -Dm644 packaging/modules-load.d/hermes-kms.conf \
     "$pkgdir/usr/lib/modules-load.d/hermes-kms.conf"
   install -Dm644 packaging/modprobe.d/hermes-kms.conf \
     "$pkgdir/usr/lib/modprobe.d/hermes-kms.conf"
+  install -Dm644 udev/70-hermes-kms-session-seats.rules \
+    "$pkgdir/usr/lib/udev/rules.d/70-hermes-kms-session-seats.rules"
+  install -Dm755 scripts/hermes-kms-seatd-instance \
+    "$pkgdir/usr/lib/hermes-kms/hermes-kms-seatd-instance"
+  install -Dm644 packaging/systemd/hermes-kms-seatd@.service \
+    "$pkgdir/usr/lib/systemd/system/hermes-kms-seatd@.service"
 }

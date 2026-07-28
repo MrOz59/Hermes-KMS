@@ -24,12 +24,14 @@ UAPI_CFLAGS := -I$(PWD)/include/uapi
 IMPORT_CHECK_CFLAGS := $(shell pkg-config --cflags libva libva-drm libdrm 2>/dev/null)
 IMPORT_CHECK_LIBS := $(shell pkg-config --libs libva libva-drm libdrm 2>/dev/null)
 UDEV_RULE_DIR ?= /etc/udev/rules.d
+SYSTEM_UDEV_RULE_DIR ?= /usr/lib/udev/rules.d
 
 DKMS_NAME := hermes-kms
 DKMS_VERSION := $(shell awk '/^#define HERMES_KMS_DRIVER_MAJOR/{maj=$$3} /^#define HERMES_KMS_DRIVER_MINOR/{min=$$3} /^#define HERMES_KMS_DRIVER_PATCH/{pat=$$3} END{print maj"."min"."pat}' kernel/hermes-kms/hermes_kms.c)
 DKMS_SRC := /usr/src/$(DKMS_NAME)-$(DKMS_VERSION)
 
-.PHONY: all modules tools install-dev-udev uninstall-dev-udev \
+.PHONY: all modules tools install-runtime-udev uninstall-runtime-udev \
+	install-dev-udev uninstall-dev-udev \
 	dkms-install dkms-uninstall clean
 
 all: modules tools
@@ -38,15 +40,18 @@ all: modules tools
 # every new kernel (the same mechanism evdi-dkms uses). Run as root.
 dkms-install:
 	install -dm755 $(DKMS_SRC)
-	cp -a Makefile dkms.conf include kernel tools udev scripts $(DKMS_SRC)/
+	cp -a Makefile dkms.conf include kernel packaging tools udev scripts $(DKMS_SRC)/
 	dkms add -m $(DKMS_NAME) -v $(DKMS_VERSION)
 	dkms build -m $(DKMS_NAME) -v $(DKMS_VERSION)
 	dkms install -m $(DKMS_NAME) -v $(DKMS_VERSION)
-	@printf 'Hermes-KMS installed via DKMS. Load it with: sudo modprobe hermes_kms initial_enabled=1\n'
+	$(MAKE) install-runtime-udev
+	@printf 'Hermes-KMS installed via DKMS. Load it with: sudo modprobe hermes_kms initial_enabled=0\n'
+	@printf 'For two independent sessions also run: sudo systemctl enable --now hermes-kms-seatd@1.service hermes-kms-seatd@2.service\n'
 
 dkms-uninstall:
 	-dkms remove -m $(DKMS_NAME) -v $(DKMS_VERSION) --all
 	$(RM) -r $(DKMS_SRC)
+	$(MAKE) uninstall-runtime-udev
 	@printf 'Hermes-KMS removed from DKMS.\n'
 
 modules:
@@ -60,6 +65,25 @@ tools/hermes-kmsctl/hermes-kmsctl: tools/hermes-kmsctl/hermes_kmsctl.c include/u
 tools/hermes-kms-import-check/hermes-kms-import-check: tools/hermes-kms-import-check/hermes_kms_import_check.c include/uapi/drm/hermes_kms_drm.h
 	@test -n "$(IMPORT_CHECK_LIBS)" || { printf 'missing libva/libva-drm/libdrm pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(IMPORT_CHECK_CFLAGS) -o $@ $< $(IMPORT_CHECK_LIBS)
+
+install-runtime-udev:
+	install -Dm0644 udev/70-hermes-kms-session-seats.rules \
+		$(SYSTEM_UDEV_RULE_DIR)/70-hermes-kms-session-seats.rules
+	install -Dm0755 scripts/hermes-kms-seatd-instance \
+		/usr/lib/hermes-kms/hermes-kms-seatd-instance
+	install -Dm0644 packaging/systemd/hermes-kms-seatd@.service \
+		/usr/lib/systemd/system/hermes-kms-seatd@.service
+	-systemctl daemon-reload
+	-udevadm control --reload-rules
+	-udevadm trigger --subsystem-match=drm --action=change
+
+uninstall-runtime-udev:
+	$(RM) $(SYSTEM_UDEV_RULE_DIR)/70-hermes-kms-session-seats.rules
+	$(RM) /usr/lib/systemd/system/hermes-kms-seatd@.service
+	$(RM) /usr/lib/hermes-kms/hermes-kms-seatd-instance
+	-systemctl daemon-reload
+	-udevadm control --reload-rules
+	-udevadm trigger --subsystem-match=drm --action=change
 
 install-dev-udev:
 	install -m 0644 udev/99-hermes-kms-ignore-seat.rules $(UDEV_RULE_DIR)/99-hermes-kms-ignore-seat.rules

@@ -12,7 +12,7 @@ The canonical version lives in the driver source as three defines in
 
 ```c
 #define HERMES_KMS_DRIVER_MAJOR 0
-#define HERMES_KMS_DRIVER_MINOR 2
+#define HERMES_KMS_DRIVER_MINOR 3
 #define HERMES_KMS_DRIVER_PATCH 0
 ```
 
@@ -23,6 +23,56 @@ tag `vMAJOR.MINOR.PATCH`.
 
 While the major version is `0`, the UAPI and on-disk/ioctl interfaces are still
 subject to change between minor releases.
+
+## [Unreleased]
+
+## [0.3.0] - 2026-07-29
+
+### Added
+
+- UAPI v9 multi-device prototype. The new `devices=` module parameter creates
+  up to eight independent Hermes DRM cards, each with its own DRM-master domain
+  and `outputs=` pipelines. Identity discovery now reports stable
+  `device_index`/`device_count`, and capabilities advertise
+  `HERMES_KMS_CAP_MULTI_DEVICE`.
+- `scripts/vm-multi-device-test.sh` validates two simultaneous DRM masters,
+  different modes, distinct owner/framebuffer/DMA-BUF channels, independent
+  disconnect, and clean teardown in a disposable virtme-ng guest.
+- Packaged per-device `hermes-kms-seatd@.service` instances expose private
+  seatd sockets for independent compositors. A disposable VM test starts two
+  brokers and two Weston DRM sessions concurrently and validates distinct
+  scanout modes.
+
+### Changed
+
+- Output names and EDID serials are globally unique across all module-created
+  devices. Existing `devices=1` behavior and UAPI structure sizes remain
+  compatible.
+- Requested visible widths are no longer rounded down to CVT's eight-pixel
+  character-cell boundary. For example, a requested 854x480 scanout remains
+  854x480 while its dumb-buffer pitch is padded independently for DMA-BUF and
+  VAAPI import.
+- The default single device retains the legacy platform path and host seat.
+  Packaged multi-device cards receive stable `hermes-kms-1..8` udev/libseat
+  assignments for independent compositors and matching virtual input devices.
+- Packaged module defaults now use `initial_enabled=0`, leaving connectors
+  disconnected until a streaming session owns them.
+
+### Validated
+
+- Two Weston DRM compositors run concurrently through separate private seat
+  brokers on two Hermes cards, with independent 854x480 and 1920x1080
+  scanouts as the unprivileged Hermes user
+  (`scripts/vm-multi-compositor-test.sh`).
+- The multi-device VM regression drives one card at the non-eight-aligned
+  854x480 mode and verifies requested, active, and exported frame sizes remain
+  854x480 while the XRGB8888 pitch is independently padded to 3584 bytes.
+
+### Not yet validated
+
+- Running two simultaneous Moonlight clients on the real host.
+- Per-session input seats and audio routing; these are Hermes userspace
+  concerns rather than part of the DRM UAPI.
 
 ## [0.2.0] - 2026-07-28
 
@@ -107,5 +157,6 @@ the warning at the bottom of this entry.
 > your graphics session. Do not run it on a machine where you cannot tolerate
 > an unstable display stack, and please report issues you hit.
 
+[0.3.0]: https://github.com/MrOz59/Hermes-KMS/releases/tag/v0.3.0
 [0.2.0]: https://github.com/MrOz59/Hermes-KMS/releases/tag/v0.2.0
 [0.1.2]: https://github.com/MrOz59/Hermes-KMS/releases/tag/v0.1.2

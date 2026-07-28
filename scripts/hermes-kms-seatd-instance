@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Run one stock seatd daemon in a private mount namespace while exposing its
+# compile-time /run/seatd.sock at a per-device host path.
+set -euo pipefail
+
+INSTANCE="${1:-}"
+SOCKET_OWNER="${2:-root}"
+SOCKET_GROUP="${3:-seat}"
+RUNTIME_ROOT="${HERMES_SEATD_RUNTIME_ROOT:-/run/hermes-kms-seatd}"
+
+if [[ ! "$INSTANCE" =~ ^[1-8]$ ]]; then
+	printf 'instance must be an integer from 1 through 8\n' >&2
+	exit 2
+fi
+if [ "$(id -u)" -ne 0 ]; then
+	printf 'hermes-kms-seatd-instance must run as root\n' >&2
+	exit 1
+fi
+command -v mount >/dev/null || {
+	printf 'mount is required\n' >&2
+	exit 1
+}
+command -v chown >/dev/null || {
+	printf 'chown is required\n' >&2
+	exit 1
+}
+command -v seatd >/dev/null || {
+	printf 'seatd is required\n' >&2
+	exit 1
+}
+
+SESSION_RUN="$RUNTIME_ROOT/$INSTANCE"
+install -d -m 0750 "$RUNTIME_ROOT" "$SESSION_RUN"
+chown "$SOCKET_OWNER:$SOCKET_GROUP" "$RUNTIME_ROOT" "$SESSION_RUN"
+install -d -m 0755 "$SESSION_RUN/udev"
+
+# The caller must provide a private mount namespace (the packaged systemd unit
+# uses PrivateMounts=yes). Preserve udev's runtime database inside the private
+# /run so libseat/libinput retain device metadata.
+mount --make-rprivate /
+if [ -d /run/udev ]; then
+	mount --rbind /run/udev "$SESSION_RUN/udev"
+fi
+mount --bind "$SESSION_RUN" /run
+
+# seatd's daemon socket location is compiled in and has no CLI override.
+# Because /run is the per-instance bind mount here, the resulting socket is
+# visible to Hermes outside the namespace as:
+#   $RUNTIME_ROOT/$INSTANCE/seatd.sock
+exec seatd -u "$SOCKET_OWNER" -g "$SOCKET_GROUP"

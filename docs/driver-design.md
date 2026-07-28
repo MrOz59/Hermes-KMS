@@ -62,6 +62,34 @@ atomic modesets, distinct owners/framebuffers, DMA-BUF + sync_file export,
 independent disconnect, and clean unload for two outputs. KWin adoption,
 persistent host layout, and real encoder integration still require validation.
 
+## Multi-device session prototype
+
+UAPI v9 can create 1–8 separate DRM devices with `devices=` (default 1). Unlike
+`outputs=`, which places several connectors under one DRM-master domain,
+separate devices allow separate compositors to hold DRM master concurrently.
+Each device owns its complete set of KMS objects, output/session state, frame
+queues, and platform-device lifetime.
+
+The identity ioctl reports a stable 0-based `device_index` and total
+`device_count`. Friendly output names and EDID serials remain globally unique
+across devices. The intended isolated-session layout is `devices=N outputs=1`;
+the older shared-desktop layout remains `devices=1 outputs=N`.
+For compatibility, `devices=1` retains the original `hermes-kms` platform path
+and host seat. Multi-device paths use `hermes-kms.0..7`, which the packaged
+udev rule maps to stable `hermes-kms-1..8` seats for matching compositor and
+virtual-input isolation.
+
+Status: **Prototype**. `scripts/vm-multi-device-test.sh` validates two
+simultaneous DRM masters at different modes, distinct owners/framebuffers,
+DMA-BUF + sync_file export from both devices, independent disconnect, and clean
+module unload. `scripts/vm-multi-compositor-test.sh` additionally validates two
+concurrent Weston DRM sessions, each connected through its own packaged
+`hermes-kms-seatd@.service`-compatible private broker, with distinct scanout
+modes. The private brokers isolate seatd's single-active-client state; they are
+not a security boundary between mutually untrusted local users. Encoder import,
+input seats, and two Moonlight clients are not validated by these driver-only
+tests.
+
 ## Communication with Hermes
 
 Hermes-KMS should be controlled through explicit DRM ioctls, not by scraping logs or guessing connector names.
@@ -72,7 +100,9 @@ The first UAPI lives in `include/uapi/drm/hermes_kms_drm.h` and provides:
 - stable output identity discovery;
 - capability discovery;
 - current output status;
-- requested output enable/disable and preferred mode.
+- requested output enable/disable and preferred mode. Visible width is
+  preserved exactly even when it is not divisible by eight; framebuffer pitch
+  alignment remains a separate allocation property.
 
 This is deliberately small. It can be safely extended with append-only structs and new ioctls for:
 
