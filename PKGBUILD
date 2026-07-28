@@ -8,7 +8,7 @@
 
 pkgname=hermes-kms-dkms-git
 _pkgbase=hermes-kms
-pkgver=0.1.2
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Hermes-KMS zero-copy virtual display DRM/KMS driver (DKMS)"
 arch=('x86_64')
@@ -26,7 +26,7 @@ sha256sums=('SKIP')
 
 pkgver() {
   cd "$srcdir/Hermes-KMS"
-  # 0.1.2.r<commits>.g<short-sha> — sortable and unique per commit.
+  # <driver-version>.r<commits>.g<short-sha> — sortable and unique per commit.
   local _ver
   _ver=$(awk '
     /^#define HERMES_KMS_DRIVER_MAJOR/ { maj=$3 }

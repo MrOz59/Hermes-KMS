@@ -19,18 +19,20 @@ static void usage(const char *argv0)
 {
 	fprintf(stderr,
 		"Usage:\n"
-		"  %s [--device /dev/dri/cardN] [--verbose] version\n"
-		"  %s [--device /dev/dri/cardN] [--verbose] identity\n"
-		"  %s [--device /dev/dri/cardN] [--verbose] caps\n"
-		"  %s [--device /dev/dri/cardN] [--verbose] status\n"
-		"  %s [--device /dev/dri/cardN] [--verbose] metrics\n"
-		"  %s [--device /dev/dri/cardN] [--verbose] diagnose\n"
-		"  %s [--device /dev/dri/cardN] [--verbose] wait [AFTER_SEQUENCE] [TIMEOUT_MS]\n"
-		"  %s [--device /dev/dri/cardN] [--verbose] frame [--require-dmabuf] [--sync-file]\n"
-		"  %s [--device /dev/dri/cardN] [--verbose] enable [WIDTHxHEIGHT@HZ]\n"
-		"  %s [--device /dev/dri/cardN] [--verbose] hold [WIDTHxHEIGHT@HZ]\n"
-		"  %s [--device /dev/dri/cardN] [--verbose] disable\n",
-		argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] version\n"
+		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] outputs\n"
+		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] identity\n"
+		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] caps\n"
+		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] status\n"
+		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] metrics\n"
+		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] diagnose\n"
+		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] wait [AFTER_SEQUENCE] [TIMEOUT_MS]\n"
+		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] frame [--require-dmabuf] [--sync-file]\n"
+		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] enable [WIDTHxHEIGHT@HZ]\n"
+		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] hold [WIDTHxHEIGHT@HZ]\n"
+		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] disable\n",
+		argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
+		argv0, argv0, argv0, argv0);
 }
 
 static volatile sig_atomic_t stop_requested;
@@ -147,6 +149,7 @@ static int print_caps(int fd)
 	printf("max=%ux%u\n", caps.max_width, caps.max_height);
 	printf("preferred=%ux%u\n", caps.preferred_width, caps.preferred_height);
 	printf("max_refresh_hz=%u\n", caps.max_refresh_hz);
+	printf("output_count=%u\n", caps.output_count ? caps.output_count : 1);
 	printf("virtual_output=%s\n",
 	       (caps.flags & HERMES_KMS_CAP_VIRTUAL_OUTPUT) ? "true" : "false");
 	printf("output_control=%s\n",
@@ -165,6 +168,8 @@ static int print_caps(int fd)
 	       (caps.flags & HERMES_KMS_CAP_FRAME_WAIT) ? "true" : "false");
 	printf("metrics=%s\n",
 	       (caps.flags & HERMES_KMS_CAP_METRICS) ? "true" : "false");
+	printf("multi_output=%s\n",
+	       (caps.flags & HERMES_KMS_CAP_MULTI_OUTPUT) ? "true" : "false");
 	printf("zero_copy_target=%s\n",
 	       (caps.flags & HERMES_KMS_CAP_ZERO_COPY_TARGET) ? "true" : "false");
 	printf("writeback_connector=%s\n",
@@ -308,6 +313,74 @@ static int print_identity(int fd)
 	printf("crtc_id=%u\n", identity.crtc_id);
 	printf("plane_id=%u\n", identity.plane_id);
 	printf("encoder_id=%u\n", identity.encoder_id);
+	printf("output_index=%u\n", identity.output_index + 1);
+	printf("output_count=%u\n",
+	       identity.output_count ? identity.output_count : 1);
+
+	return 0;
+}
+
+static int select_output(int fd, uint32_t output_number)
+{
+	struct drm_hermes_kms_select_output request;
+
+	if (!output_number) {
+		fprintf(stderr, "Output numbers start at 1\n");
+		return 2;
+	}
+
+	memset(&request, 0, sizeof(request));
+	request.output_index = output_number - 1;
+	if (ioctl(fd, DRM_IOCTL_HERMES_KMS_SELECT_OUTPUT, &request) < 0) {
+		fprintf(stderr, "SELECT_OUTPUT %u failed: %s\n",
+			output_number, strerror(errno));
+		return 1;
+	}
+
+	return 0;
+}
+
+static int print_outputs(int fd)
+{
+	struct drm_hermes_kms_caps caps;
+	uint32_t count;
+
+	memset(&caps, 0, sizeof(caps));
+	if (ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_CAPS, &caps) < 0) {
+		perror("GET_CAPS");
+		return 1;
+	}
+
+	count = caps.output_count ? caps.output_count : 1;
+	printf("output_count=%u\n", count);
+	for (uint32_t i = 0; i < count; i++) {
+		struct drm_hermes_kms_identity identity;
+		struct drm_hermes_kms_status status;
+
+		if (count > 1 && select_output(fd, i + 1))
+			return 1;
+
+		memset(&identity, 0, sizeof(identity));
+		memset(&status, 0, sizeof(status));
+		if (ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_IDENTITY, &identity) < 0) {
+			perror("GET_IDENTITY");
+			return 1;
+		}
+		if (ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_STATUS, &status) < 0) {
+			perror("GET_STATUS");
+			return 1;
+		}
+
+		printf("output_%u_name=%s\n", i + 1, identity.output_name);
+		printf("output_%u_connector=%s\n", i + 1,
+		       identity.connector_name);
+		printf("output_%u_enabled=%s\n", i + 1,
+		       (status.flags & HERMES_KMS_STATUS_OUTPUT_ENABLED) ?
+		       "true" : "false");
+		printf("output_%u_owner_pid=%d\n", i + 1, status.owner_pid);
+		printf("output_%u_frame_sequence=%llu\n", i + 1,
+		       (unsigned long long)status.frame_sequence);
+	}
 
 	return 0;
 }
@@ -605,6 +678,8 @@ int main(int argc, char **argv)
 {
 	const char *device = NULL;
 	const char *command;
+	uint32_t output_number = 1;
+	bool output_selected = false;
 	int argi = 1;
 	int fd;
 	int ret;
@@ -615,14 +690,32 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	if (argc >= 4 && strcmp(argv[argi], "--device") == 0) {
-		device = argv[argi + 1];
-		argi += 2;
-	}
-
-	if (argi < argc && strcmp(argv[argi], "--verbose") == 0) {
-		verbose = true;
-		argi++;
+	while (argi < argc && strncmp(argv[argi], "--", 2) == 0) {
+		if (strcmp(argv[argi], "--device") == 0) {
+			if (argi + 1 >= argc) {
+				fprintf(stderr, "--device requires a path\n");
+				return 2;
+			}
+			device = argv[argi + 1];
+			argi += 2;
+		} else if (strcmp(argv[argi], "--output") == 0) {
+			if (argi + 1 >= argc ||
+			    parse_u32(argv[argi + 1], &output_number) < 0 ||
+			    !output_number) {
+				fprintf(stderr,
+					"--output requires a positive 1-based number\n");
+				return 2;
+			}
+			output_selected = true;
+			argi += 2;
+		} else if (strcmp(argv[argi], "--verbose") == 0) {
+			verbose = true;
+			argi++;
+		} else {
+			fprintf(stderr, "Unknown option '%s'\n", argv[argi]);
+			usage(argv[0]);
+			return 2;
+		}
 	}
 
 	if (argi >= argc) {
@@ -640,8 +733,15 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	if (output_selected && select_output(fd, output_number)) {
+		close(fd);
+		return 1;
+	}
+
 	if (strcmp(command, "version") == 0)
 		ret = print_version(fd);
+	else if (strcmp(command, "outputs") == 0)
+		ret = print_outputs(fd);
 	else if (strcmp(command, "identity") == 0)
 		ret = print_identity(fd);
 	else if (strcmp(command, "caps") == 0)

@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define HERMES_KMS_UAPI_VERSION 7
+#define HERMES_KMS_UAPI_VERSION 8
 
 #define HERMES_KMS_NAME_LEN 32
 
@@ -30,6 +30,7 @@ extern "C" {
 #define HERMES_KMS_CAP_SESSION_OWNER		(1ULL << 8)
 #define HERMES_KMS_CAP_FRAME_WAIT		(1ULL << 9)
 #define HERMES_KMS_CAP_METRICS			(1ULL << 10)
+#define HERMES_KMS_CAP_MULTI_OUTPUT		(1ULL << 11)
 #define HERMES_KMS_CAP_DMABUF_EXPORT_PLANNED	(1ULL << 32)
 #define HERMES_KMS_CAP_ZERO_COPY_TARGET		(1ULL << 33)
 #define HERMES_KMS_CAP_WRITEBACK_CONNECTOR	(1ULL << 34)
@@ -80,7 +81,8 @@ struct drm_hermes_kms_caps {
 	__u32 preferred_width;
 	__u32 preferred_height;
 	__u32 max_refresh_hz;
-	__u32 reserved0;
+	/* Number of independently selectable outputs on this DRM device. */
+	__u32 output_count;
 };
 
 struct drm_hermes_kms_status {
@@ -121,6 +123,27 @@ struct drm_hermes_kms_identity {
 	__u32 crtc_id;
 	__u32 plane_id;
 	__u32 encoder_id;
+	/* 0-based selected output and total outputs (uapi >= 8). */
+	__u32 output_index;
+	__u32 output_count;
+	__u32 reserved[6];
+};
+
+/*
+ * Bind this DRM file descriptor to one virtual output. All output-scoped
+ * ioctls on the descriptor (status, control, capture, wait and metrics) then
+ * operate on that output. A newly opened descriptor is bound to output 0 for
+ * compatibility with uapi <= 7 clients.
+ *
+ * Rebinding an fd that currently owns an enabled output is rejected with
+ * -EBUSY. Use a separate fd for each concurrent output/session.
+ */
+struct drm_hermes_kms_select_output {
+	__u32 output_index;
+	__u32 flags;
+	__u32 selected_output_index;
+	__u32 output_count;
+	char output_name[HERMES_KMS_NAME_LEN];
 	__u32 reserved[8];
 };
 
@@ -207,6 +230,7 @@ struct drm_hermes_kms_metrics {
 #define DRM_HERMES_KMS_GET_IDENTITY	0x05
 #define DRM_HERMES_KMS_WAIT_FRAME	0x06
 #define DRM_HERMES_KMS_GET_METRICS	0x07
+#define DRM_HERMES_KMS_SELECT_OUTPUT	0x08
 
 #define DRM_IOCTL_HERMES_KMS_GET_VERSION \
 	DRM_IOR(DRM_COMMAND_BASE + DRM_HERMES_KMS_GET_VERSION, struct drm_hermes_kms_version)
@@ -224,6 +248,9 @@ struct drm_hermes_kms_metrics {
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_HERMES_KMS_WAIT_FRAME, struct drm_hermes_kms_wait_frame)
 #define DRM_IOCTL_HERMES_KMS_GET_METRICS \
 	DRM_IOR(DRM_COMMAND_BASE + DRM_HERMES_KMS_GET_METRICS, struct drm_hermes_kms_metrics)
+#define DRM_IOCTL_HERMES_KMS_SELECT_OUTPUT \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_HERMES_KMS_SELECT_OUTPUT, \
+		 struct drm_hermes_kms_select_output)
 
 #if defined(__cplusplus)
 }

@@ -18,6 +18,11 @@
 
 ## Next
 
+- Host/KWin validation of the multi-output prototype: compositor adoption,
+  persistent layout, two real concurrent capture sessions, and recovery. The
+  disposable VM test already validates two simultaneous owner fds and atomic
+  modesets, distinct framebuffer/DMA-BUF channels, independent disconnect, and
+  clean unload.
 - NVENC/AMF DMA-BUF import validation (VAAPI is validated).
 - NV12/P010 scanout and HDR. The compositor composes in RGB and the encoder
   does RGB→NV12 on the real GPU today, so this is an optimization, not a

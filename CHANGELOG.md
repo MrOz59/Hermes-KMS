@@ -12,8 +12,8 @@ The canonical version lives in the driver source as three defines in
 
 ```c
 #define HERMES_KMS_DRIVER_MAJOR 0
-#define HERMES_KMS_DRIVER_MINOR 1
-#define HERMES_KMS_DRIVER_PATCH 2
+#define HERMES_KMS_DRIVER_MINOR 2
+#define HERMES_KMS_DRIVER_PATCH 0
 ```
 
 The DKMS config, the PKGBUILD, and the `GET_VERSION` ioctl all read from these,
@@ -23,6 +23,43 @@ tag `vMAJOR.MINOR.PATCH`.
 
 While the major version is `0`, the UAPI and on-disk/ioctl interfaces are still
 subject to change between minor releases.
+
+## [0.2.0] - 2026-07-28
+
+### Added
+
+- Prototype support for 1–8 independent virtual outputs on one DRM device
+  (`outputs=`, default 1 for compatibility), each with its own connector, CRTC,
+  planes, software vblank timer, owner session, framebuffer channel, waitqueue,
+  metrics, and DMA-BUF export cache. Multiple outputs remain opt-in until the
+  Hermes host integration manages every connector.
+- UAPI v8 `SELECT_OUTPUT` binding. A new DRM fd remains bound to output 0 for
+  compatibility; updated clients bind one fd per concurrent output.
+- Stable per-output identities (`HERMES-1`, `HERMES-2`, ...) and distinct EDID
+  serials so compositors can persist each virtual monitor separately.
+- `hermes-kmsctl --output N` and `hermes-kmsctl outputs`.
+- Disposable virtme-ng tests for concurrent modeset, ownership, DMA-BUF
+  export, independent disconnect (`scripts/vm-multi-output-test.sh`), and
+  compatibility with an unmodified v0.1.2 client
+  (`scripts/vm-uapi-v7-compat-test.sh`).
+
+### Validation
+
+- Builds against CachyOS kernel `7.0.9-1-cachyos` with kbuild `W=1`.
+- The control tool builds with `-Wall -Wextra`.
+- Three consecutive virtme-ng runs validated two simultaneous atomic modesets
+  at different resolutions, distinct owner fds and framebuffers, DMA-BUF +
+  sync_file export from both outputs, independent disconnect, clean unload,
+  and no kernel splat.
+- The unmodified v0.1.2 `hermes-kmsctl` binary was tested against UAPI v8: its
+  existing ioctls still operate on `HERMES-1`, while `HERMES-2` remains
+  independent.
+- Existing VM regressions pass after the refactor: software vblank pacing at
+  60/120/144 Hz with zero overruns, plus a 5-second/4-thread export stress
+  (4,652,791 acquires, 299 flips, zero errors/splats, clean unload). The short
+  stress run did not use KASAN or SLUB debug.
+- KWin compositor adoption/recovery and real encoder integration are not yet
+  runtime-validated for multiple outputs.
 
 ## [0.1.2] - 2026-06-30
 
@@ -70,4 +107,5 @@ the warning at the bottom of this entry.
 > your graphics session. Do not run it on a machine where you cannot tolerate
 > an unstable display stack, and please report issues you hit.
 
+[0.2.0]: https://github.com/MrOz59/Hermes-KMS/releases/tag/v0.2.0
 [0.1.2]: https://github.com/MrOz59/Hermes-KMS/releases/tag/v0.1.2

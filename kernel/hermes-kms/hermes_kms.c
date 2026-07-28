@@ -20,6 +20,7 @@
 #include <linux/fcntl.h>
 #include <linux/file.h>
 #include <linux/seq_file.h>
+#include <linux/slab.h>
 #include <linux/sync_file.h>
 #include <linux/wait.h>
 
@@ -57,9 +58,11 @@
 #define HERMES_KMS_DRIVER_DESC "Hermes virtual KMS display"
 #define HERMES_KMS_DRIVER_DATE "20260625"
 #define HERMES_KMS_DRIVER_MAJOR 0
-#define HERMES_KMS_DRIVER_MINOR 1
-#define HERMES_KMS_DRIVER_PATCH 2
-#define HERMES_KMS_OUTPUT_NAME "HERMES-1"
+#define HERMES_KMS_DRIVER_MINOR 2
+#define HERMES_KMS_DRIVER_PATCH 0
+#define HERMES_KMS_OUTPUT_NAME_PREFIX "HERMES-"
+#define HERMES_KMS_DEFAULT_OUTPUTS 1
+#define HERMES_KMS_MAX_OUTPUTS 8
 
 #define HERMES_KMS_MIN_WIDTH 640
 #define HERMES_KMS_MIN_HEIGHT 480
@@ -76,6 +79,7 @@ static bool non_desktop;
 static unsigned int initial_width = HERMES_KMS_DEFAULT_WIDTH;
 static unsigned int initial_height = HERMES_KMS_DEFAULT_HEIGHT;
 static unsigned int initial_refresh_hz = HERMES_KMS_DEFAULT_REFRESH_HZ;
+static unsigned int outputs = HERMES_KMS_DEFAULT_OUTPUTS;
 
 module_param(initial_enabled, bool, 0644);
 MODULE_PARM_DESC(initial_enabled, "Initial virtual output state");
@@ -89,9 +93,16 @@ module_param(initial_height, uint, 0644);
 MODULE_PARM_DESC(initial_height, "Initial virtual output height");
 module_param(initial_refresh_hz, uint, 0644);
 MODULE_PARM_DESC(initial_refresh_hz, "Initial virtual output refresh rate");
+module_param(outputs, uint, 0444);
+MODULE_PARM_DESC(outputs, "Number of virtual outputs on the DRM device (1-8, default 1)");
 
-struct hermes_kms_device {
-	struct drm_device drm;
+struct hermes_kms_device;
+
+struct hermes_kms_output {
+	struct hermes_kms_device *hdev;
+	unsigned int index;
+	char output_name[HERMES_KMS_NAME_LEN];
+	u8 edid[128];
 	/*
 	 * Explicit KMS objects (CRTC + encoder + primary plane), rather than
 	 * drm_simple_display_pipe, so we can drive a software vblank timer the
@@ -186,22 +197,45 @@ struct hermes_kms_device {
 	u64 acquire_no_frame_log_count;
 };
 
+struct hermes_kms_device {
+	struct drm_device drm;
+	unsigned int output_count;
+	struct hermes_kms_output outputs[HERMES_KMS_MAX_OUTPUTS];
+};
+
+struct hermes_kms_file {
+	unsigned int output_index;
+};
+
 static inline struct hermes_kms_device *to_hermes_kms(struct drm_device *drm)
 {
 	return container_of(drm, struct hermes_kms_device, drm);
 }
 
+static inline struct hermes_kms_output *
+hermes_kms_output_for_file(struct hermes_kms_device *hdev,
+			   struct drm_file *file)
+{
+	struct hermes_kms_file *context = file->driver_priv;
+
+	if (!context || context->output_index >= hdev->output_count)
+		return &hdev->outputs[0];
+
+	return &hdev->outputs[context->output_index];
+}
+
 /* Drop every cached dma-buf export. Caller must hold export_lock. */
-static void hermes_kms_drop_export_cache_locked(struct hermes_kms_device *hdev)
+static void
+hermes_kms_drop_export_cache_locked(struct hermes_kms_output *output)
 {
 	unsigned int i;
 
-	for (i = 0; i < ARRAY_SIZE(hdev->export_dmabuf); i++) {
-		if (hdev->export_dmabuf[i]) {
-			dma_buf_put(hdev->export_dmabuf[i]);
-			hdev->export_dmabuf[i] = NULL;
+	for (i = 0; i < ARRAY_SIZE(output->export_dmabuf); i++) {
+		if (output->export_dmabuf[i]) {
+			dma_buf_put(output->export_dmabuf[i]);
+			output->export_dmabuf[i] = NULL;
 		}
-		hdev->export_obj[i] = NULL;
+		output->export_obj[i] = NULL;
 	}
 }
 
@@ -238,16 +272,16 @@ static const u8 hermes_kms_edid[128] = {
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86,
 };
 
-static bool hermes_kms_hotplug_event(struct drm_device *drm)
+static bool hermes_kms_hotplug_event(struct hermes_kms_output *output)
 {
-	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct drm_device *drm = &output->hdev->drm;
 
 	if (!hotplug_events)
 		return false;
 
-	mutex_lock(&hdev->state_lock);
-	hdev->hotplug_event_count++;
-	mutex_unlock(&hdev->state_lock);
+	mutex_lock(&output->state_lock);
+	output->hotplug_event_count++;
+	mutex_unlock(&output->state_lock);
 
 	drm_kms_helper_hotplug_event(drm);
 	return true;
@@ -263,82 +297,83 @@ static bool hermes_kms_hotplug_event(struct drm_device *drm)
  * see the new mode. Force the probe directly; it is independent of the
  * hotplug_events module parameter, which only gates connection-state events.
  */
-static void hermes_kms_reprobe_modes(struct drm_device *drm)
+static void hermes_kms_reprobe_modes(struct hermes_kms_output *output)
 {
-	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct drm_device *drm = &output->hdev->drm;
 
 	mutex_lock(&drm->mode_config.mutex);
-	drm_helper_probe_single_connector_modes(&hdev->connector,
+	drm_helper_probe_single_connector_modes(&output->connector,
 						HERMES_KMS_MAX_WIDTH,
 						HERMES_KMS_MAX_HEIGHT);
 	mutex_unlock(&drm->mode_config.mutex);
 }
 
-static u64 hermes_kms_next_session_id_locked(struct hermes_kms_device *hdev)
+static u64
+hermes_kms_next_session_id_locked(struct hermes_kms_output *output)
 {
-	u64 session_id = hdev->next_session_id++;
+	u64 session_id = output->next_session_id++;
 
-	if (!hdev->next_session_id)
-		hdev->next_session_id = 1;
+	if (!output->next_session_id)
+		output->next_session_id = 1;
 
 	return session_id;
 }
 
-static void hermes_kms_clear_owner_locked(struct hermes_kms_device *hdev)
+static void hermes_kms_clear_owner_locked(struct hermes_kms_output *output)
 {
-	hdev->owner_file = NULL;
-	hdev->owner_pid = 0;
-	hdev->session_id = 0;
+	output->owner_file = NULL;
+	output->owner_pid = 0;
+	output->session_id = 0;
 }
 
-static void hermes_kms_clear_frame_locked(struct hermes_kms_device *hdev)
+static void hermes_kms_clear_frame_locked(struct hermes_kms_output *output)
 {
-	hdev->framebuffer_id = 0;
-	hdev->framebuffer_width = 0;
-	hdev->framebuffer_height = 0;
-	hdev->framebuffer_format = 0;
-	hdev->framebuffer_plane_count = 0;
-	memset(hdev->framebuffer_pitch, 0, sizeof(hdev->framebuffer_pitch));
-	memset(hdev->framebuffer_offset, 0, sizeof(hdev->framebuffer_offset));
-	hdev->framebuffer_modifier = 0;
+	output->framebuffer_id = 0;
+	output->framebuffer_width = 0;
+	output->framebuffer_height = 0;
+	output->framebuffer_format = 0;
+	output->framebuffer_plane_count = 0;
+	memset(output->framebuffer_pitch, 0, sizeof(output->framebuffer_pitch));
+	memset(output->framebuffer_offset, 0, sizeof(output->framebuffer_offset));
+	output->framebuffer_modifier = 0;
 }
 
-static void hermes_kms_set_frame_metadata_locked(struct hermes_kms_device *hdev,
+static void hermes_kms_set_frame_metadata_locked(struct hermes_kms_output *output,
 						 struct drm_framebuffer *fb)
 {
 	unsigned int i;
 	unsigned int plane_count = 0;
 
 	if (!fb) {
-		hermes_kms_clear_frame_locked(hdev);
+		hermes_kms_clear_frame_locked(output);
 		return;
 	}
 
-	hdev->framebuffer_id = fb->base.id;
-	hdev->framebuffer_width = fb->width;
-	hdev->framebuffer_height = fb->height;
-	hdev->framebuffer_format = fb->format->format;
-	hdev->framebuffer_modifier = fb->modifier;
+	output->framebuffer_id = fb->base.id;
+	output->framebuffer_width = fb->width;
+	output->framebuffer_height = fb->height;
+	output->framebuffer_format = fb->format->format;
+	output->framebuffer_modifier = fb->modifier;
 
-	if (fb->format->num_planes > ARRAY_SIZE(hdev->framebuffer_pitch))
-		plane_count = ARRAY_SIZE(hdev->framebuffer_pitch);
+	if (fb->format->num_planes > ARRAY_SIZE(output->framebuffer_pitch))
+		plane_count = ARRAY_SIZE(output->framebuffer_pitch);
 	else
 		plane_count = fb->format->num_planes;
 
-	hdev->framebuffer_plane_count = plane_count;
-	memset(hdev->framebuffer_pitch, 0, sizeof(hdev->framebuffer_pitch));
-	memset(hdev->framebuffer_offset, 0, sizeof(hdev->framebuffer_offset));
+	output->framebuffer_plane_count = plane_count;
+	memset(output->framebuffer_pitch, 0, sizeof(output->framebuffer_pitch));
+	memset(output->framebuffer_offset, 0, sizeof(output->framebuffer_offset));
 
 	for (i = 0; i < plane_count; i++) {
-		hdev->framebuffer_pitch[i] = fb->pitches[i];
-		hdev->framebuffer_offset[i] = fb->offsets[i];
+		output->framebuffer_pitch[i] = fb->pitches[i];
+		output->framebuffer_offset[i] = fb->offsets[i];
 	}
 }
 
-static void hermes_kms_track_frame(struct hermes_kms_device *hdev,
+static void hermes_kms_track_frame(struct hermes_kms_output *output,
 				   struct drm_framebuffer *fb)
 {
-	struct drm_device *drm = &hdev->drm;
+	struct drm_device *drm = &output->hdev->drm;
 	struct drm_framebuffer *old_fb;
 	u32 old_fb_id;
 	u64 sequence;
@@ -348,34 +383,34 @@ static void hermes_kms_track_frame(struct hermes_kms_device *hdev,
 	if (fb)
 		drm_framebuffer_get(fb);
 
-	mutex_lock(&hdev->state_lock);
-	old_fb = hdev->framebuffer;
+	mutex_lock(&output->state_lock);
+	old_fb = output->framebuffer;
 	old_fb_id = old_fb ? old_fb->base.id : 0;
-	hdev->framebuffer = fb;
-	hdev->frame_sequence++;
-	hdev->frame_update_count++;
-	hdev->last_update_ns = ktime_get_ns();
-	sequence = hdev->frame_sequence;
-	hermes_kms_set_frame_metadata_locked(hdev, fb);
+	output->framebuffer = fb;
+	output->frame_sequence++;
+	output->frame_update_count++;
+	output->last_update_ns = ktime_get_ns();
+	sequence = output->frame_sequence;
+	hermes_kms_set_frame_metadata_locked(output, fb);
 	if (fb && !old_fb_id) {
-		hdev->last_logged_framebuffer_id = fb->base.id;
+		output->last_logged_framebuffer_id = fb->base.id;
 		log_frame_connected = true;
 	} else if (!fb && old_fb_id) {
-		hdev->last_logged_framebuffer_id = 0;
+		output->last_logged_framebuffer_id = 0;
 		log_frame_disconnected = true;
-	} else if (fb && hdev->last_logged_framebuffer_id != fb->base.id) {
-		hdev->last_logged_framebuffer_id = fb->base.id;
+	} else if (fb && output->last_logged_framebuffer_id != fb->base.id) {
+		output->last_logged_framebuffer_id = fb->base.id;
 		drm_dbg_kms(drm,
-			    "scanout framebuffer changed: id=%u size=%ux%u format=0x%08x modifier=0x%016llx planes=%u sequence=%llu\n",
-			    hdev->framebuffer_id,
-			    hdev->framebuffer_width,
-			    hdev->framebuffer_height,
-			    hdev->framebuffer_format,
-			    (unsigned long long)hdev->framebuffer_modifier,
-			    hdev->framebuffer_plane_count,
-			    (unsigned long long)hdev->frame_sequence);
+			    "%s scanout framebuffer changed: id=%u size=%ux%u format=0x%08x modifier=0x%016llx planes=%u sequence=%llu\n",
+			    output->output_name, output->framebuffer_id,
+			    output->framebuffer_width,
+			    output->framebuffer_height,
+			    output->framebuffer_format,
+			    (unsigned long long)output->framebuffer_modifier,
+			    output->framebuffer_plane_count,
+			    (unsigned long long)output->frame_sequence);
 	}
-	mutex_unlock(&hdev->state_lock);
+	mutex_unlock(&output->state_lock);
 
 	/*
 	 * When the scanout framebuffer goes away (output disabled), drop the
@@ -385,9 +420,9 @@ static void hermes_kms_track_frame(struct hermes_kms_device *hdev,
 	 * outside state_lock to keep export_lock strictly below it.
 	 */
 	if (!fb) {
-		mutex_lock(&hdev->export_lock);
-		hermes_kms_drop_export_cache_locked(hdev);
-		mutex_unlock(&hdev->export_lock);
+		mutex_lock(&output->export_lock);
+		hermes_kms_drop_export_cache_locked(output);
+		mutex_unlock(&output->export_lock);
 	}
 
 	if (old_fb)
@@ -395,26 +430,29 @@ static void hermes_kms_track_frame(struct hermes_kms_device *hdev,
 
 	if (log_frame_connected)
 		drm_info(drm,
-			 "first active scanout framebuffer: id=%u size=%ux%u format=0x%08x modifier=0x%016llx planes=%u sequence=%llu\n",
-			 fb->base.id, fb->width, fb->height, fb->format->format,
+			 "%s first active scanout framebuffer: id=%u size=%ux%u format=0x%08x modifier=0x%016llx planes=%u sequence=%llu\n",
+			 output->output_name, fb->base.id, fb->width, fb->height,
+			 fb->format->format,
 			 (unsigned long long)fb->modifier, fb->format->num_planes,
 			 (unsigned long long)sequence);
 	else if (log_frame_disconnected)
-		drm_info(drm, "cleared active scanout framebuffer\n");
+		drm_info(drm, "%s cleared active scanout framebuffer\n",
+			 output->output_name);
 
-	wake_up_interruptible(&hdev->frame_wait);
+	wake_up_interruptible(&output->frame_wait);
 }
 
 static enum drm_connector_status
 hermes_kms_connector_detect(struct drm_connector *connector, bool force)
 {
-	struct hermes_kms_device *hdev = to_hermes_kms(connector->dev);
+	struct hermes_kms_output *output =
+		container_of(connector, struct hermes_kms_output, connector);
 	enum drm_connector_status status;
 
-	mutex_lock(&hdev->state_lock);
-	status = hdev->output_enabled ? connector_status_connected :
-					connector_status_disconnected;
-	mutex_unlock(&hdev->state_lock);
+	mutex_lock(&output->state_lock);
+	status = output->output_enabled ? connector_status_connected :
+					  connector_status_disconnected;
+	mutex_unlock(&output->state_lock);
 
 	return status;
 }
@@ -422,18 +460,19 @@ hermes_kms_connector_detect(struct drm_connector *connector, bool force)
 static int hermes_kms_connector_get_modes(struct drm_connector *connector)
 {
 	int count = 0;
-	struct hermes_kms_device *hdev = to_hermes_kms(connector->dev);
+	struct hermes_kms_output *output =
+		container_of(connector, struct hermes_kms_output, connector);
 	const struct drm_edid *drm_edid;
 	struct drm_display_mode *mode;
 	u32 width;
 	u32 height;
 	u32 refresh_hz;
 
-	mutex_lock(&hdev->state_lock);
-	width = hdev->requested_width;
-	height = hdev->requested_height;
-	refresh_hz = hdev->requested_refresh_hz;
-	mutex_unlock(&hdev->state_lock);
+	mutex_lock(&output->state_lock);
+	width = output->requested_width;
+	height = output->requested_height;
+	refresh_hz = output->requested_refresh_hz;
+	mutex_unlock(&output->state_lock);
 
 	/*
 	 * Attach the synthetic EDID for identity. This makes compositors treat
@@ -443,7 +482,7 @@ static int hermes_kms_connector_get_modes(struct drm_connector *connector)
 	 * detailed-timing modes are added too, but the CVT mode below is marked
 	 * preferred so the client's exact geometry still wins.
 	 */
-	drm_edid = drm_edid_alloc(hermes_kms_edid, sizeof(hermes_kms_edid));
+	drm_edid = drm_edid_alloc(output->edid, sizeof(output->edid));
 	if (drm_edid) {
 		drm_edid_connector_update(connector, drm_edid);
 		count += drm_edid_connector_add_modes(connector);
@@ -500,15 +539,16 @@ static const struct drm_connector_funcs hermes_kms_connector_funcs = {
 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
 };
 
-static inline struct hermes_kms_device *crtc_to_hermes_kms(struct drm_crtc *crtc)
+static inline struct hermes_kms_output *
+crtc_to_hermes_kms_output(struct drm_crtc *crtc)
 {
-	return container_of(crtc, struct hermes_kms_device, crtc);
+	return container_of(crtc, struct hermes_kms_output, crtc);
 }
 
-static inline struct hermes_kms_device *
-plane_to_hermes_kms(struct drm_plane *plane)
+static inline struct hermes_kms_output *
+primary_to_hermes_kms_output(struct drm_plane *plane)
 {
-	return container_of(plane, struct hermes_kms_device, primary);
+	return container_of(plane, struct hermes_kms_output, primary);
 }
 
 /*
@@ -518,14 +558,14 @@ plane_to_hermes_kms(struct drm_plane *plane)
  */
 static enum hrtimer_restart hermes_kms_vblank_timer(struct hrtimer *timer)
 {
-	struct hermes_kms_device *hdev =
-		container_of(timer, struct hermes_kms_device, vblank_timer);
-	struct drm_crtc *crtc = &hdev->crtc;
+	struct hermes_kms_output *output =
+		container_of(timer, struct hermes_kms_output, vblank_timer);
+	struct drm_crtc *crtc = &output->crtc;
 	u64 ret_overrun;
 	bool ret;
 
-	ret_overrun = hrtimer_forward_now(&hdev->vblank_timer,
-					  hdev->vblank_period);
+	ret_overrun = hrtimer_forward_now(&output->vblank_timer,
+					  output->vblank_period);
 	if (ret_overrun != 1) {
 		/*
 		 * More than one period elapsed since the last tick: the timer
@@ -534,24 +574,28 @@ static enum hrtimer_restart hermes_kms_vblank_timer(struct hrtimer *timer)
 		 * steady stream produces zero overruns. ret_overrun counts the
 		 * periods skipped over (>=2 here, or 0 if called late-but-once).
 		 */
-		WRITE_ONCE(hdev->vblank_overrun_count,
-			   hdev->vblank_overrun_count +
+		WRITE_ONCE(output->vblank_overrun_count,
+			   output->vblank_overrun_count +
 				   (ret_overrun > 1 ? ret_overrun - 1 : 1));
-		drm_dbg_kms(&hdev->drm, "vblank timer overrun (skipped=%llu)\n",
+		drm_dbg_kms(&output->hdev->drm,
+			    "%s vblank timer overrun (skipped=%llu)\n",
+			    output->output_name,
 			    (unsigned long long)ret_overrun);
 	}
-	WRITE_ONCE(hdev->vblank_count, hdev->vblank_count + 1);
+	WRITE_ONCE(output->vblank_count, output->vblank_count + 1);
 
 	ret = drm_crtc_handle_vblank(crtc);
 	if (!ret)
-		drm_err(&hdev->drm, "hermes-kms failure on handling vblank\n");
+		drm_err(&output->hdev->drm,
+			"%s failure handling vblank\n", output->output_name);
 
 	return HRTIMER_RESTART;
 }
 
 static int hermes_kms_enable_vblank(struct drm_crtc *crtc)
 {
-	struct hermes_kms_device *hdev = crtc_to_hermes_kms(crtc);
+	struct hermes_kms_output *output =
+		crtc_to_hermes_kms_output(crtc);
 	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
 	unsigned int refresh = drm_mode_vrefresh(&crtc->mode);
 
@@ -565,11 +609,11 @@ static int hermes_kms_enable_vblank(struct drm_crtc *crtc)
 	 * mode's refresh, so 60/120/144Hz all work.
 	 */
 	if (vblank && vblank->framedur_ns)
-		hdev->vblank_period = ns_to_ktime(vblank->framedur_ns);
+		output->vblank_period = ns_to_ktime(vblank->framedur_ns);
 	else
-		hdev->vblank_period = ns_to_ktime(NSEC_PER_SEC / refresh);
+		output->vblank_period = ns_to_ktime(NSEC_PER_SEC / refresh);
 
-	hrtimer_start(&hdev->vblank_timer, hdev->vblank_period,
+	hrtimer_start(&output->vblank_timer, output->vblank_period,
 		      HRTIMER_MODE_REL);
 
 	return 0;
@@ -577,9 +621,10 @@ static int hermes_kms_enable_vblank(struct drm_crtc *crtc)
 
 static void hermes_kms_disable_vblank(struct drm_crtc *crtc)
 {
-	struct hermes_kms_device *hdev = crtc_to_hermes_kms(crtc);
+	struct hermes_kms_output *output =
+		crtc_to_hermes_kms_output(crtc);
 
-	hrtimer_cancel(&hdev->vblank_timer);
+	hrtimer_cancel(&output->vblank_timer);
 }
 
 /*
@@ -592,7 +637,8 @@ static bool hermes_kms_get_vblank_timestamp(struct drm_crtc *crtc,
 					    ktime_t *vblank_time,
 					    bool in_vblank_irq)
 {
-	struct hermes_kms_device *hdev = crtc_to_hermes_kms(crtc);
+	struct hermes_kms_output *output =
+		crtc_to_hermes_kms_output(crtc);
 	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
 
 	if (!READ_ONCE(vblank->enabled)) {
@@ -600,13 +646,13 @@ static bool hermes_kms_get_vblank_timestamp(struct drm_crtc *crtc,
 		return true;
 	}
 
-	*vblank_time = READ_ONCE(hdev->vblank_timer.node.expires);
+	*vblank_time = READ_ONCE(output->vblank_timer.node.expires);
 
 	if (WARN_ON(*vblank_time == vblank->time))
 		return true;
 
 	/* The timer was rolled forward before processing, so correct by one. */
-	*vblank_time -= hdev->vblank_period;
+	*vblank_time -= output->vblank_period;
 
 	return true;
 }
@@ -669,11 +715,12 @@ static int hermes_kms_crtc_atomic_check(struct drm_crtc *crtc,
 static void hermes_kms_crtc_atomic_enable(struct drm_crtc *crtc,
 					  struct drm_atomic_state *state)
 {
-	struct hermes_kms_device *hdev = crtc_to_hermes_kms(crtc);
+	struct hermes_kms_output *output =
+		crtc_to_hermes_kms_output(crtc);
 
-	mutex_lock(&hdev->state_lock);
-	hdev->last_enable_ns = ktime_get_ns();
-	mutex_unlock(&hdev->state_lock);
+	mutex_lock(&output->state_lock);
+	output->last_enable_ns = ktime_get_ns();
+	mutex_unlock(&output->state_lock);
 
 	/*
 	 * Compute the vblank timestamping constants (framedur_ns/linedur_ns)
@@ -685,7 +732,9 @@ static void hermes_kms_crtc_atomic_enable(struct drm_crtc *crtc,
 
 	drm_crtc_vblank_on(crtc);
 
-	drm_info(&hdev->drm, "enabled virtual display %ux%u@%d\n",
+	drm_info(&output->hdev->drm,
+		 "%s enabled virtual display %ux%u@%d\n",
+		 output->output_name,
 		 crtc->state->mode.hdisplay,
 		 crtc->state->mode.vdisplay,
 		 drm_mode_vrefresh(&crtc->state->mode));
@@ -694,26 +743,29 @@ static void hermes_kms_crtc_atomic_enable(struct drm_crtc *crtc,
 static void hermes_kms_crtc_atomic_disable(struct drm_crtc *crtc,
 					   struct drm_atomic_state *state)
 {
-	struct hermes_kms_device *hdev = crtc_to_hermes_kms(crtc);
+	struct hermes_kms_output *output =
+		crtc_to_hermes_kms_output(crtc);
 
 	drm_crtc_vblank_off(crtc);
 
-	mutex_lock(&hdev->state_lock);
-	hdev->last_disable_ns = ktime_get_ns();
-	mutex_unlock(&hdev->state_lock);
-	hermes_kms_track_frame(hdev, NULL);
+	mutex_lock(&output->state_lock);
+	output->last_disable_ns = ktime_get_ns();
+	mutex_unlock(&output->state_lock);
+	hermes_kms_track_frame(output, NULL);
 
-	drm_info(&hdev->drm, "disabled virtual display\n");
+	drm_info(&output->hdev->drm, "%s disabled virtual display\n",
+		 output->output_name);
 }
 
 static void hermes_kms_crtc_atomic_flush(struct drm_crtc *crtc,
 					 struct drm_atomic_state *state)
 {
-	struct hermes_kms_device *hdev = crtc_to_hermes_kms(crtc);
-	struct drm_plane *plane = &hdev->primary;
+	struct hermes_kms_output *output =
+		crtc_to_hermes_kms_output(crtc);
+	struct drm_plane *plane = &output->primary;
 	struct drm_framebuffer *fb = plane->state ? plane->state->fb : NULL;
 
-	hermes_kms_track_frame(hdev, fb);
+	hermes_kms_track_frame(output, fb);
 
 	if (crtc->state->event) {
 		spin_lock_irq(&crtc->dev->event_lock);
@@ -790,7 +842,8 @@ static int hermes_kms_plane_atomic_check(struct drm_plane *plane,
 static void hermes_kms_plane_atomic_update(struct drm_plane *plane,
 					   struct drm_atomic_state *state)
 {
-	struct hermes_kms_device *hdev = plane_to_hermes_kms(plane);
+	struct hermes_kms_output *output =
+		primary_to_hermes_kms_output(plane);
 	struct drm_plane_state *old_state =
 		drm_atomic_get_old_plane_state(state, plane);
 	struct drm_plane_state *new_state =
@@ -811,17 +864,17 @@ static void hermes_kms_plane_atomic_update(struct drm_plane *plane,
 							      new_state,
 							      &damage);
 
-	mutex_lock(&hdev->state_lock);
+	mutex_lock(&output->state_lock);
 	if (have_damage) {
-		hdev->framebuffer_damage_valid = true;
-		hdev->framebuffer_damage_x1 = max(damage.x1, 0);
-		hdev->framebuffer_damage_y1 = max(damage.y1, 0);
-		hdev->framebuffer_damage_x2 = max(damage.x2, 0);
-		hdev->framebuffer_damage_y2 = max(damage.y2, 0);
+		output->framebuffer_damage_valid = true;
+		output->framebuffer_damage_x1 = max(damage.x1, 0);
+		output->framebuffer_damage_y1 = max(damage.y1, 0);
+		output->framebuffer_damage_x2 = max(damage.x2, 0);
+		output->framebuffer_damage_y2 = max(damage.y2, 0);
 	} else {
-		hdev->framebuffer_damage_valid = false;
+		output->framebuffer_damage_valid = false;
 	}
-	mutex_unlock(&hdev->state_lock);
+	mutex_unlock(&output->state_lock);
 }
 
 static const struct drm_plane_helper_funcs hermes_kms_plane_helper_funcs = {
@@ -918,6 +971,7 @@ static int hermes_kms_ioctl_get_version(struct drm_device *drm, void *data,
 static int hermes_kms_ioctl_get_caps(struct drm_device *drm, void *data,
 				     struct drm_file *file)
 {
+	struct hermes_kms_device *hdev = to_hermes_kms(drm);
 	struct drm_hermes_kms_caps *caps = data;
 
 	memset(caps, 0, sizeof(*caps));
@@ -932,6 +986,7 @@ static int hermes_kms_ioctl_get_caps(struct drm_device *drm, void *data,
 		      HERMES_KMS_CAP_SESSION_OWNER |
 		      HERMES_KMS_CAP_FRAME_WAIT |
 		      HERMES_KMS_CAP_METRICS |
+		      HERMES_KMS_CAP_MULTI_OUTPUT |
 		      HERMES_KMS_CAP_ZERO_COPY_TARGET |
 		      HERMES_KMS_CAP_SYNC_FILE;
 	caps->min_width = HERMES_KMS_MIN_WIDTH;
@@ -941,6 +996,43 @@ static int hermes_kms_ioctl_get_caps(struct drm_device *drm, void *data,
 	caps->preferred_width = HERMES_KMS_DEFAULT_WIDTH;
 	caps->preferred_height = HERMES_KMS_DEFAULT_HEIGHT;
 	caps->max_refresh_hz = HERMES_KMS_MAX_REFRESH_HZ;
+	caps->output_count = hdev->output_count;
+
+	return 0;
+}
+
+static int hermes_kms_ioctl_select_output(struct drm_device *drm, void *data,
+					  struct drm_file *file)
+{
+	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct hermes_kms_file *context = file->driver_priv;
+	struct drm_hermes_kms_select_output *request = data;
+	struct hermes_kms_output *current_output;
+	struct hermes_kms_output *selected;
+	unsigned int output_index = request->output_index;
+
+	if (!context)
+		return -EINVAL;
+	if (request->flags || output_index >= hdev->output_count)
+		return -EINVAL;
+
+	current_output = hermes_kms_output_for_file(hdev, file);
+	mutex_lock(&current_output->state_lock);
+	if (current_output->owner_file == file) {
+		mutex_unlock(&current_output->state_lock);
+		return -EBUSY;
+	}
+	mutex_unlock(&current_output->state_lock);
+
+	context->output_index = output_index;
+	selected = &hdev->outputs[output_index];
+
+	memset(request, 0, sizeof(*request));
+	request->output_index = output_index;
+	request->selected_output_index = output_index;
+	request->output_count = hdev->output_count;
+	strscpy(request->output_name, selected->output_name,
+		sizeof(request->output_name));
 
 	return 0;
 }
@@ -949,64 +1041,66 @@ static int hermes_kms_ioctl_get_status(struct drm_device *drm, void *data,
 				       struct drm_file *file)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct hermes_kms_output *output =
+		hermes_kms_output_for_file(hdev, file);
 	struct drm_hermes_kms_status *status = data;
 	struct drm_crtc_state *crtc_state;
 
 	memset(status, 0, sizeof(*status));
 
-	mutex_lock(&hdev->state_lock);
-	if (hdev->output_enabled)
+	mutex_lock(&output->state_lock);
+	if (output->output_enabled)
 		status->flags |= HERMES_KMS_STATUS_OUTPUT_ENABLED |
 				 HERMES_KMS_STATUS_CONNECTED;
 	if (hotplug_events)
 		status->flags |= HERMES_KMS_STATUS_HOTPLUG_EVENTS_ENABLED;
-	if (hdev->owner_file)
+	if (output->owner_file)
 		status->flags |= HERMES_KMS_STATUS_SESSION_OWNED;
 
-	status->requested_width = hdev->requested_width;
-	status->requested_height = hdev->requested_height;
-	status->requested_refresh_hz = hdev->requested_refresh_hz;
-	status->frame_sequence = hdev->frame_sequence;
-	status->last_update_ns = hdev->last_update_ns;
-	status->last_enable_ns = hdev->last_enable_ns;
-	status->last_disable_ns = hdev->last_disable_ns;
-	status->framebuffer_id = hdev->framebuffer_id;
-	status->framebuffer_width = hdev->framebuffer_width;
-	status->framebuffer_height = hdev->framebuffer_height;
-	status->framebuffer_format = hdev->framebuffer_format;
-	status->framebuffer_plane_count = hdev->framebuffer_plane_count;
-	memcpy(status->framebuffer_pitch, hdev->framebuffer_pitch,
+	status->requested_width = output->requested_width;
+	status->requested_height = output->requested_height;
+	status->requested_refresh_hz = output->requested_refresh_hz;
+	status->frame_sequence = output->frame_sequence;
+	status->last_update_ns = output->last_update_ns;
+	status->last_enable_ns = output->last_enable_ns;
+	status->last_disable_ns = output->last_disable_ns;
+	status->framebuffer_id = output->framebuffer_id;
+	status->framebuffer_width = output->framebuffer_width;
+	status->framebuffer_height = output->framebuffer_height;
+	status->framebuffer_format = output->framebuffer_format;
+	status->framebuffer_plane_count = output->framebuffer_plane_count;
+	memcpy(status->framebuffer_pitch, output->framebuffer_pitch,
 	       sizeof(status->framebuffer_pitch));
-	memcpy(status->framebuffer_offset, hdev->framebuffer_offset,
+	memcpy(status->framebuffer_offset, output->framebuffer_offset,
 	       sizeof(status->framebuffer_offset));
-	status->framebuffer_modifier = hdev->framebuffer_modifier;
-	status->session_id = hdev->session_id;
-	status->owner_pid = hdev->owner_pid ? hdev->owner_pid : -1;
-	if (hdev->framebuffer_id)
+	status->framebuffer_modifier = output->framebuffer_modifier;
+	status->session_id = output->session_id;
+	status->owner_pid = output->owner_pid ? output->owner_pid : -1;
+	if (output->framebuffer_id)
 		status->flags |= HERMES_KMS_STATUS_FRAME_VALID;
-	if (hdev->framebuffer)
+	if (output->framebuffer)
 		status->flags |= HERMES_KMS_STATUS_DMABUF_EXPORT_READY;
-	mutex_unlock(&hdev->state_lock);
+	mutex_unlock(&output->state_lock);
 
-	status->connector_id = hdev->connector.base.id;
-	status->crtc_id = hdev->crtc.base.id;
-	status->plane_id = hdev->primary.base.id;
-	status->encoder_id = hdev->encoder.base.id;
+	status->connector_id = output->connector.base.id;
+	status->crtc_id = output->crtc.base.id;
+	status->plane_id = output->primary.base.id;
+	status->encoder_id = output->encoder.base.id;
 
 	/*
 	 * crtc->state is swapped under the CRTC modeset lock during an atomic
 	 * commit; take it so we never dereference a state being freed. This is
 	 * a diagnostic path, so blocking briefly on a concurrent commit is fine.
 	 */
-	drm_modeset_lock(&hdev->crtc.mutex, NULL);
-	crtc_state = hdev->crtc.state;
+	drm_modeset_lock(&output->crtc.mutex, NULL);
+	crtc_state = output->crtc.state;
 	if (crtc_state && crtc_state->enable) {
 		status->flags |= HERMES_KMS_STATUS_SCANOUT_ACTIVE;
 		status->active_width = crtc_state->mode.hdisplay;
 		status->active_height = crtc_state->mode.vdisplay;
 		status->active_refresh_hz = drm_mode_vrefresh(&crtc_state->mode);
 	}
-	drm_modeset_unlock(&hdev->crtc.mutex);
+	drm_modeset_unlock(&output->crtc.mutex);
 
 	return 0;
 }
@@ -1015,35 +1109,38 @@ static int hermes_kms_ioctl_get_metrics(struct drm_device *drm, void *data,
 					struct drm_file *file)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct hermes_kms_output *output =
+		hermes_kms_output_for_file(hdev, file);
 	struct drm_hermes_kms_metrics *metrics = data;
 
 	memset(metrics, 0, sizeof(*metrics));
 
-	mutex_lock(&hdev->state_lock);
-	metrics->frame_sequence = hdev->frame_sequence;
-	metrics->frame_update_count = hdev->frame_update_count;
-	metrics->acquire_count = hdev->acquire_count;
-	metrics->acquire_no_frame_count = hdev->acquire_no_frame_count;
-	metrics->dmabuf_export_count = hdev->dmabuf_export_count;
-	metrics->dmabuf_export_fail_count = hdev->dmabuf_export_fail_count;
-	metrics->sync_file_export_count = hdev->sync_file_export_count;
-	metrics->sync_file_export_fail_count = hdev->sync_file_export_fail_count;
-	metrics->wait_count = hdev->wait_count;
-	metrics->wait_ready_count = hdev->wait_ready_count;
-	metrics->wait_timeout_count = hdev->wait_timeout_count;
-	metrics->wait_interrupted_count = hdev->wait_interrupted_count;
-	metrics->output_enable_count = hdev->output_enable_count;
-	metrics->output_disable_count = hdev->output_disable_count;
-	metrics->hotplug_event_count = hdev->hotplug_event_count;
-	metrics->owner_close_disconnect_count = hdev->owner_close_disconnect_count;
-	metrics->last_update_ns = hdev->last_update_ns;
-	metrics->last_acquire_ns = hdev->last_acquire_ns;
-	metrics->last_wait_start_ns = hdev->last_wait_start_ns;
-	metrics->last_wait_end_ns = hdev->last_wait_end_ns;
-	metrics->last_wait_duration_ns = hdev->last_wait_duration_ns;
-	metrics->last_dmabuf_export_ns = hdev->last_dmabuf_export_ns;
-	metrics->last_sync_file_export_ns = hdev->last_sync_file_export_ns;
-	mutex_unlock(&hdev->state_lock);
+	mutex_lock(&output->state_lock);
+	metrics->frame_sequence = output->frame_sequence;
+	metrics->frame_update_count = output->frame_update_count;
+	metrics->acquire_count = output->acquire_count;
+	metrics->acquire_no_frame_count = output->acquire_no_frame_count;
+	metrics->dmabuf_export_count = output->dmabuf_export_count;
+	metrics->dmabuf_export_fail_count = output->dmabuf_export_fail_count;
+	metrics->sync_file_export_count = output->sync_file_export_count;
+	metrics->sync_file_export_fail_count = output->sync_file_export_fail_count;
+	metrics->wait_count = output->wait_count;
+	metrics->wait_ready_count = output->wait_ready_count;
+	metrics->wait_timeout_count = output->wait_timeout_count;
+	metrics->wait_interrupted_count = output->wait_interrupted_count;
+	metrics->output_enable_count = output->output_enable_count;
+	metrics->output_disable_count = output->output_disable_count;
+	metrics->hotplug_event_count = output->hotplug_event_count;
+	metrics->owner_close_disconnect_count =
+		output->owner_close_disconnect_count;
+	metrics->last_update_ns = output->last_update_ns;
+	metrics->last_acquire_ns = output->last_acquire_ns;
+	metrics->last_wait_start_ns = output->last_wait_start_ns;
+	metrics->last_wait_end_ns = output->last_wait_end_ns;
+	metrics->last_wait_duration_ns = output->last_wait_duration_ns;
+	metrics->last_dmabuf_export_ns = output->last_dmabuf_export_ns;
+	metrics->last_sync_file_export_ns = output->last_sync_file_export_ns;
+	mutex_unlock(&output->state_lock);
 
 	return 0;
 }
@@ -1052,43 +1149,47 @@ static int hermes_kms_ioctl_get_identity(struct drm_device *drm, void *data,
 					 struct drm_file *file)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct hermes_kms_output *output =
+		hermes_kms_output_for_file(hdev, file);
 	struct drm_hermes_kms_identity *identity = data;
-	const char *connector_name = hdev->connector.name;
+	const char *connector_name = output->connector.name;
 
 	memset(identity, 0, sizeof(*identity));
 	strscpy(identity->driver_name, HERMES_KMS_DRIVER_NAME,
 		sizeof(identity->driver_name));
-	strscpy(identity->output_name, HERMES_KMS_OUTPUT_NAME,
+	strscpy(identity->output_name, output->output_name,
 		sizeof(identity->output_name));
 	if (connector_name)
 		strscpy(identity->connector_name, connector_name,
 			sizeof(identity->connector_name));
 
-	identity->connector_id = hdev->connector.base.id;
-	identity->crtc_id = hdev->crtc.base.id;
-	identity->plane_id = hdev->primary.base.id;
-	identity->encoder_id = hdev->encoder.base.id;
+	identity->connector_id = output->connector.base.id;
+	identity->crtc_id = output->crtc.base.id;
+	identity->plane_id = output->primary.base.id;
+	identity->encoder_id = output->encoder.base.id;
+	identity->output_index = output->index;
+	identity->output_count = hdev->output_count;
 
 	return 0;
 }
 
-static void hermes_kms_fill_wait_frame_locked(struct hermes_kms_device *hdev,
+static void hermes_kms_fill_wait_frame_locked(struct hermes_kms_output *output,
 					      struct drm_hermes_kms_wait_frame *wait)
 {
-	wait->sequence = hdev->frame_sequence;
-	wait->timestamp_ns = hdev->last_update_ns;
+	wait->sequence = output->frame_sequence;
+	wait->timestamp_ns = output->last_update_ns;
 	wait->status_flags = 0;
 
-	if (hdev->output_enabled)
+	if (output->output_enabled)
 		wait->status_flags |= HERMES_KMS_STATUS_OUTPUT_ENABLED |
 				      HERMES_KMS_STATUS_CONNECTED;
 	if (hotplug_events)
 		wait->status_flags |= HERMES_KMS_STATUS_HOTPLUG_EVENTS_ENABLED;
-	if (hdev->owner_file)
+	if (output->owner_file)
 		wait->status_flags |= HERMES_KMS_STATUS_SESSION_OWNED;
-	if (hdev->framebuffer_id)
+	if (output->framebuffer_id)
 		wait->status_flags |= HERMES_KMS_STATUS_FRAME_VALID;
-	if (hdev->framebuffer) {
+	if (output->framebuffer) {
 		wait->flags |= HERMES_KMS_WAIT_FRAME_READY;
 		wait->status_flags |= HERMES_KMS_STATUS_DMABUF_EXPORT_READY;
 	}
@@ -1098,6 +1199,8 @@ static int hermes_kms_ioctl_wait_frame(struct drm_device *drm, void *data,
 				       struct drm_file *file)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct hermes_kms_output *output =
+		hermes_kms_output_for_file(hdev, file);
 	struct drm_hermes_kms_wait_frame *wait = data;
 	u64 after_sequence = wait->after_sequence;
 	u32 timeout_ms = wait->timeout_ms;
@@ -1105,42 +1208,42 @@ static int hermes_kms_ioctl_wait_frame(struct drm_device *drm, void *data,
 	u64 end_ns;
 	long timeout;
 
-	mutex_lock(&hdev->state_lock);
-	hdev->wait_count++;
-	hdev->last_wait_start_ns = start_ns;
-	mutex_unlock(&hdev->state_lock);
+	mutex_lock(&output->state_lock);
+	output->wait_count++;
+	output->last_wait_start_ns = start_ns;
+	mutex_unlock(&output->state_lock);
 
-	if (READ_ONCE(hdev->frame_sequence) <= after_sequence) {
+	if (READ_ONCE(output->frame_sequence) <= after_sequence) {
 		if (!timeout_ms) {
-			mutex_lock(&hdev->state_lock);
-			hdev->wait_timeout_count++;
-			hdev->last_wait_end_ns = ktime_get_ns();
-			hdev->last_wait_duration_ns =
-				hdev->last_wait_end_ns - start_ns;
-			mutex_unlock(&hdev->state_lock);
+			mutex_lock(&output->state_lock);
+			output->wait_timeout_count++;
+			output->last_wait_end_ns = ktime_get_ns();
+			output->last_wait_duration_ns =
+				output->last_wait_end_ns - start_ns;
+			mutex_unlock(&output->state_lock);
 			return -EAGAIN;
 		}
 
 		timeout = wait_event_interruptible_timeout(
-			hdev->frame_wait,
-			READ_ONCE(hdev->frame_sequence) > after_sequence,
+			output->frame_wait,
+			READ_ONCE(output->frame_sequence) > after_sequence,
 			msecs_to_jiffies(timeout_ms));
 		if (timeout < 0) {
-			mutex_lock(&hdev->state_lock);
-			hdev->wait_interrupted_count++;
-			hdev->last_wait_end_ns = ktime_get_ns();
-			hdev->last_wait_duration_ns =
-				hdev->last_wait_end_ns - start_ns;
-			mutex_unlock(&hdev->state_lock);
+			mutex_lock(&output->state_lock);
+			output->wait_interrupted_count++;
+			output->last_wait_end_ns = ktime_get_ns();
+			output->last_wait_duration_ns =
+				output->last_wait_end_ns - start_ns;
+			mutex_unlock(&output->state_lock);
 			return timeout;
 		}
 		if (!timeout) {
-			mutex_lock(&hdev->state_lock);
-			hdev->wait_timeout_count++;
-			hdev->last_wait_end_ns = ktime_get_ns();
-			hdev->last_wait_duration_ns =
-				hdev->last_wait_end_ns - start_ns;
-			mutex_unlock(&hdev->state_lock);
+			mutex_lock(&output->state_lock);
+			output->wait_timeout_count++;
+			output->last_wait_end_ns = ktime_get_ns();
+			output->last_wait_duration_ns =
+				output->last_wait_end_ns - start_ns;
+			mutex_unlock(&output->state_lock);
 			return -ETIMEDOUT;
 		}
 	}
@@ -1148,12 +1251,12 @@ static int hermes_kms_ioctl_wait_frame(struct drm_device *drm, void *data,
 	memset(wait, 0, sizeof(*wait));
 
 	end_ns = ktime_get_ns();
-	mutex_lock(&hdev->state_lock);
-	hdev->wait_ready_count++;
-	hdev->last_wait_end_ns = end_ns;
-	hdev->last_wait_duration_ns = end_ns - start_ns;
-	hermes_kms_fill_wait_frame_locked(hdev, wait);
-	mutex_unlock(&hdev->state_lock);
+	mutex_lock(&output->state_lock);
+	output->wait_ready_count++;
+	output->last_wait_end_ns = end_ns;
+	output->last_wait_duration_ns = end_ns - start_ns;
+	hermes_kms_fill_wait_frame_locked(output, wait);
+	mutex_unlock(&output->state_lock);
 
 	return 0;
 }
@@ -1192,7 +1295,7 @@ static void hermes_kms_close_frame_fds(struct drm_hermes_kms_acquire_frame *fram
  * the installed fd). Caller must hold export_lock.
  */
 static struct dma_buf *
-hermes_kms_get_plane_dmabuf_locked(struct hermes_kms_device *hdev,
+hermes_kms_get_plane_dmabuf_locked(struct hermes_kms_output *output,
 				   struct drm_framebuffer *fb,
 				   unsigned int index)
 {
@@ -1203,9 +1306,9 @@ hermes_kms_get_plane_dmabuf_locked(struct hermes_kms_device *hdev,
 	if (!obj)
 		return ERR_PTR(-EINVAL);
 
-	if (hdev->export_obj[index] == obj && hdev->export_dmabuf[index]) {
-		get_dma_buf(hdev->export_dmabuf[index]);
-		return hdev->export_dmabuf[index];
+	if (output->export_obj[index] == obj && output->export_dmabuf[index]) {
+		get_dma_buf(output->export_dmabuf[index]);
+		return output->export_dmabuf[index];
 	}
 
 	dmabuf = drm_gem_prime_export(obj, O_RDWR);
@@ -1213,28 +1316,28 @@ hermes_kms_get_plane_dmabuf_locked(struct hermes_kms_device *hdev,
 		return dmabuf;
 
 	/* Replace the cache entry; the cache holds one reference. */
-	if (hdev->export_dmabuf[index])
-		dma_buf_put(hdev->export_dmabuf[index]);
+	if (output->export_dmabuf[index])
+		dma_buf_put(output->export_dmabuf[index]);
 	get_dma_buf(dmabuf);
-	hdev->export_dmabuf[index] = dmabuf;
-	hdev->export_obj[index] = obj;
+	output->export_dmabuf[index] = dmabuf;
+	output->export_obj[index] = obj;
 
 	return dmabuf;
 }
 
-static int hermes_kms_export_frame_dmabufs(struct hermes_kms_device *hdev,
+static int hermes_kms_export_frame_dmabufs(struct hermes_kms_output *output,
 					   struct drm_framebuffer *fb,
 					   struct drm_hermes_kms_acquire_frame *frame)
 {
 	unsigned int i;
 	int ret = 0;
 
-	mutex_lock(&hdev->export_lock);
+	mutex_lock(&output->export_lock);
 	for (i = 0; i < frame->plane_count; i++) {
 		struct dma_buf *dmabuf;
 		int fd;
 
-		dmabuf = hermes_kms_get_plane_dmabuf_locked(hdev, fb, i);
+		dmabuf = hermes_kms_get_plane_dmabuf_locked(output, fb, i);
 		if (IS_ERR(dmabuf)) {
 			ret = PTR_ERR(dmabuf);
 			break;
@@ -1250,7 +1353,7 @@ static int hermes_kms_export_frame_dmabufs(struct hermes_kms_device *hdev,
 
 		frame->dma_buf_fd[i] = fd;
 	}
-	mutex_unlock(&hdev->export_lock);
+	mutex_unlock(&output->export_lock);
 
 	if (ret)
 		return ret;
@@ -1324,6 +1427,8 @@ static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 					  struct drm_file *file)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct hermes_kms_output *output =
+		hermes_kms_output_for_file(hdev, file);
 	struct drm_hermes_kms_acquire_frame *frame = data;
 	struct drm_framebuffer *fb;
 	u64 requested_flags = frame->flags;
@@ -1332,64 +1437,65 @@ static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 	memset(frame, 0, sizeof(*frame));
 	hermes_kms_init_invalid_frame_fds(frame);
 
-	mutex_lock(&hdev->state_lock);
-	hdev->acquire_count++;
-	hdev->last_acquire_ns = ktime_get_ns();
-	if (!hdev->framebuffer) {
-		hdev->acquire_no_frame_count++;
-		if (hdev->acquire_no_frame_log_count < 5) {
-			hdev->acquire_no_frame_log_count++;
+	mutex_lock(&output->state_lock);
+	output->acquire_count++;
+	output->last_acquire_ns = ktime_get_ns();
+	if (!output->framebuffer) {
+		output->acquire_no_frame_count++;
+		if (output->acquire_no_frame_log_count < 5) {
+			output->acquire_no_frame_log_count++;
 			drm_info(drm,
-				 "ACQUIRE_FRAME has no framebuffer yet: output_enabled=%d owner_pid=%d session=%llu sequence=%llu\n",
-				 hdev->output_enabled,
-				 hdev->owner_pid ? hdev->owner_pid : -1,
-				 (unsigned long long)hdev->session_id,
-				 (unsigned long long)hdev->frame_sequence);
+				 "%s ACQUIRE_FRAME has no framebuffer yet: output_enabled=%d owner_pid=%d session=%llu sequence=%llu\n",
+				 output->output_name, output->output_enabled,
+				 output->owner_pid ? output->owner_pid : -1,
+				 (unsigned long long)output->session_id,
+				 (unsigned long long)output->frame_sequence);
 		} else {
 			drm_dbg_kms_ratelimited(drm,
-						"ACQUIRE_FRAME has no framebuffer yet: output_enabled=%d owner_pid=%d session=%llu sequence=%llu\n",
-						hdev->output_enabled,
-						hdev->owner_pid ? hdev->owner_pid : -1,
-						(unsigned long long)hdev->session_id,
-						(unsigned long long)hdev->frame_sequence);
+						"%s ACQUIRE_FRAME has no framebuffer yet: output_enabled=%d owner_pid=%d session=%llu sequence=%llu\n",
+						output->output_name,
+						output->output_enabled,
+						output->owner_pid ? output->owner_pid : -1,
+						(unsigned long long)output->session_id,
+						(unsigned long long)output->frame_sequence);
 		}
-		mutex_unlock(&hdev->state_lock);
+		mutex_unlock(&output->state_lock);
 		return -ENODATA;
 	}
 
-	fb = hdev->framebuffer;
+	fb = output->framebuffer;
 	drm_framebuffer_get(fb);
 	frame->flags = HERMES_KMS_FRAME_METADATA_VALID;
-	frame->sequence = hdev->frame_sequence;
-	frame->timestamp_ns = hdev->last_update_ns;
-	frame->modifier = hdev->framebuffer_modifier;
-	frame->framebuffer_id = hdev->framebuffer_id;
-	frame->width = hdev->framebuffer_width;
-	frame->height = hdev->framebuffer_height;
-	frame->format = hdev->framebuffer_format;
-	frame->plane_count = hdev->framebuffer_plane_count;
-	memcpy(frame->pitch, hdev->framebuffer_pitch, sizeof(frame->pitch));
-	memcpy(frame->offset, hdev->framebuffer_offset, sizeof(frame->offset));
-	if (hdev->framebuffer_damage_valid) {
+	frame->sequence = output->frame_sequence;
+	frame->timestamp_ns = output->last_update_ns;
+	frame->modifier = output->framebuffer_modifier;
+	frame->framebuffer_id = output->framebuffer_id;
+	frame->width = output->framebuffer_width;
+	frame->height = output->framebuffer_height;
+	frame->format = output->framebuffer_format;
+	frame->plane_count = output->framebuffer_plane_count;
+	memcpy(frame->pitch, output->framebuffer_pitch, sizeof(frame->pitch));
+	memcpy(frame->offset, output->framebuffer_offset, sizeof(frame->offset));
+	if (output->framebuffer_damage_valid) {
 		frame->flags |= HERMES_KMS_FRAME_DAMAGE_VALID;
-		frame->damage_x1 = hdev->framebuffer_damage_x1;
-		frame->damage_y1 = hdev->framebuffer_damage_y1;
-		frame->damage_x2 = hdev->framebuffer_damage_x2;
-		frame->damage_y2 = hdev->framebuffer_damage_y2;
+		frame->damage_x1 = output->framebuffer_damage_x1;
+		frame->damage_y1 = output->framebuffer_damage_y1;
+		frame->damage_x2 = output->framebuffer_damage_x2;
+		frame->damage_y2 = output->framebuffer_damage_y2;
 	}
-	mutex_unlock(&hdev->state_lock);
+	mutex_unlock(&output->state_lock);
 
 	if (requested_flags & HERMES_KMS_FRAME_REQUEST_DMABUF) {
-		ret = hermes_kms_export_frame_dmabufs(hdev, fb, frame);
-		mutex_lock(&hdev->state_lock);
+		ret = hermes_kms_export_frame_dmabufs(output, fb, frame);
+		mutex_lock(&output->state_lock);
 		if (ret) {
-			hdev->dmabuf_export_fail_count++;
-			mutex_unlock(&hdev->state_lock);
+			output->dmabuf_export_fail_count++;
+			mutex_unlock(&output->state_lock);
 			hermes_kms_close_frame_fds(frame);
 		} else {
-			hdev->dmabuf_export_count++;
-			hdev->last_dmabuf_export_ns = ktime_get_ns();
-			mutex_unlock(&hdev->state_lock);
+			output->dmabuf_export_count++;
+			output->last_dmabuf_export_ns = ktime_get_ns();
+			mutex_unlock(&output->state_lock);
 		}
 		if (ret)
 			goto out_put_fb;
@@ -1399,15 +1505,15 @@ static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 
 	if (requested_flags & HERMES_KMS_FRAME_REQUEST_SYNC_FILE) {
 		ret = hermes_kms_export_sync_file(fb, frame);
-		mutex_lock(&hdev->state_lock);
+		mutex_lock(&output->state_lock);
 		if (ret) {
-			hdev->sync_file_export_fail_count++;
-			mutex_unlock(&hdev->state_lock);
+			output->sync_file_export_fail_count++;
+			mutex_unlock(&output->state_lock);
 			hermes_kms_close_frame_fds(frame);
 		} else {
-			hdev->sync_file_export_count++;
-			hdev->last_sync_file_export_ns = ktime_get_ns();
-			mutex_unlock(&hdev->state_lock);
+			output->sync_file_export_count++;
+			output->last_sync_file_export_ns = ktime_get_ns();
+			mutex_unlock(&output->state_lock);
 		}
 	}
 
@@ -1428,7 +1534,7 @@ static bool hermes_kms_valid_requested_mode(u32 width, u32 height,
 }
 
 static void hermes_kms_init_output_state(struct drm_device *drm,
-					 struct hermes_kms_device *hdev)
+					 struct hermes_kms_output *output)
 {
 	u32 width = initial_width;
 	u32 height = initial_height;
@@ -1446,16 +1552,18 @@ static void hermes_kms_init_output_state(struct drm_device *drm,
 		refresh_hz = HERMES_KMS_DEFAULT_REFRESH_HZ;
 	}
 
-	hdev->output_enabled = initial_enabled;
-	hdev->requested_width = width;
-	hdev->requested_height = height;
-	hdev->requested_refresh_hz = refresh_hz;
+	output->output_enabled = initial_enabled;
+	output->requested_width = width;
+	output->requested_height = height;
+	output->requested_refresh_hz = refresh_hz;
 }
 
 static int hermes_kms_ioctl_set_output(struct drm_device *drm, void *data,
 				       struct drm_file *file)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct hermes_kms_output *output =
+		hermes_kms_output_for_file(hdev, file);
 	struct drm_hermes_kms_set_output *request = data;
 	u32 width = request->width;
 	u32 height = request->height;
@@ -1472,27 +1580,27 @@ static int hermes_kms_ioctl_set_output(struct drm_device *drm, void *data,
 	if (!request->enabled) {
 		u64 session_id;
 
-		mutex_lock(&hdev->state_lock);
-		if (hdev->owner_file && hdev->owner_file != file) {
-			mutex_unlock(&hdev->state_lock);
+		mutex_lock(&output->state_lock);
+		if (output->owner_file && output->owner_file != file) {
+			mutex_unlock(&output->state_lock);
 			return -EPERM;
 		}
 
-		session_id = hdev->session_id;
-		owner_pid = hdev->owner_pid;
-		hdev->output_enabled = false;
-		hermes_kms_clear_owner_locked(hdev);
-		hdev->last_disable_ns = ktime_get_ns();
-		hdev->output_disable_count++;
-		mutex_unlock(&hdev->state_lock);
-		hermes_kms_track_frame(hdev, NULL);
-		hotplug_sent = hermes_kms_hotplug_event(drm);
+		session_id = output->session_id;
+		owner_pid = output->owner_pid;
+		output->output_enabled = false;
+		hermes_kms_clear_owner_locked(output);
+		output->last_disable_ns = ktime_get_ns();
+		output->output_disable_count++;
+		mutex_unlock(&output->state_lock);
+		hermes_kms_track_frame(output, NULL);
+		hotplug_sent = hermes_kms_hotplug_event(output);
 		request->session_id = session_id;
 		if (hotplug_sent)
 			request->result_flags |= HERMES_KMS_SET_OUTPUT_RESULT_HOTPLUG_SENT;
 		drm_info(drm,
-			 "disconnected virtual output session=%llu owner_pid=%d hotplug_sent=%d\n",
-			 (unsigned long long)session_id,
+			 "%s disconnected virtual output session=%llu owner_pid=%d hotplug_sent=%d\n",
+			 output->output_name, (unsigned long long)session_id,
 			 owner_pid ? owner_pid : -1,
 			 hotplug_sent);
 		return 0;
@@ -1508,26 +1616,27 @@ static int hermes_kms_ioctl_set_output(struct drm_device *drm, void *data,
 	if (!hermes_kms_valid_requested_mode(width, height, refresh_hz))
 		return -EINVAL;
 
-	mutex_lock(&hdev->state_lock);
-	if (hdev->owner_file && hdev->owner_file != file) {
-		mutex_unlock(&hdev->state_lock);
+	mutex_lock(&output->state_lock);
+	if (output->owner_file && output->owner_file != file) {
+		mutex_unlock(&output->state_lock);
 		return -EBUSY;
 	}
 
-	hdev->output_enabled = true;
-	if (hdev->owner_file != file || !hdev->session_id) {
-		hdev->owner_file = file;
-		hdev->owner_pid = task_pid_nr(current);
-		hdev->session_id = hermes_kms_next_session_id_locked(hdev);
+	output->output_enabled = true;
+	if (output->owner_file != file || !output->session_id) {
+		output->owner_file = file;
+		output->owner_pid = task_pid_nr(current);
+		output->session_id =
+			hermes_kms_next_session_id_locked(output);
 	}
-	hdev->requested_width = width;
-	hdev->requested_height = height;
-	hdev->requested_refresh_hz = refresh_hz;
-	hdev->last_enable_ns = ktime_get_ns();
-	hdev->output_enable_count++;
-	request->session_id = hdev->session_id;
-	owner_pid = hdev->owner_pid;
-	mutex_unlock(&hdev->state_lock);
+	output->requested_width = width;
+	output->requested_height = height;
+	output->requested_refresh_hz = refresh_hz;
+	output->last_enable_ns = ktime_get_ns();
+	output->output_enable_count++;
+	request->session_id = output->session_id;
+	owner_pid = output->owner_pid;
+	mutex_unlock(&output->state_lock);
 
 	request->width = width;
 	request->height = height;
@@ -1536,14 +1645,14 @@ static int hermes_kms_ioctl_set_output(struct drm_device *drm, void *data,
 				 HERMES_KMS_SET_OUTPUT_RESULT_OWNER_ASSIGNED;
 
 	/* Make the connector advertise the freshly requested mode. */
-	hermes_kms_reprobe_modes(drm);
+	hermes_kms_reprobe_modes(output);
 
-	hotplug_sent = hermes_kms_hotplug_event(drm);
+	hotplug_sent = hermes_kms_hotplug_event(output);
 	if (hotplug_sent)
 		request->result_flags |= HERMES_KMS_SET_OUTPUT_RESULT_HOTPLUG_SENT;
 	drm_info(drm,
-		 "connected virtual output %ux%u@%u session=%llu owner_pid=%d hotplug_sent=%d\n",
-		 width, height, refresh_hz,
+		 "%s connected virtual output %ux%u@%u session=%llu owner_pid=%d hotplug_sent=%d\n",
+		 output->output_name, width, height, refresh_hz,
 		 (unsigned long long)request->session_id,
 		 owner_pid ? owner_pid : -1,
 		 hotplug_sent);
@@ -1551,28 +1660,52 @@ static int hermes_kms_ioctl_set_output(struct drm_device *drm, void *data,
 	return 0;
 }
 
+static int hermes_kms_open(struct drm_device *drm, struct drm_file *file)
+{
+	struct hermes_kms_file *context;
+
+	context = kzalloc(sizeof(*context), GFP_KERNEL);
+	if (!context)
+		return -ENOMEM;
+
+	/* UAPI <= 7 compatibility: an unselected fd controls HERMES-1. */
+	context->output_index = 0;
+	file->driver_priv = context;
+	return 0;
+}
+
 static void hermes_kms_postclose(struct drm_device *drm, struct drm_file *file)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
-	bool disconnected = false;
+	unsigned int i;
 
-	mutex_lock(&hdev->state_lock);
-	if (hdev->owner_file == file) {
-		hdev->output_enabled = false;
-		hermes_kms_clear_owner_locked(hdev);
-		hdev->last_disable_ns = ktime_get_ns();
-		hdev->output_disable_count++;
-		hdev->owner_close_disconnect_count++;
-		disconnected = true;
+	for (i = 0; i < hdev->output_count; i++) {
+		struct hermes_kms_output *output = &hdev->outputs[i];
+		bool disconnected = false;
+
+		mutex_lock(&output->state_lock);
+		if (output->owner_file == file) {
+			output->output_enabled = false;
+			hermes_kms_clear_owner_locked(output);
+			output->last_disable_ns = ktime_get_ns();
+			output->output_disable_count++;
+			output->owner_close_disconnect_count++;
+			disconnected = true;
+		}
+		mutex_unlock(&output->state_lock);
+
+		if (!disconnected)
+			continue;
+
+		hermes_kms_track_frame(output, NULL);
+		hermes_kms_hotplug_event(output);
+		drm_info(drm,
+			 "%s disconnected after owner fd closed\n",
+			 output->output_name);
 	}
-	mutex_unlock(&hdev->state_lock);
 
-	if (!disconnected)
-		return;
-
-	hermes_kms_track_frame(hdev, NULL);
-	hermes_kms_hotplug_event(drm);
-	drm_info(drm, "disconnected virtual output after owner fd closed\n");
+	kfree(file->driver_priv);
+	file->driver_priv = NULL;
 }
 
 static const struct drm_ioctl_desc hermes_kms_ioctls[] = {
@@ -1599,6 +1732,9 @@ static const struct drm_ioctl_desc hermes_kms_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(HERMES_KMS_GET_METRICS,
 			  hermes_kms_ioctl_get_metrics,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(HERMES_KMS_SELECT_OUTPUT,
+			  hermes_kms_ioctl_select_output,
 			  DRM_RENDER_ALLOW),
 };
 
@@ -1627,38 +1763,56 @@ static int hermes_kms_stats_show(struct seq_file *m, void *data)
 	struct drm_debugfs_entry *entry = m->private;
 	struct drm_device *drm = entry->dev;
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	unsigned int i;
 
-	mutex_lock(&hdev->state_lock);
-	seq_printf(m, "output_enabled:        %d\n", hdev->output_enabled);
-	seq_printf(m, "owner_pid:             %d\n", hdev->owner_pid);
-	seq_printf(m, "session_id:            %llu\n", hdev->session_id);
-	seq_printf(m, "requested_mode:        %ux%u@%u\n",
-		   hdev->requested_width, hdev->requested_height,
-		   hdev->requested_refresh_hz);
-	seq_printf(m, "vblank_period_ns:      %lld\n",
-		   ktime_to_ns(hdev->vblank_period));
-	seq_printf(m, "vblank_count:          %llu\n",
-		   READ_ONCE(hdev->vblank_count));
-	seq_printf(m, "vblank_overrun_count:  %llu\n",
-		   READ_ONCE(hdev->vblank_overrun_count));
-	seq_printf(m, "frame_sequence:        %llu\n", hdev->frame_sequence);
-	seq_printf(m, "frame_update_count:    %llu\n", hdev->frame_update_count);
-	seq_printf(m, "acquire_count:         %llu\n", hdev->acquire_count);
-	seq_printf(m, "acquire_no_frame:      %llu\n",
-		   hdev->acquire_no_frame_count);
-	seq_printf(m, "dmabuf_export_count:   %llu\n", hdev->dmabuf_export_count);
-	seq_printf(m, "dmabuf_export_fail:    %llu\n",
-		   hdev->dmabuf_export_fail_count);
-	seq_printf(m, "sync_file_export:      %llu\n",
-		   hdev->sync_file_export_count);
-	seq_printf(m, "sync_file_export_fail: %llu\n",
-		   hdev->sync_file_export_fail_count);
-	seq_printf(m, "wait_count:            %llu\n", hdev->wait_count);
-	seq_printf(m, "wait_timeout_count:    %llu\n", hdev->wait_timeout_count);
-	seq_printf(m, "hotplug_event_count:   %llu\n", hdev->hotplug_event_count);
-	seq_printf(m, "output_enable_count:   %llu\n", hdev->output_enable_count);
-	seq_printf(m, "output_disable_count:  %llu\n", hdev->output_disable_count);
-	mutex_unlock(&hdev->state_lock);
+	seq_printf(m, "output_count:          %u\n", hdev->output_count);
+	for (i = 0; i < hdev->output_count; i++) {
+		struct hermes_kms_output *output = &hdev->outputs[i];
+
+		mutex_lock(&output->state_lock);
+		seq_printf(m, "\n[%s]\n", output->output_name);
+		seq_printf(m, "output_enabled:        %d\n",
+			   output->output_enabled);
+		seq_printf(m, "owner_pid:             %d\n", output->owner_pid);
+		seq_printf(m, "session_id:            %llu\n",
+			   output->session_id);
+		seq_printf(m, "requested_mode:        %ux%u@%u\n",
+			   output->requested_width, output->requested_height,
+			   output->requested_refresh_hz);
+		seq_printf(m, "vblank_period_ns:      %lld\n",
+			   ktime_to_ns(output->vblank_period));
+		seq_printf(m, "vblank_count:          %llu\n",
+			   READ_ONCE(output->vblank_count));
+		seq_printf(m, "vblank_overrun_count:  %llu\n",
+			   READ_ONCE(output->vblank_overrun_count));
+		seq_printf(m, "frame_sequence:        %llu\n",
+			   output->frame_sequence);
+		seq_printf(m, "frame_update_count:    %llu\n",
+			   output->frame_update_count);
+		seq_printf(m, "acquire_count:         %llu\n",
+			   output->acquire_count);
+		seq_printf(m, "acquire_no_frame:      %llu\n",
+			   output->acquire_no_frame_count);
+		seq_printf(m, "dmabuf_export_count:   %llu\n",
+			   output->dmabuf_export_count);
+		seq_printf(m, "dmabuf_export_fail:    %llu\n",
+			   output->dmabuf_export_fail_count);
+		seq_printf(m, "sync_file_export:      %llu\n",
+			   output->sync_file_export_count);
+		seq_printf(m, "sync_file_export_fail: %llu\n",
+			   output->sync_file_export_fail_count);
+		seq_printf(m, "wait_count:            %llu\n",
+			   output->wait_count);
+		seq_printf(m, "wait_timeout_count:    %llu\n",
+			   output->wait_timeout_count);
+		seq_printf(m, "hotplug_event_count:   %llu\n",
+			   output->hotplug_event_count);
+		seq_printf(m, "output_enable_count:   %llu\n",
+			   output->output_enable_count);
+		seq_printf(m, "output_disable_count:  %llu\n",
+			   output->output_disable_count);
+		mutex_unlock(&output->state_lock);
+	}
 	return 0;
 }
 
@@ -1690,6 +1844,7 @@ static const struct drm_driver hermes_kms_driver = {
 	.major = HERMES_KMS_DRIVER_MAJOR,
 	.minor = HERMES_KMS_DRIVER_MINOR,
 	.fops = &hermes_kms_fops,
+	.open = hermes_kms_open,
 	.postclose = hermes_kms_postclose,
 #ifdef CONFIG_DEBUG_FS
 	.debugfs_init = hermes_kms_debugfs_init,
@@ -1699,9 +1854,101 @@ static const struct drm_driver hermes_kms_driver = {
 	DRM_GEM_SHMEM_DRIVER_OPS,
 };
 
+static int hermes_kms_output_modeset_init(struct hermes_kms_output *output)
+{
+	struct drm_device *drm = &output->hdev->drm;
+	int ret;
+
+	ret = drm_connector_init(drm, &output->connector,
+				 &hermes_kms_connector_funcs,
+				 DRM_MODE_CONNECTOR_VIRTUAL);
+	if (ret)
+		return ret;
+
+	drm_connector_helper_add(&output->connector,
+				 &hermes_kms_connector_helper_funcs);
+
+	/*
+	 * Do not set the connector PATH property here. That property is
+	 * reserved for DP-MST tunnelled connectors: drm_connector_set_path_property()
+	 * returns -EINVAL on a plain DRM_MODE_CONNECTOR_VIRTUAL connector, and a
+	 * PATH blob would mislead userspace (KScreen/KWin) into treating Hermes as
+	 * an MST sink. The connector keeps its kernel-assigned "Virtual-N" name,
+	 * which is what compositors enumerate. The friendly identity is reported
+	 * separately via DRM_IOCTL_HERMES_KMS_GET_IDENTITY (output_name).
+	 */
+
+	output->connector.display_info.non_desktop = non_desktop;
+	if (drm->mode_config.non_desktop_property)
+		drm_object_attach_property(&output->connector.base,
+					   drm->mode_config.non_desktop_property,
+					   non_desktop ? 1 : 0);
+	output->connector.polled = DRM_CONNECTOR_POLL_CONNECT |
+				   DRM_CONNECTOR_POLL_DISCONNECT;
+
+	/* Primary plane. */
+	ret = drm_universal_plane_init(drm, &output->primary, 0,
+				       &hermes_kms_plane_funcs,
+				       hermes_kms_formats,
+				       ARRAY_SIZE(hermes_kms_formats),
+				       NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
+	if (ret)
+		return ret;
+	drm_plane_helper_add(&output->primary,
+			     &hermes_kms_plane_helper_funcs);
+
+	/*
+	 * Advertise FB_DAMAGE_CLIPS so the compositor can tell us which region
+	 * changed each frame; we forward it to the capture consumer via
+	 * ACQUIRE_FRAME's damage rect so only the dirty region is encoded.
+	 */
+	drm_plane_enable_fb_damage_clips(&output->primary);
+
+	/* Cursor plane: lets the compositor offload pointer motion (no full
+	 * recomposite per move). Consumed client-side, not blended into capture. */
+	ret = drm_universal_plane_init(drm, &output->cursor, 0,
+				       &hermes_kms_cursor_funcs,
+				       hermes_kms_cursor_formats,
+				       ARRAY_SIZE(hermes_kms_cursor_formats),
+				       NULL, DRM_PLANE_TYPE_CURSOR, NULL);
+	if (ret)
+		return ret;
+	drm_plane_helper_add(&output->cursor,
+			     &hermes_kms_cursor_helper_funcs);
+
+	/* CRTC driven by the software vblank timer. Use the managed variant to
+	 * match vkms and pair with devm_drm_dev_alloc(). */
+	drm_dbg_kms(drm,
+		    "%s primary plane type=%d (PRIMARY=%d) before crtc init\n",
+		    output->output_name, output->primary.type,
+		    DRM_PLANE_TYPE_PRIMARY);
+	ret = drmm_crtc_init_with_planes(drm, &output->crtc,
+					 &output->primary, &output->cursor,
+					 &hermes_kms_crtc_funcs, NULL);
+	if (ret)
+		return ret;
+	drm_crtc_helper_add(&output->crtc, &hermes_kms_crtc_helper_funcs);
+
+	/* Encoder linking the CRTC to the connector. */
+	ret = drm_encoder_init(drm, &output->encoder,
+			       &hermes_kms_encoder_funcs,
+			       DRM_MODE_ENCODER_VIRTUAL, NULL);
+	if (ret)
+		return ret;
+	output->encoder.possible_crtcs = drm_crtc_mask(&output->crtc);
+
+	ret = drm_connector_attach_encoder(&output->connector,
+					   &output->encoder);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
 static int hermes_kms_modeset_init(struct hermes_kms_device *hdev)
 {
 	struct drm_device *drm = &hdev->drm;
+	unsigned int i;
 	int ret;
 
 	ret = drmm_mode_config_init(drm);
@@ -1718,85 +1965,14 @@ static int hermes_kms_modeset_init(struct hermes_kms_device *hdev)
 	drm->mode_config.cursor_height = 256;
 	drm->mode_config.funcs = &hermes_kms_mode_config_funcs;
 
-	ret = drm_connector_init(drm, &hdev->connector,
-				 &hermes_kms_connector_funcs,
-				 DRM_MODE_CONNECTOR_VIRTUAL);
-	if (ret)
-		return ret;
+	for (i = 0; i < hdev->output_count; i++) {
+		ret = hermes_kms_output_modeset_init(&hdev->outputs[i]);
+		if (ret)
+			return ret;
+	}
 
-	drm_connector_helper_add(&hdev->connector,
-				 &hermes_kms_connector_helper_funcs);
-
-	/*
-	 * Do not set the connector PATH property here. That property is
-	 * reserved for DP-MST tunnelled connectors: drm_connector_set_path_property()
-	 * returns -EINVAL on a plain DRM_MODE_CONNECTOR_VIRTUAL connector, and a
-	 * PATH blob would mislead userspace (KScreen/KWin) into treating Hermes as
-	 * an MST sink. The connector keeps its kernel-assigned "Virtual-N" name,
-	 * which is what compositors enumerate. The friendly identity is reported
-	 * separately via DRM_IOCTL_HERMES_KMS_GET_IDENTITY (output_name).
-	 */
-
-	hdev->connector.display_info.non_desktop = non_desktop;
-	if (drm->mode_config.non_desktop_property)
-		drm_object_attach_property(&hdev->connector.base,
-					   drm->mode_config.non_desktop_property,
-					   non_desktop ? 1 : 0);
-	hdev->connector.polled = DRM_CONNECTOR_POLL_CONNECT |
-				 DRM_CONNECTOR_POLL_DISCONNECT;
-
-	/* Primary plane. */
-	ret = drm_universal_plane_init(drm, &hdev->primary, 0,
-				       &hermes_kms_plane_funcs,
-				       hermes_kms_formats,
-				       ARRAY_SIZE(hermes_kms_formats),
-				       NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
-	if (ret)
-		return ret;
-	drm_plane_helper_add(&hdev->primary, &hermes_kms_plane_helper_funcs);
-
-	/*
-	 * Advertise FB_DAMAGE_CLIPS so the compositor can tell us which region
-	 * changed each frame; we forward it to the capture consumer via
-	 * ACQUIRE_FRAME's damage rect so only the dirty region is encoded.
-	 */
-	drm_plane_enable_fb_damage_clips(&hdev->primary);
-
-	/* Cursor plane: lets the compositor offload pointer motion (no full
-	 * recomposite per move). Consumed client-side, not blended into capture. */
-	ret = drm_universal_plane_init(drm, &hdev->cursor, 0,
-				       &hermes_kms_cursor_funcs,
-				       hermes_kms_cursor_formats,
-				       ARRAY_SIZE(hermes_kms_cursor_formats),
-				       NULL, DRM_PLANE_TYPE_CURSOR, NULL);
-	if (ret)
-		return ret;
-	drm_plane_helper_add(&hdev->cursor, &hermes_kms_cursor_helper_funcs);
-
-	/* CRTC driven by the software vblank timer. Use the managed variant to
-	 * match vkms and pair with devm_drm_dev_alloc(). */
-	drm_dbg_kms(drm, "primary plane type=%d (PRIMARY=%d) before crtc init\n",
-		    hdev->primary.type, DRM_PLANE_TYPE_PRIMARY);
-	ret = drmm_crtc_init_with_planes(drm, &hdev->crtc, &hdev->primary,
-					 &hdev->cursor,
-					 &hermes_kms_crtc_funcs, NULL);
-	if (ret)
-		return ret;
-	drm_crtc_helper_add(&hdev->crtc, &hermes_kms_crtc_helper_funcs);
-
-	/* Encoder linking the CRTC to the connector. */
-	hdev->encoder.possible_crtcs = drm_crtc_mask(&hdev->crtc);
-	ret = drm_encoder_init(drm, &hdev->encoder, &hermes_kms_encoder_funcs,
-			       DRM_MODE_ENCODER_VIRTUAL, NULL);
-	if (ret)
-		return ret;
-
-	ret = drm_connector_attach_encoder(&hdev->connector, &hdev->encoder);
-	if (ret)
-		return ret;
-
-	/* One CRTC, with a software vblank timer driving its refresh. */
-	ret = drm_vblank_init(drm, 1);
+	/* One independently paced software-vblank CRTC per virtual output. */
+	ret = drm_vblank_init(drm, hdev->output_count);
 	if (ret)
 		return ret;
 
@@ -1808,6 +1984,8 @@ static int hermes_kms_probe(struct platform_device *pdev)
 {
 	struct hermes_kms_device *hdev;
 	struct drm_device *drm;
+	unsigned int output_count = outputs;
+	unsigned int i;
 	int ret;
 
 	hdev = devm_drm_dev_alloc(&pdev->dev, &hermes_kms_driver,
@@ -1817,13 +1995,46 @@ static int hermes_kms_probe(struct platform_device *pdev)
 
 	drm = &hdev->drm;
 	platform_set_drvdata(pdev, hdev);
-	mutex_init(&hdev->state_lock);
-	mutex_init(&hdev->export_lock);
-	init_waitqueue_head(&hdev->frame_wait);
-	hrtimer_setup(&hdev->vblank_timer, hermes_kms_vblank_timer,
-		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	hdev->next_session_id = 1;
-	hermes_kms_init_output_state(drm, hdev);
+	if (output_count < 1 || output_count > HERMES_KMS_MAX_OUTPUTS) {
+		output_count = clamp(output_count, 1u,
+				     (unsigned int)HERMES_KMS_MAX_OUTPUTS);
+		drm_warn(drm, "outputs=%u out of range, using %u\n",
+			 outputs, output_count);
+	}
+	hdev->output_count = output_count;
+
+	for (i = 0; i < hdev->output_count; i++) {
+		struct hermes_kms_output *output = &hdev->outputs[i];
+		u8 checksum = 0;
+		unsigned int j;
+
+		output->hdev = hdev;
+		output->index = i;
+		snprintf(output->output_name, sizeof(output->output_name),
+			 HERMES_KMS_OUTPUT_NAME_PREFIX "%u", i + 1);
+
+		/*
+		 * Give every connector a stable, distinct EDID serial. KWin uses
+		 * EDID identity when persisting layouts; identical virtual panels
+		 * would otherwise be easy to collapse or swap across restarts.
+		 */
+		memcpy(output->edid, hermes_kms_edid, sizeof(output->edid));
+		output->edid[12] = (i + 1) & 0xff;
+		output->edid[13] = ((i + 1) >> 8) & 0xff;
+		output->edid[14] = ((i + 1) >> 16) & 0xff;
+		output->edid[15] = ((i + 1) >> 24) & 0xff;
+		for (j = 0; j < sizeof(output->edid) - 1; j++)
+			checksum += output->edid[j];
+		output->edid[sizeof(output->edid) - 1] = -checksum;
+
+		mutex_init(&output->state_lock);
+		mutex_init(&output->export_lock);
+		init_waitqueue_head(&output->frame_wait);
+		hrtimer_setup(&output->vblank_timer, hermes_kms_vblank_timer,
+			      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+		output->next_session_id = 1;
+		hermes_kms_init_output_state(drm, output);
+	}
 
 	ret = hermes_kms_modeset_init(hdev);
 	if (ret)
@@ -1834,49 +2045,57 @@ static int hermes_kms_probe(struct platform_device *pdev)
 		return ret;
 
 	drm_info(drm,
-		 "registered Hermes-KMS virtual DRM device output=%s initial_enabled=%d hotplug_events=%d non_desktop=%d initial_mode=%ux%u@%u\n",
-		 HERMES_KMS_OUTPUT_NAME,
+		 "registered Hermes-KMS virtual DRM device outputs=%u initial_enabled=%d hotplug_events=%d non_desktop=%d initial_mode=%ux%u@%u\n",
+		 hdev->output_count,
 		 initial_enabled,
 		 hotplug_events,
 		 non_desktop,
-		 hdev->requested_width,
-		 hdev->requested_height,
-		 hdev->requested_refresh_hz);
+		 hdev->outputs[0].requested_width,
+		 hdev->outputs[0].requested_height,
+		 hdev->outputs[0].requested_refresh_hz);
 	return 0;
 }
 
 static void hermes_kms_remove(struct platform_device *pdev)
 {
 	struct hermes_kms_device *hdev = platform_get_drvdata(pdev);
-	struct drm_framebuffer *fb;
+	unsigned int i;
 
-	mutex_lock(&hdev->state_lock);
-	if (hdev->output_enabled) {
-		hdev->output_enabled = false;
-		hdev->last_disable_ns = ktime_get_ns();
-		hdev->output_disable_count++;
+	for (i = 0; i < hdev->output_count; i++) {
+		struct hermes_kms_output *output = &hdev->outputs[i];
+
+		mutex_lock(&output->state_lock);
+		if (output->output_enabled) {
+			output->output_enabled = false;
+			output->last_disable_ns = ktime_get_ns();
+			output->output_disable_count++;
+		}
+		hermes_kms_clear_owner_locked(output);
+		mutex_unlock(&output->state_lock);
+		hermes_kms_track_frame(output, NULL);
+		hrtimer_cancel(&output->vblank_timer);
 	}
-	hermes_kms_clear_owner_locked(hdev);
-	mutex_unlock(&hdev->state_lock);
-	hermes_kms_track_frame(hdev, NULL);
-
-	hrtimer_cancel(&hdev->vblank_timer);
 
 	drm_dev_unregister(&hdev->drm);
 	drm_atomic_helper_shutdown(&hdev->drm);
 
-	mutex_lock(&hdev->state_lock);
-	fb = hdev->framebuffer;
-	hdev->framebuffer = NULL;
-	hermes_kms_clear_frame_locked(hdev);
-	mutex_unlock(&hdev->state_lock);
+	for (i = 0; i < hdev->output_count; i++) {
+		struct hermes_kms_output *output = &hdev->outputs[i];
+		struct drm_framebuffer *fb;
 
-	mutex_lock(&hdev->export_lock);
-	hermes_kms_drop_export_cache_locked(hdev);
-	mutex_unlock(&hdev->export_lock);
+		mutex_lock(&output->state_lock);
+		fb = output->framebuffer;
+		output->framebuffer = NULL;
+		hermes_kms_clear_frame_locked(output);
+		mutex_unlock(&output->state_lock);
 
-	if (fb)
-		drm_framebuffer_put(fb);
+		mutex_lock(&output->export_lock);
+		hermes_kms_drop_export_cache_locked(output);
+		mutex_unlock(&output->export_lock);
+
+		if (fb)
+			drm_framebuffer_put(fb);
+	}
 }
 
 static void hermes_kms_platform_release(struct device *dev)

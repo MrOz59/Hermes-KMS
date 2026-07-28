@@ -8,7 +8,7 @@ Hermes. It does not manage EVDI; EVDI remains a supported fallback.
 ```text
 Compositor / game
     ↓
-HERMES-1 DRM/KMS virtual connector
+HERMES-1..N DRM/KMS virtual connectors
     ↓
 GPU-backed framebuffer / GEM object
     ↓
@@ -33,6 +33,35 @@ A cursor plane lets the compositor offload pointer motion without recompositing
 the whole output, and `FB_DAMAGE_CLIPS` on the primary plane lets the driver
 forward the changed region to the capture consumer.
 
+## Multi-output prototype
+
+UAPI v8 can expose 1–8 independent virtual outputs on a single DRM device
+(`outputs=`, default 1 for compatibility). Multiple outputs are opt-in until
+the Hermes host integration can manage every connector. Every output owns a
+separate connector, encoder, CRTC, primary/cursor planes, software-vblank
+timer, owner session, scanout reference, frame waitqueue, metrics, and DMA-BUF
+cache. This keeps one compositor-facing DRM card while preventing two capture
+sessions from reading the same output state.
+
+Output selection is scoped to a DRM file descriptor:
+
+1. open the Hermes-KMS render node;
+2. call `DRM_IOCTL_HERMES_KMS_SELECT_OUTPUT` with a 0-based output index;
+3. use that same fd for `SET_OUTPUT`, `WAIT_FRAME`, `ACQUIRE_FRAME`, status, and
+   metrics;
+4. open a separate fd for every simultaneous output.
+
+A newly opened fd defaults to output 0, preserving UAPI v7 behavior for current
+Hermes builds. Rebinding an fd that owns an enabled output is rejected. The
+friendly identities are `HERMES-1`, `HERMES-2`, and so on; each connector also
+has a distinct EDID serial for compositor layout persistence. Compatibility was
+smoke-tested with the unmodified v0.1.2 control client against the v8 module.
+
+Status: **Prototype**. A disposable virtme-ng test validates simultaneous
+atomic modesets, distinct owners/framebuffers, DMA-BUF + sync_file export,
+independent disconnect, and clean unload for two outputs. KWin adoption,
+persistent host layout, and real encoder integration still require validation.
+
 ## Communication with Hermes
 
 Hermes-KMS should be controlled through explicit DRM ioctls, not by scraping logs or guessing connector names.
@@ -53,9 +82,10 @@ This is deliberately small. It can be safely extended with append-only structs a
 - latency counters;
 - a real DRM writeback connector.
 
-The stable Hermes output name is `HERMES-1`. The DRM connector name can still be
-the core-generated `Virtual-*`; Hermes should use `GET_IDENTITY` and object IDs
-instead of scraping connector names.
+The stable Hermes output names are `HERMES-1` through `HERMES-N`. DRM connector
+names can still be core-generated `Virtual-*`; Hermes should use
+`GET_IDENTITY`, `GET_CAPS.output_count`, and object IDs instead of scraping
+connector names.
 
 ## Frame and scanout tracking
 
@@ -162,13 +192,14 @@ The module supports simple load-time parameters for test safety:
 - `initial_width`
 - `initial_height`
 - `initial_refresh_hz`
+- `outputs` (1–8, default 1, fixed until the module is reloaded)
 
 The default is `initial_enabled=0`, so the DRM device exists but the connector
 starts disconnected. This prevents the desktop compositor from immediately
 taking ownership of the virtual display during development or before Hermes has
 started a stream.
 
-`DRM_IOCTL_HERMES_KMS_SET_OUTPUT` connects the output and records the calling
+`DRM_IOCTL_HERMES_KMS_SET_OUTPUT` connects the fd-selected output and records the calling
 `drm_file` as the session owner. Only that owner can update or disable the
 output while it is active. If the owner fd closes, including process crash, the
 driver marks the connector disconnected, clears the tracked frame, and emits a
@@ -209,12 +240,16 @@ root when the local user has normal device access.
 
 ## Current status
 
-Implemented and validated: explicit CRTC/encoder/plane modeset with a software
+Implemented and validated for the original single-output path: explicit CRTC/encoder/plane modeset with a software
 vblank timer (60/120/144 Hz, lockdep-clean, deterministic pacing), cursor plane,
 damage tracking, render node for masterless zero-copy consumption, scanout
 tracking, owner-fd lifecycle, stable output identity, DMA-BUF + sync_file export,
 strict atomic check, and debugfs telemetry. End-to-end zero-copy is validated on
 VAAPI (XRGB8888, linear).
+
+Implemented and VM-validated as a prototype: multiple independent KMS
+pipelines on one DRM device and per-fd output selection. This is not yet
+validated with KWin and real encoders on the host.
 
 Not yet implemented:
 

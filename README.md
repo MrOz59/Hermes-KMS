@@ -12,7 +12,8 @@ any program that speaks its DRM ioctl UAPI can consume frames (see
 
 - A Linux kernel DRM/KMS driver (`hermes_kms.ko`).
 - An EVDI alternative for low-latency screen capture, used by Hermes today.
-- A virtual display that exposes an output (`HERMES-1`) which a desktop
+- A virtual display that exposes independently controlled outputs
+  (`HERMES-1`, `HERMES-2`, ...) which a desktop
   compositor (KWin/GNOME) drives like a normal monitor.
 - A zero-copy DMA-BUF source for VAAPI/other hardware encoders.
 
@@ -48,9 +49,11 @@ userspace consumer — another streaming host such as Apollo/Sunshine, a recorde
 or your own tool — can use it by talking the same UAPI, with no fork required:
 
 1. Open the render node and probe with `GET_VERSION` / `GET_CAPS`.
-2. Optionally `SET_OUTPUT` to request a specific mode (this does not take DRM
+2. For UAPI v8 multi-output use, bind that fd with `SELECT_OUTPUT`; use one fd
+   per simultaneous virtual display. Unselected/legacy fds use `HERMES-1`.
+3. Optionally `SET_OUTPUT` to request a specific mode (this does not take DRM
    master, so the compositor keeps it).
-3. Run the `WAIT_FRAME` → `ACQUIRE_FRAME` loop and import the returned DMA-BUF
+4. Run the `WAIT_FRAME` → `ACQUIRE_FRAME` loop and import the returned DMA-BUF
    into your encoder.
 
 [tools/hermes-kmsctl](tools/hermes-kmsctl) and
@@ -60,7 +63,8 @@ in [include/uapi/drm/hermes_kms_drm.h](include/uapi/drm/hermes_kms_drm.h) and in
 [Userspace communication](#userspace-communication) below.
 
 What is currently fixed (and would need a fork to rebrand, though not to use):
-the output name is `HERMES-1` and the UAPI symbols are prefixed `HERMES_KMS_`.
+the output name prefix is `HERMES-` and the UAPI symbols are prefixed
+`HERMES_KMS_`.
 
 What is currently validated: VAAPI with `XRGB8888`, linear. NVENC/AMF and
 NV12/P010/HDR are not validated yet — see the [Roadmap](#roadmap). Forks and
@@ -79,6 +83,9 @@ same terms — see [License](#license).
   `ACQUIRE_FRAME`;
 - render node for masterless, zero-copy frame consumption;
 - synthetic EDID so compositors treat `HERMES-1` as a normal monitor;
+- 1–8 independent outputs on one DRM card (`outputs=`, default 1 for
+  compatibility), with separate KMS pipelines, sessions, frame channels, and
+  EDID serials;
 - exact requested mode synthesized via CVT and re-probed on `SET_OUTPUT`, so
   arbitrary client geometries (e.g. 1280x720@30) modeset correctly;
 - DMA-BUF export of the tracked scanout framebuffer, cached per buffer object;
@@ -113,16 +120,19 @@ compositor-driven (real streaming) and isolated `modetest` (driver validation).
 Inspect the driver with the control tool while it is loaded:
 
 ```bash
-sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=1
+sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=1 outputs=2
 sleep 1
 tools/hermes-kmsctl/hermes-kmsctl version
+tools/hermes-kmsctl/hermes-kmsctl outputs
 tools/hermes-kmsctl/hermes-kmsctl identity
+tools/hermes-kmsctl/hermes-kmsctl --output 2 identity
 tools/hermes-kmsctl/hermes-kmsctl caps
 tools/hermes-kmsctl/hermes-kmsctl status
 tools/hermes-kmsctl/hermes-kmsctl metrics
 tools/hermes-kmsctl/hermes-kmsctl wait 0 1000
 tools/hermes-kmsctl/hermes-kmsctl --verbose status
 tools/hermes-kmsctl/hermes-kmsctl hold 1920x1080@60
+tools/hermes-kmsctl/hermes-kmsctl --output 2 hold 1280x720@60
 ls -l /dev/dri/
 modetest -c
 drm_info
@@ -135,6 +145,7 @@ Optional initial mode/state parameters:
 ```bash
 sudo insmod kernel/hermes-kms/hermes_kms.ko initial_width=1920 initial_height=1080 initial_refresh_hz=60
 sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=1
+sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0 outputs=2
 ```
 
 There are two ways to drive the output, for two different purposes.
@@ -177,6 +188,11 @@ module, drives a `modetest` producer, and verifies the DMA-BUF/sync_file path.
 
 Other validation scripts (run as root, in the virtme-ng VM or on the host):
 
+- `scripts/vm-multi-output-test.sh` — drives two outputs concurrently at
+  different modes and verifies distinct owners, framebuffers, DMA-BUFs,
+  independent disconnect, and clean unload;
+- `scripts/vm-uapi-v7-compat-test.sh` — verifies an unmodified v0.1.2 control
+  client remains confined to `HERMES-1` under UAPI v8;
 - `scripts/vm-pacing-test.sh` — asserts the vblank timer fires at exactly
   60/120/144 Hz with no missed vblanks (uses `hermes-vblank-meter.c`);
 - `scripts/vm-export-stress.sh` — hammers `ACQUIRE_FRAME` from many threads
@@ -210,9 +226,13 @@ Initial ioctls:
 - `DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME`
 - `DRM_IOCTL_HERMES_KMS_WAIT_FRAME`
 - `DRM_IOCTL_HERMES_KMS_GET_METRICS`
+- `DRM_IOCTL_HERMES_KMS_SELECT_OUTPUT` (UAPI v8)
 
-`GET_IDENTITY` exposes the stable Hermes-facing output name `HERMES-1` while
-the DRM core may still expose the connector object as `Virtual-*`.
+`GET_CAPS.output_count` reports the number of independent outputs.
+`SELECT_OUTPUT` binds all output-scoped ioctls on that fd to a 0-based output;
+new fds default to output 0 for compatibility. `GET_IDENTITY` then exposes the
+selected stable Hermes-facing name (`HERMES-1`, `HERMES-2`, ...) while the DRM
+core may still expose connector objects as `Virtual-*`.
 
 `GET_STATUS` now reports scanout/frame metadata:
 
