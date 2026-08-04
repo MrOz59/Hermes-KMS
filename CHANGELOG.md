@@ -13,7 +13,7 @@ The canonical version lives in the driver source as three defines in
 ```c
 #define HERMES_KMS_DRIVER_MAJOR 0
 #define HERMES_KMS_DRIVER_MINOR 3
-#define HERMES_KMS_DRIVER_PATCH 0
+#define HERMES_KMS_DRIVER_PATCH 1
 ```
 
 The DKMS config, the PKGBUILD, and the `GET_VERSION` ioctl all read from these,
@@ -25,6 +25,8 @@ While the major version is `0`, the UAPI and on-disk/ioctl interfaces are still
 subject to change between minor releases.
 
 ## [Unreleased]
+
+## [0.3.1] - 2026-08-04
 
 ### Fixed
 
