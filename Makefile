@@ -32,7 +32,7 @@ DKMS_SRC := /usr/src/$(DKMS_NAME)-$(DKMS_VERSION)
 
 .PHONY: all modules tools install-runtime-udev uninstall-runtime-udev \
 	install-dev-udev uninstall-dev-udev \
-	dkms-install dkms-uninstall clean
+	dkms-install dkms-uninstall modules-install install-configs clean
 
 all: modules tools
 
@@ -56,6 +56,49 @@ dkms-uninstall:
 
 modules:
 	$(MAKE) -C $(KDIR) M=$(PWD)/kernel/hermes-kms $(LLVM_FLAG) modules
+
+# Install a built module straight into a kernel's module tree, without DKMS.
+#
+# DKMS assumes a writable /usr and a kernel that can be rebuilt against on the
+# running system. Image-based distributions (Bazzite, Silverblue, SteamOS and
+# other bootc/ostree systems) have neither: /usr is read-only at runtime, and
+# the module has to be baked in while the image is being built instead. There
+# the module is compiled once against the image's kernel and dropped into
+# /usr/lib/modules/$(KERNELRELEASE)/extra, which is what akmods and every
+# ublue-os kmod image do.
+#
+#   make modules KERNELRELEASE=<kver> KDIR=/usr/lib/modules/<kver>/build
+#   make modules-install KERNELRELEASE=<kver> DESTDIR=/
+modules-install: MODULE_DEST := $(DESTDIR)/usr/lib/modules/$(KERNELRELEASE)/extra/hermes-kms
+modules-install:
+	install -Dm0644 kernel/hermes-kms/hermes_kms.ko $(MODULE_DEST)/hermes_kms.ko
+	@# depmod resolves the tree through lib/modules, which is only the same as
+	@# usr/lib/modules on a merged-/usr root. A bare staging DESTDIR has neither
+	@# that symlink nor the rest of the kernel's module tree, so skip it there
+	@# and say so, instead of failing a build that is otherwise complete.
+	@if [ -d "$(DESTDIR)/lib/modules/$(KERNELRELEASE)" ]; then \
+		depmod -b "$(DESTDIR)/" -a "$(KERNELRELEASE)"; \
+	else \
+		printf 'skipping depmod: no module tree at %s — run "depmod -a %s" on the target\n' \
+			'$(DESTDIR)/lib/modules/$(KERNELRELEASE)' '$(KERNELRELEASE)' >&2; \
+	fi
+	@printf 'installed %s\n' '$(MODULE_DEST)/hermes_kms.ko'
+
+# The module options, autoload entry, udev rules and seat helper, installed
+# under /usr so they survive on an image-based system. Split out from
+# install-runtime-udev because that target reloads udev and systemd, which
+# cannot work inside an image build.
+install-configs:
+	install -Dm0644 packaging/modules-load.d/hermes-kms.conf \
+		$(DESTDIR)/usr/lib/modules-load.d/hermes-kms.conf
+	install -Dm0644 packaging/modprobe.d/hermes-kms.conf \
+		$(DESTDIR)/usr/lib/modprobe.d/hermes-kms.conf
+	install -Dm0644 udev/70-hermes-kms-session-seats.rules \
+		$(DESTDIR)$(SYSTEM_UDEV_RULE_DIR)/70-hermes-kms-session-seats.rules
+	install -Dm0755 scripts/hermes-kms-seatd-instance \
+		$(DESTDIR)/usr/lib/hermes-kms/hermes-kms-seatd-instance
+	install -Dm0644 packaging/systemd/hermes-kms-seatd@.service \
+		$(DESTDIR)/usr/lib/systemd/system/hermes-kms-seatd@.service
 
 tools: tools/hermes-kmsctl/hermes-kmsctl tools/hermes-kms-import-check/hermes-kms-import-check
 

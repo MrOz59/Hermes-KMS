@@ -26,6 +26,25 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Added
+
+- Support for image-based distributions (Bazzite, Silverblue, SteamOS and other
+  bootc/ostree systems), where DKMS cannot work: it rebuilds the module on the
+  installed system whenever the kernel changes, and there `/usr` is read-only at
+  runtime, so that moment never arrives. `packaging/bazzite/Containerfile` builds
+  the module into the image instead, compiling it against the image's kernel and
+  installing it to `/usr/lib/modules/<kver>/extra` the way akmods and the
+  ublue-os kmod images do. It fails the build rather than ship an image whose
+  module cannot be resolved, and takes an optional MOK for signing — Bazzite
+  enforces Secure Boot, which will not load an unsigned out-of-tree module.
+- `make modules-install` and `make install-configs`, the DKMS-free halves of an
+  install: one places a built module and runs `depmod`, the other puts the module
+  options, autoload entry, session-seat udev rule and seatd helper under `/usr`
+  so they survive a read-only root. Both honour `DESTDIR`. `depmod` resolves
+  modules through `lib/modules`, which only matches `usr/lib/modules` on a
+  merged-`/usr` root, so on a staging `DESTDIR` it is skipped with a note rather
+  than failing an otherwise complete build.
+
 ## [0.3.0] - 2026-07-29
 
 ### Added

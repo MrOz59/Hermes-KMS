@@ -120,6 +120,51 @@ Clean:
 make clean
 ```
 
+### Image-based systems (Bazzite, Silverblue, SteamOS)
+
+DKMS does not work on an image-based distribution. Its whole model is to rebuild
+the module on the installed system whenever the kernel changes, and there `/usr`
+is read-only at runtime, so that moment never arrives. The module has to be
+built into the image instead.
+
+`packaging/bazzite/Containerfile` does that: it compiles `hermes_kms.ko` against
+the image's kernel and installs it to `/usr/lib/modules/<kver>/extra`, which is
+where akmods and the ublue-os kmod images put theirs.
+
+```bash
+podman build -t localhost/bazzite-hermes:latest -f packaging/bazzite/Containerfile .
+sudo bootc switch --transport containers-storage localhost/bazzite-hermes:latest
+```
+
+Reboot into the new image and the module autoloads. Push the image to a registry
+and rebase from there if you want it to follow Bazzite's own updates.
+
+**Secure Boot.** Bazzite ships with Secure Boot enabled, signed with the
+Universal Blue key. A module built this way is unsigned, and an enforcing Secure
+Boot will refuse to load it. Either enroll your own MOK and pass it to the build:
+
+```bash
+podman build \
+  --build-arg MODULE_SIGN_KEY=/path/to/MOK.priv \
+  --build-arg MODULE_SIGN_CERT=/path/to/MOK.der \
+  -t localhost/bazzite-hermes:latest -f packaging/bazzite/Containerfile .
+```
+
+…or turn Secure Boot off in firmware. There is no way around that pair.
+
+The two Makefile targets behind it work for any image build, not only Bazzite:
+
+```bash
+make modules KERNELRELEASE=<kver> KDIR=/usr/lib/modules/<kver>/build
+make modules-install install-configs KERNELRELEASE=<kver> DESTDIR=/
+```
+
+`modules-install` places the module and runs `depmod`; `install-configs` adds the
+module options, the autoload entry, the session-seat udev rule and the seatd
+helper under `/usr`, so they survive on a read-only root. On a staging `DESTDIR`
+with no full module tree `depmod` is skipped with a note rather than failing —
+run `depmod -a <kver>` on the target in that case.
+
 ## Local test commands
 
 Loading an unsigned experimental kernel module can destabilize the session. Use
