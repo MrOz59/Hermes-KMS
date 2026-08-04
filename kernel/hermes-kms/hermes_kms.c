@@ -261,10 +261,21 @@ static const u32 hermes_kms_cursor_formats[] = {
  * Synthetic EDID 1.3 base block identifying the Hermes virtual monitor.
  * Compositors (e.g. KWin) warn and may refuse to configure a connector with
  * no EDID ("Could not find edid for connector"). This block provides identity
- * (manufacturer "HRM", name "Hermes KMS") and sane range limits so the output
- * is treated as a normal monitor. The actual mode list is still generated
+ * (manufacturer "HRM", name "Hermes KMS") and range limits so the output is
+ * treated as a normal monitor. The actual mode list is still generated
  * dynamically in get_modes() via CVT so arbitrary client geometries work; the
  * EDID's detailed timing is only a fallback/preferred hint. Checksum verified.
+ *
+ * The range limits are not a hint, though — userspace validates modes against
+ * them, so they have to cover everything this driver accepts. They used to say
+ * 75 Hz / 150 kHz / 300 MHz, which contradicted HERMES_KMS_MAX_REFRESH_HZ and
+ * silently ruled out every mode above 75 Hz: a client asking for 1080p120 got a
+ * connector that advertised the mode through CVT and then refused it here.
+ * They now say 240 Hz / 255 kHz / 1200 MHz, matching what the driver allows.
+ *
+ * 255 kHz is the ceiling a 1.3 range descriptor can express without the 1.4
+ * offset flags. That covers up to 1440p144; 4K above ~113 Hz needs more
+ * horizontal rate than can be stated here, so it would still be filtered out.
  */
 static const u8 hermes_kms_edid[128] = {
 	0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x22, 0x4d, 0x01, 0x00,
@@ -272,12 +283,12 @@ static const u8 hermes_kms_edid[128] = {
 	0x02, 0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54, 0x00,
 	0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
 	0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3a, 0x80, 0x18, 0x71, 0x38,
-	0x2d, 0x40, 0x58, 0x2c, 0x45, 0x00, 0x40, 0x84, 0x63, 0x00, 0x00, 0x1e,
+	0x2d, 0x40, 0x58, 0x2c, 0x45, 0x00, 0x13, 0x2b, 0x21, 0x00, 0x00, 0x1e,
 	0x00, 0x00, 0x00, 0xfc, 0x00, 0x48, 0x65, 0x72, 0x6d, 0x65, 0x73, 0x20,
 	0x4b, 0x4d, 0x53, 0x0a, 0x20, 0x20, 0x00, 0x00, 0x00, 0xfd, 0x00, 0x17,
-	0x4b, 0x0f, 0x96, 0x1e, 0x01, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+	0xf0, 0x0f, 0xff, 0x78, 0x01, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
 	0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe6,
 };
 
 static bool hermes_kms_hotplug_event(struct hermes_kms_output *output)
@@ -1950,6 +1961,18 @@ static int hermes_kms_output_modeset_init(struct hermes_kms_output *output)
 
 	drm_connector_helper_add(&output->connector,
 				 &hermes_kms_connector_helper_funcs);
+
+	/*
+	 * drm_connector_init() attaches the EDID property to every connector
+	 * type except VIRTUAL and WRITEBACK, on the assumption that neither has
+	 * an EDID to publish. This one does, so attach it explicitly. Without
+	 * this, drm_edid_connector_update() fails with -EINVAL because the
+	 * property is not on the object, the synthetic EDID never reaches
+	 * userspace, and the connector's sysfs "edid" reads back empty — so the
+	 * identity and range limits it carries are silently absent, which is
+	 * precisely what they exist to provide.
+	 */
+	drm_connector_attach_edid_property(&output->connector);
 
 	/*
 	 * Do not set the connector PATH property here. That property is

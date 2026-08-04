@@ -26,6 +26,26 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- The synthetic EDID now reaches userspace. `drm_connector_init()` attaches the
+  EDID property to every connector type except VIRTUAL and WRITEBACK, and
+  Hermes-KMS uses VIRTUAL, so every `drm_edid_connector_update()` failed with
+  `-EINVAL` and the connector's sysfs `edid` read back empty. The failure is
+  only visible with `drm.debug` enabled, so the block had been publishing
+  nothing since it was added — the identity KWin looks for, the range limits and
+  the per-output serial were all inert.
+- The EDID range limits no longer cap the display at 75 Hz. They stated
+  23-75 Hz, 15-150 kHz and 300 MHz while the driver accepts up to
+  `HERMES_KMS_MAX_REFRESH_HZ` (240), so once the EDID was actually published
+  they would have rejected every mode above 75 Hz, including the 1080p120 the
+  CVT path synthesises correctly. They now state 240 Hz, 255 kHz and 1200 MHz;
+  255 kHz is the most a 1.3 range descriptor holds without the 1.4 offset flags,
+  which covers up to 1440p144.
+- The EDID's detailed timing described a 1600x900 mm panel — a 72" display —
+  which skews the DPI a compositor derives from it. It now describes a 24"
+  1080p panel.
+
 ### Added
 
 - Support for image-based distributions (Bazzite, Silverblue, SteamOS and other
