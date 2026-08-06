@@ -3,7 +3,9 @@
 // DMA-BUF: the declared one (frame.pitch[0]) or a wrongly assumed width*4.
 // Compares GPU-read rows against CPU ground truth under both hypotheses.
 
+#include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +17,8 @@
 #include <limits.h>
 #include <stdbool.h>
 
+#include <linux/dma-buf.h>
+
 #include <drm/drm_fourcc.h>
 #include <drm/hermes_kms_drm.h>
 #include <xf86drm.h>
@@ -24,6 +28,13 @@
 #define GL_GLEXT_PROTOTYPES 1
 #include <GL/gl.h>
 #include <GL/glext.h>
+
+static void usage(const char *argv0)
+{
+	fprintf(stderr,
+		"Usage: %s [--device /dev/dri/cardN] [--gpu /dev/dri/renderDN]\n",
+		argv0);
+}
 
 static int open_if_hermes(const char *path)
 {
@@ -39,73 +50,44 @@ static int open_if_hermes(const char *path)
 	return -1;
 }
 
-int main(void)
+static int open_auto_hermes(void)
 {
-	setvbuf(stdout, NULL, _IONBF, 0);
-
-	int hermes_fd = -1;
-	DIR *dir = opendir("/dev/dri");
 	struct dirent *entry;
+	DIR *dir = opendir("/dev/dri");
+	int fd = -1;
+
 	while (dir && (entry = readdir(dir))) {
 		char path[PATH_MAX];
 		if (strncmp(entry->d_name, "card", 4) && strncmp(entry->d_name, "renderD", 7))
 			continue;
 		snprintf(path, sizeof(path), "/dev/dri/%s", entry->d_name);
-		hermes_fd = open_if_hermes(path);
-		if (hermes_fd >= 0)
+		fd = open_if_hermes(path);
+		if (fd >= 0)
 			break;
 	}
 	if (dir)
 		closedir(dir);
-	if (hermes_fd < 0) {
-		fprintf(stderr, "no hermes device\n");
-		return 1;
-	}
+	return fd;
+}
 
-	struct drm_hermes_kms_status status;
-	memset(&status, 0, sizeof(status));
-	ioctl(hermes_fd, DRM_IOCTL_HERMES_KMS_GET_STATUS, &status);
-	if (!(status.flags & HERMES_KMS_STATUS_FRAME_VALID)) {
-		struct drm_hermes_kms_wait_frame wait;
-		memset(&wait, 0, sizeof(wait));
-		wait.after_sequence = status.frame_sequence;
-		wait.timeout_ms = 10000;
-		ioctl(hermes_fd, DRM_IOCTL_HERMES_KMS_WAIT_FRAME, &wait);
-	}
+// Open the render GPU that should import the frame: an explicit path when
+// given, otherwise the first render node that is not the Hermes device.
+static int open_real_gpu(const char *path)
+{
+	struct dirent *entry;
+	DIR *dir;
+	int fd = -1;
 
-	struct drm_hermes_kms_acquire_frame frame;
-	memset(&frame, 0, sizeof(frame));
-	frame.flags = HERMES_KMS_FRAME_REQUEST_DMABUF;
-	if (ioctl(hermes_fd, DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME, &frame) < 0 ||
-	    !(frame.flags & HERMES_KMS_FRAME_DMABUF_VALID)) {
-		fprintf(stderr, "acquire failed\n");
-		return 1;
-	}
+	if (path)
+		return open(path, O_RDWR | O_CLOEXEC);
 
-	const uint32_t W = frame.width, H = frame.height;
-	const uint32_t declared_pitch = frame.pitch[0];
-	const uint32_t tight_pitch = W * 4;
-	printf("frame %ux%u declared_pitch=%u tight_pitch=%u\n", W, H, declared_pitch, tight_pitch);
-
-	// CPU snapshot FIRST (freeze our reference before any GPU work)
-	size_t map_len = (size_t) declared_pitch * H + frame.offset[0];
-	uint8_t *cpu = mmap(NULL, map_len, PROT_READ, MAP_SHARED, frame.dma_buf_fd[0], 0);
-	if (cpu == MAP_FAILED) {
-		fprintf(stderr, "mmap failed\n");
-		return 1;
-	}
-	uint8_t *snap = malloc(map_len);
-	memcpy(snap, cpu, map_len);
-
-	// GPU import
-	int gpu_fd = -1;
 	dir = opendir("/dev/dri");
 	while (dir && (entry = readdir(dir))) {
+		char candidate[PATH_MAX];
 		if (strncmp(entry->d_name, "renderD", 7))
 			continue;
-		char path[PATH_MAX];
-		snprintf(path, sizeof(path), "/dev/dri/%s", entry->d_name);
-		int fd = open(path, O_RDWR | O_CLOEXEC);
+		snprintf(candidate, sizeof(candidate), "/dev/dri/%s", entry->d_name);
+		fd = open(candidate, O_RDWR | O_CLOEXEC);
 		if (fd < 0)
 			continue;
 		drmVersionPtr ver = drmGetVersion(fd);
@@ -114,49 +96,233 @@ int main(void)
 			drmFreeVersion(ver);
 		if (herm) {
 			close(fd);
+			fd = -1;
 			continue;
 		}
-		gpu_fd = fd;
 		break;
 	}
 	if (dir)
 		closedir(dir);
+	return fd;
+}
 
-	struct gbm_device *gbm = gbm_create_device(gpu_fd);
-	PFNEGLGETPLATFORMDISPLAYEXTPROC gpd =
-		(PFNEGLGETPLATFORMDISPLAYEXTPROC) eglGetProcAddress("eglGetPlatformDisplayEXT");
-	EGLDisplay dpy = gpd(EGL_PLATFORM_GBM_KHR, gbm, NULL);
-	eglInitialize(dpy, NULL, NULL);
-	eglBindAPI(EGL_OPENGL_API);
-	EGLContext ctx = eglCreateContext(dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, NULL);
-	eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx);
+static void close_frame_fds(struct drm_hermes_kms_acquire_frame *frame)
+{
+	for (uint32_t i = 0; i < frame->plane_count && i < 4; i++) {
+		if (frame->dma_buf_fd[i] >= 0) {
+			close(frame->dma_buf_fd[i]);
+			frame->dma_buf_fd[i] = -1;
+		}
+	}
+	if (frame->sync_file_fd >= 0) {
+		close(frame->sync_file_fd);
+		frame->sync_file_fd = -1;
+	}
+}
 
-	EGLAttrib attribs[] = {
-		EGL_WIDTH, W,
-		EGL_HEIGHT, H,
-		EGL_LINUX_DRM_FOURCC_EXT, frame.format,
-		EGL_DMA_BUF_PLANE0_FD_EXT, frame.dma_buf_fd[0],
-		EGL_DMA_BUF_PLANE0_OFFSET_EXT, frame.offset[0],
-		EGL_DMA_BUF_PLANE0_PITCH_EXT, declared_pitch,
-		EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLAttrib) (frame.modifier & 0xFFFFFFFFu),
-		EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLAttrib) (frame.modifier >> 32),
-		EGL_NONE
-	};
-	EGLImage image = eglCreateImage(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
-	if (image == EGL_NO_IMAGE) {
-		fprintf(stderr, "import failed 0x%x\n", eglGetError());
-		return 1;
+// The CPU snapshots below are the reference for every verdict; bracket them
+// with the DMA-BUF sync ioctl as the mmap contract requires.
+static void cpu_read_locked(int dmabuf_fd, uint8_t *dst, const uint8_t *src, size_t len)
+{
+	struct dma_buf_sync sync;
+
+	memset(&sync, 0, sizeof(sync));
+	sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+	ioctl(dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync);
+
+	memcpy(dst, src, len);
+
+	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+	ioctl(dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync);
+}
+
+int main(int argc, char **argv)
+{
+	const char *hermes_path = NULL;
+	const char *gpu_path = NULL;
+	int ret = 1;
+
+	int hermes_fd = -1;
+	int gpu_fd = -1;
+	struct gbm_device *gbm = NULL;
+	EGLDisplay dpy = EGL_NO_DISPLAY;
+	EGLContext ctx = EGL_NO_CONTEXT;
+	EGLImage image = EGL_NO_IMAGE;
+	GLuint tex = 0, fbo = 0;
+	bool egl_initialized = false;
+	uint8_t *cpu = MAP_FAILED;
+	uint8_t *snap = NULL, *gpu_rows = NULL, *gpu_all = NULL;
+	size_t map_len = 0;
+
+	struct drm_hermes_kms_acquire_frame frame;
+	memset(&frame, 0, sizeof(frame));
+	frame.sync_file_fd = -1;
+
+	setvbuf(stdout, NULL, _IONBF, 0);
+
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
+			hermes_path = argv[++i];
+		} else if (strcmp(argv[i], "--gpu") == 0 && i + 1 < argc) {
+			gpu_path = argv[++i];
+		} else {
+			usage(argv[0]);
+			return 1;
+		}
 	}
 
-	typedef void(GLAPIENTRY * TexStorageFn)(GLenum, void *, const GLint *);
-	TexStorageFn tex_storage = (TexStorageFn) eglGetProcAddress("glEGLImageTargetTexStorageEXT");
-	GLuint tex;
+	hermes_fd = hermes_path ? open_if_hermes(hermes_path) : open_auto_hermes();
+	if (hermes_fd < 0) {
+		fprintf(stderr, "no hermes device\n");
+		goto out;
+	}
+
+	struct drm_hermes_kms_status status;
+	memset(&status, 0, sizeof(status));
+	if (ioctl(hermes_fd, DRM_IOCTL_HERMES_KMS_GET_STATUS, &status) < 0) {
+		perror("GET_STATUS");
+		goto out;
+	}
+	if (!(status.flags & HERMES_KMS_STATUS_FRAME_VALID)) {
+		struct drm_hermes_kms_wait_frame wait;
+		memset(&wait, 0, sizeof(wait));
+		wait.after_sequence = status.frame_sequence;
+		wait.timeout_ms = 10000;
+		if (ioctl(hermes_fd, DRM_IOCTL_HERMES_KMS_WAIT_FRAME, &wait) < 0 ||
+		    !(wait.flags & HERMES_KMS_WAIT_FRAME_READY)) {
+			fprintf(stderr, "no scanout frame within 10s\n");
+			goto out;
+		}
+	}
+
+	frame.flags = HERMES_KMS_FRAME_REQUEST_DMABUF |
+		      HERMES_KMS_FRAME_REQUEST_SYNC_FILE;
+	if (ioctl(hermes_fd, DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME, &frame) < 0 ||
+	    !(frame.flags & HERMES_KMS_FRAME_DMABUF_VALID) ||
+	    !frame.plane_count || frame.dma_buf_fd[0] < 0) {
+		fprintf(stderr, "acquire failed\n");
+		goto out;
+	}
+
+	// ACQUIRE_FRAME does not guarantee the producer finished writing; wait
+	// for the exported write fence before freezing the CPU reference.
+	if ((frame.flags & HERMES_KMS_FRAME_SYNC_FILE_VALID) && frame.sync_file_fd >= 0) {
+		struct pollfd pfd = {.fd = frame.sync_file_fd, .events = POLLIN};
+		int rv;
+		do {
+			rv = poll(&pfd, 1, 2000);
+		} while (rv < 0 && errno == EINTR);
+		if (rv <= 0) {
+			fprintf(stderr, "frame fence did not signal within 2s\n");
+			goto out;
+		}
+	}
+
+	const uint32_t W = frame.width, H = frame.height;
+	const uint32_t declared_pitch = frame.pitch[0];
+	const uint32_t tight_pitch = W * 4;
+	if (!W || !H || declared_pitch < tight_pitch) {
+		fprintf(stderr, "implausible frame geometry %ux%u pitch=%u\n",
+			W, H, declared_pitch);
+		goto out;
+	}
+	printf("frame %ux%u declared_pitch=%u tight_pitch=%u\n", W, H, declared_pitch, tight_pitch);
+
+	// CPU snapshot FIRST (freeze our reference before any GPU work)
+	map_len = (size_t) declared_pitch * H + frame.offset[0];
+	cpu = mmap(NULL, map_len, PROT_READ, MAP_SHARED, frame.dma_buf_fd[0], 0);
+	if (cpu == MAP_FAILED) {
+		fprintf(stderr, "mmap failed\n");
+		goto out;
+	}
+	snap = malloc(map_len);
+	if (!snap) {
+		fprintf(stderr, "out of memory\n");
+		goto out;
+	}
+	cpu_read_locked(frame.dma_buf_fd[0], snap, cpu, map_len);
+
+	// GPU import
+	gpu_fd = open_real_gpu(gpu_path);
+	if (gpu_fd < 0) {
+		fprintf(stderr, "no render GPU found\n");
+		goto out;
+	}
+
+	gbm = gbm_create_device(gpu_fd);
+	if (!gbm) {
+		fprintf(stderr, "gbm_create_device failed\n");
+		goto out;
+	}
+	PFNEGLGETPLATFORMDISPLAYEXTPROC gpd =
+		(PFNEGLGETPLATFORMDISPLAYEXTPROC) eglGetProcAddress("eglGetPlatformDisplayEXT");
+	if (!gpd) {
+		fprintf(stderr, "eglGetPlatformDisplayEXT unavailable\n");
+		goto out;
+	}
+	dpy = gpd(EGL_PLATFORM_GBM_KHR, gbm, NULL);
+	if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, NULL, NULL)) {
+		fprintf(stderr, "EGL display init failed\n");
+		dpy = EGL_NO_DISPLAY;
+		goto out;
+	}
+	egl_initialized = true;
+	if (!eglBindAPI(EGL_OPENGL_API)) {
+		fprintf(stderr, "eglBindAPI failed\n");
+		goto out;
+	}
+	ctx = eglCreateContext(dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, NULL);
+	if (ctx == EGL_NO_CONTEXT || !eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
+		fprintf(stderr, "EGL context setup failed (0x%x)\n", eglGetError());
+		goto out;
+	}
+
+	const char *exts = eglQueryString(dpy, EGL_EXTENSIONS);
+	bool has_modifiers = exts && strstr(exts, "EGL_EXT_image_dma_buf_import_modifiers");
+
+	EGLAttrib attribs[32];
+	int a = 0;
+	attribs[a++] = EGL_WIDTH;
+	attribs[a++] = W;
+	attribs[a++] = EGL_HEIGHT;
+	attribs[a++] = H;
+	attribs[a++] = EGL_LINUX_DRM_FOURCC_EXT;
+	attribs[a++] = frame.format;
+	attribs[a++] = EGL_DMA_BUF_PLANE0_FD_EXT;
+	attribs[a++] = frame.dma_buf_fd[0];
+	attribs[a++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
+	attribs[a++] = frame.offset[0];
+	attribs[a++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
+	attribs[a++] = declared_pitch;
+	// Omit the modifier attributes when the driver reported none or the
+	// EGL implementation does not advertise the modifier extension.
+	if (frame.modifier != DRM_FORMAT_MOD_INVALID && has_modifiers) {
+		attribs[a++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
+		attribs[a++] = (EGLAttrib) (frame.modifier & 0xFFFFFFFFu);
+		attribs[a++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
+		attribs[a++] = (EGLAttrib) (frame.modifier >> 32);
+	}
+	attribs[a++] = EGL_NONE;
+
+	image = eglCreateImage(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attribs);
+	if (image == EGL_NO_IMAGE) {
+		fprintf(stderr, "import failed 0x%x\n", eglGetError());
+		goto out;
+	}
+
 	glGenTextures(1, &tex);
 	glBindTexture(GL_TEXTURE_2D, tex);
 	while (glGetError()) {}
 	glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
 	const char *bind_path = "OES";
 	if (glGetError() != GL_NO_ERROR) {
+		typedef void(GLAPIENTRY * TexStorageFn)(GLenum, void *, const GLint *);
+		TexStorageFn tex_storage =
+			(TexStorageFn) eglGetProcAddress("glEGLImageTargetTexStorageEXT");
+		if (!tex_storage) {
+			fprintf(stderr, "OES bind failed and glEGLImageTargetTexStorageEXT unavailable\n");
+			goto out;
+		}
 		glDeleteTextures(1, &tex);
 		glGenTextures(1, &tex);
 		glBindTexture(GL_TEXTURE_2D, tex);
@@ -164,17 +330,24 @@ int main(void)
 		bind_path = "TexStorageEXT";
 		if (glGetError() != GL_NO_ERROR) {
 			fprintf(stderr, "both binds failed\n");
-			return 1;
+			goto out;
 		}
 	}
 	printf("bind path: %s\n", bind_path);
 
-	GLuint fbo;
 	glGenFramebuffers(1, &fbo);
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
 	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+	if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+		fprintf(stderr, "FBO incomplete with imported texture\n");
+		goto out;
+	}
 
-	uint8_t *gpu_rows = malloc((size_t) W * 4 * 32);
+	gpu_rows = malloc((size_t) W * 4 * 32);
+	if (!gpu_rows) {
+		fprintf(stderr, "out of memory\n");
+		goto out;
+	}
 	glPixelStorei(GL_PACK_ALIGNMENT, 1);
 	glReadPixels(0, 0, W, 32, GL_BGRA, GL_UNSIGNED_BYTE, gpu_rows);
 	glFinish();
@@ -183,7 +356,11 @@ int main(void)
 	// the GPU readback, so compare byte-match FRACTIONS: a pitch shear
 	// misaligns everything, animation only touches small regions.
 	const uint32_t rows_to_check = H < 200 ? H : 200;
-	uint8_t *gpu_all = malloc((size_t) W * 4 * rows_to_check);
+	gpu_all = malloc((size_t) W * 4 * rows_to_check);
+	if (!gpu_all) {
+		fprintf(stderr, "out of memory\n");
+		goto out;
+	}
 	glReadPixels(0, 0, W, rows_to_check, GL_BGRA, GL_UNSIGNED_BYTE, gpu_all);
 	glFinish();
 
@@ -227,10 +404,16 @@ int main(void)
 		const uint32_t y0 = H > 600 ? 400 : H / 4;
 		const uint32_t nrows = 200;
 		uint8_t *gpu_mid = malloc((size_t) W * 4 * nrows);
+		uint8_t *post = malloc(map_len);
+		if (!gpu_mid || !post) {
+			fprintf(stderr, "out of memory\n");
+			free(gpu_mid);
+			free(post);
+			goto out;
+		}
 		glReadPixels(0, y0, W, nrows, GL_BGRA, GL_UNSIGNED_BYTE, gpu_mid);
 		glFinish();
-		uint8_t *post = malloc(map_len);
-		memcpy(post, cpu, map_len);
+		cpu_read_locked(frame.dma_buf_fd[0], post, cpu, map_len);
 
 		uint32_t stable = 0, st_decl = 0, st_tight = 0, st_other = 0;
 		for (uint32_t r = 0; r < nrows && y0 + r < H; r++) {
@@ -263,6 +446,10 @@ int main(void)
 		const uint32_t y0 = H > 600 ? 500 : H / 2;
 		const uint32_t nrows = 24;
 		uint8_t *mid = malloc((size_t) W * 4 * nrows);
+		if (!mid) {
+			fprintf(stderr, "out of memory\n");
+			goto out;
+		}
 		glReadPixels(0, y0, W, nrows, GL_BGRA, GL_UNSIGNED_BYTE, mid);
 		glFinish();
 
@@ -306,18 +493,42 @@ int main(void)
 	printf("\ngpu row0[0..15]: ");
 	for (int i = 0; i < 16; i++)
 		printf("%02x ", gpu_all[i]);
-	printf("\ncpu row100[0..15]: ");
-	for (int i = 0; i < 16; i++)
-		printf("%02x ", snap[frame.offset[0] + (size_t) 100 * declared_pitch + i]);
-	printf("\ngpu row100[0..15]: ");
-	for (int i = 0; i < 16; i++)
-		printf("%02x ", gpu_all[(size_t) 100 * W * 4 + i]);
+	if (H > 100 && rows_to_check > 100) {
+		printf("\ncpu row100[0..15]: ");
+		for (int i = 0; i < 16; i++)
+			printf("%02x ", snap[frame.offset[0] + (size_t) 100 * declared_pitch + i]);
+		printf("\ngpu row100[0..15]: ");
+		for (int i = 0; i < 16; i++)
+			printf("%02x ", gpu_all[(size_t) 100 * W * 4 + i]);
+	}
 	printf("\n");
-	free(gpu_all);
 
+	ret = 0;
+
+out:
+	free(gpu_all);
 	free(gpu_rows);
 	free(snap);
-	munmap(cpu, map_len);
-	eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-	return 0;
+	if (cpu != MAP_FAILED && map_len)
+		munmap(cpu, map_len);
+	if (egl_initialized) {
+		if (fbo)
+			glDeleteFramebuffers(1, &fbo);
+		if (tex)
+			glDeleteTextures(1, &tex);
+		if (image != EGL_NO_IMAGE)
+			eglDestroyImage(dpy, image);
+		eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+		if (ctx != EGL_NO_CONTEXT)
+			eglDestroyContext(dpy, ctx);
+		eglTerminate(dpy);
+	}
+	if (gbm)
+		gbm_device_destroy(gbm);
+	if (gpu_fd >= 0)
+		close(gpu_fd);
+	close_frame_fds(&frame);
+	if (hermes_fd >= 0)
+		close(hermes_fd);
+	return ret;
 }

@@ -3,7 +3,8 @@
 // hermes-egl-import-check: validate the NVENC-style consumer path for
 // Hermes-KMS frames on NVIDIA (and any other EGL/GL/CUDA stack):
 //
-//   ACQUIRE_FRAME (DMA-BUF) -> eglCreateImage(EGL_LINUX_DMA_BUF_EXT)
+//   ACQUIRE_FRAME (DMA-BUF) -> wait on the exported sync file
+//     -> eglCreateImage(EGL_LINUX_DMA_BUF_EXT)
 //     -> glEGLImageTargetTexture2DOES -> FBO readback (proves sampling)
 //     -> cuGraphicsGLRegisterImage (proves the Sunshine/Hermes CUDA interop)
 //
@@ -11,11 +12,16 @@
 // captured DMA-BUF through EGL on the render GPU and maps the GL texture into
 // CUDA. VAAPI has its own checker (hermes-kms-import-check); this tool covers
 // the NVIDIA side of the roadmap ("NVENC/AMF DMA-BUF import validation").
+//
+// Every stage reports PASS / FAIL / SKIPPED / NOT PROVIDED individually and
+// the final RESULT only claims a complete chain when every required stage
+// actually ran and passed.
 
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -24,6 +30,8 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#include <linux/dma-buf.h>
 
 #include <drm/drm_fourcc.h>
 #include <drm/hermes_kms_drm.h>
@@ -61,10 +69,45 @@
 
 typedef void(GLAPIENTRY *PFNGLEGLIMAGETARGETTEXTURE2DOESPROC_local)(GLenum target, void *image);
 
+enum stage_result {
+	ST_NOT_RUN = 0,
+	ST_PASS,
+	ST_FAIL,
+	ST_SKIPPED,
+	ST_NOT_PROVIDED,
+};
+
+static const char *stage_name(enum stage_result s)
+{
+	switch (s) {
+	case ST_PASS:
+		return "PASS";
+	case ST_FAIL:
+		return "FAIL";
+	case ST_SKIPPED:
+		return "SKIPPED";
+	case ST_NOT_PROVIDED:
+		return "NOT PROVIDED";
+	default:
+		return "not run";
+	}
+}
+
+struct stage_results {
+	enum stage_result acquire;
+	enum stage_result fence;
+	enum stage_result cpu_ref;
+	enum stage_result egl_import;
+	enum stage_result gl_validate;
+	enum stage_result cuda_reg;
+};
+
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-		"Usage: %s [--device /dev/dri/cardN] [--gpu /dev/dri/renderDN] [--wait-ms MS] [--no-cuda]\n",
+		"Usage: %s [--device /dev/dri/cardN] [--gpu /dev/dri/renderDN] [--wait-ms MS] [--no-cuda]\n"
+		"Exit codes: 0 = complete chain passed, 1 = a stage failed,\n"
+		"            2 = no failures but the chain is incomplete (stages skipped)\n",
 		argv0);
 }
 
@@ -244,6 +287,37 @@ static void close_frame_fds(struct drm_hermes_kms_acquire_frame *frame)
 	}
 }
 
+// ACQUIRE_FRAME only guarantees that the frame was exported, not that the
+// producer finished writing it. The driver exports the framebuffer's write
+// fence as a sync file; wait for it before using the pixels as a reference.
+static enum stage_result wait_frame_fence(const struct drm_hermes_kms_acquire_frame *frame,
+					  int timeout_ms)
+{
+	struct pollfd pfd;
+	int rv;
+
+	if (!(frame->flags & HERMES_KMS_FRAME_SYNC_FILE_VALID) ||
+	    frame->sync_file_fd < 0) {
+		printf("INFO: driver provided no sync file for this frame\n");
+		return ST_NOT_PROVIDED;
+	}
+
+	pfd.fd = frame->sync_file_fd;
+	pfd.events = POLLIN;
+	pfd.revents = 0;
+	do {
+		rv = poll(&pfd, 1, timeout_ms);
+	} while (rv < 0 && errno == EINTR);
+
+	if (rv <= 0) {
+		fprintf(stderr, "FAIL: frame fence did not signal within %d ms\n", timeout_ms);
+		return ST_FAIL;
+	}
+
+	printf("PASS: frame fence signalled (producer finished writing)\n");
+	return ST_PASS;
+}
+
 // CPU ground truth: mmap plane 0 and CRC a few rows so the GPU readback can be
 // compared against what is actually in the buffer.
 static uint32_t crc32_simple(const uint8_t *data, size_t len, uint32_t crc)
@@ -266,12 +340,23 @@ static bool cpu_crc_rows(const struct drm_hermes_kms_acquire_frame *frame,
 	if (map == MAP_FAILED)
 		return false;
 
+	// CPU access to a DMA-BUF mapping must be bracketed with the sync
+	// ioctl; this read is the reference every later stage is compared
+	// against, so an unsynchronized read here would poison all verdicts.
+	struct dma_buf_sync sync;
+	memset(&sync, 0, sizeof(sync));
+	sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+	ioctl(frame->dma_buf_fd[0], DMA_BUF_IOCTL_SYNC, &sync);
+
 	uint32_t crc = 0;
 	const uint8_t *base = (const uint8_t *) map + frame->offset[0];
 	uint32_t row_bytes = frame->width * 4;
 
 	for (uint32_t y = 0; y < rows && y < frame->height; y++)
 		crc = crc32_simple(base + (size_t) y * frame->pitch[0], row_bytes, crc);
+
+	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+	ioctl(frame->dma_buf_fd[0], DMA_BUF_IOCTL_SYNC, &sync);
 
 	munmap(map, map_len);
 	*crc_out = crc;
@@ -285,6 +370,27 @@ int main(int argc, char **argv)
 	uint32_t wait_ms = 2000;
 	bool do_cuda = true;
 	int ret = 1;
+
+	struct stage_results st;
+	memset(&st, 0, sizeof(st));
+
+	int hermes_fd = -1;
+	int gpu_fd = -1;
+	struct gbm_device *gbm = NULL;
+	EGLDisplay dpy = EGL_NO_DISPLAY;
+	EGLContext ctx = EGL_NO_CONTEXT;
+	EGLImage image = EGL_NO_IMAGE;
+	GLuint tex = 0, fbo = 0, conv = 0, draw_fbo = 0;
+	bool egl_initialized = false;
+#ifdef HAVE_CUDA
+	CUdevice cuda_dev = 0;
+	bool cuda_ctx_retained = false;
+	bool cuda_interop_ran = false;
+#endif
+
+	struct drm_hermes_kms_acquire_frame frame;
+	memset(&frame, 0, sizeof(frame));
+	frame.sync_file_fd = -1;
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
@@ -302,23 +408,24 @@ int main(int argc, char **argv)
 	}
 
 	// --- 1. Acquire a frame from Hermes-KMS ---------------------------------
-	int hermes_fd = hermes_path ? open_if_hermes(hermes_path) : open_auto_hermes();
+	hermes_fd = hermes_path ? open_if_hermes(hermes_path) : open_auto_hermes();
 	if (hermes_fd < 0) {
 		fprintf(stderr, "FAIL: no Hermes-KMS device found (module loaded? output enabled?)\n");
-		return 1;
+		st.acquire = ST_FAIL;
+		goto out;
 	}
 
 	if (wait_for_frame(hermes_fd, wait_ms)) {
 		fprintf(stderr, "FAIL: no scanout frame (compositor not driving HERMES output?)\n");
-		close(hermes_fd);
-		return 1;
+		st.acquire = ST_FAIL;
+		goto out;
 	}
 
-	struct drm_hermes_kms_acquire_frame frame;
 	if (acquire_frame(hermes_fd, &frame)) {
-		close(hermes_fd);
-		return 1;
+		st.acquire = ST_FAIL;
+		goto out;
 	}
+	st.acquire = ST_PASS;
 
 	printf("frame: %ux%u format=0x%08x ('%c%c%c%c') modifier=0x%016llx planes=%u pitch0=%u\n",
 	       frame.width, frame.height, frame.format,
@@ -326,46 +433,60 @@ int main(int argc, char **argv)
 	       (frame.format >> 16) & 0xff, (frame.format >> 24) & 0xff,
 	       (unsigned long long) frame.modifier, frame.plane_count, frame.pitch[0]);
 
+	// --- 2. Wait for the producer's write fence -----------------------------
+	st.fence = wait_frame_fence(&frame, (int) wait_ms);
+	if (st.fence == ST_FAIL)
+		goto out;
+
 	uint32_t cpu_crc = 0;
 	bool have_cpu_crc = cpu_crc_rows(&frame, 8, &cpu_crc);
-	if (have_cpu_crc)
+	if (have_cpu_crc) {
 		printf("PASS: CPU mmap of plane 0 (crc32 of first 8 rows: 0x%08x)\n", cpu_crc);
-	else
-		printf("INFO: CPU mmap not supported by exporter (non-fatal)\n");
+		st.cpu_ref = ST_PASS;
+	} else {
+		printf("INFO: CPU mmap not supported by exporter, no CPU reference available\n");
+		st.cpu_ref = ST_SKIPPED;
+	}
 
-	// --- 2. EGL display/context on the real GPU ----------------------------
+	// --- 3. EGL display/context on the real GPU ----------------------------
 	char gpu_name[64] = {0};
-	int gpu_fd = open_real_gpu(gpu_path, gpu_name, sizeof(gpu_name));
+	gpu_fd = open_real_gpu(gpu_path, gpu_name, sizeof(gpu_name));
 	if (gpu_fd < 0) {
 		fprintf(stderr, "FAIL: no real render GPU found\n");
-		goto out_frame;
+		st.egl_import = ST_FAIL;
+		goto out;
 	}
 	printf("render GPU: %s\n", gpu_name);
 
-	struct gbm_device *gbm = gbm_create_device(gpu_fd);
+	gbm = gbm_create_device(gpu_fd);
 	if (!gbm) {
 		fprintf(stderr, "FAIL: gbm_create_device\n");
-		goto out_frame;
+		st.egl_import = ST_FAIL;
+		goto out;
 	}
 
 	PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display =
 		(PFNEGLGETPLATFORMDISPLAYEXTPROC) eglGetProcAddress("eglGetPlatformDisplayEXT");
 	if (!get_platform_display) {
 		fprintf(stderr, "FAIL: eglGetPlatformDisplayEXT unavailable\n");
-		goto out_frame;
+		st.egl_import = ST_FAIL;
+		goto out;
 	}
 
-	EGLDisplay dpy = get_platform_display(EGL_PLATFORM_GBM_KHR, gbm, NULL);
+	dpy = get_platform_display(EGL_PLATFORM_GBM_KHR, gbm, NULL);
 	if (dpy == EGL_NO_DISPLAY) {
 		fprintf(stderr, "FAIL: eglGetPlatformDisplay(GBM)\n");
-		goto out_frame;
+		st.egl_import = ST_FAIL;
+		goto out;
 	}
 
 	EGLint major, minor;
 	if (!eglInitialize(dpy, &major, &minor)) {
 		fprintf(stderr, "FAIL: eglInitialize (0x%x)\n", eglGetError());
-		goto out_frame;
+		st.egl_import = ST_FAIL;
+		goto out;
 	}
+	egl_initialized = true;
 	printf("EGL %d.%d on %s / %s\n", major, minor,
 	       eglQueryString(dpy, EGL_VENDOR), eglQueryString(dpy, EGL_VERSION));
 
@@ -375,27 +496,32 @@ int main(int argc, char **argv)
 	printf("%s: EGL_EXT_image_dma_buf_import\n", has_import ? "PASS" : "FAIL");
 	printf("INFO: EGL_EXT_image_dma_buf_import_modifiers %s\n",
 	       has_modifiers ? "present" : "absent");
-	if (!has_import)
-		goto out_egl;
+	if (!has_import) {
+		st.egl_import = ST_FAIL;
+		goto out;
+	}
 
 	if (!eglBindAPI(EGL_OPENGL_API)) {
 		fprintf(stderr, "FAIL: eglBindAPI(OPENGL)\n");
-		goto out_egl;
+		st.egl_import = ST_FAIL;
+		goto out;
 	}
 
-	EGLContext ctx = eglCreateContext(dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, NULL);
+	ctx = eglCreateContext(dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, NULL);
 	if (ctx == EGL_NO_CONTEXT) {
 		fprintf(stderr, "FAIL: eglCreateContext (0x%x)\n", eglGetError());
-		goto out_egl;
+		st.egl_import = ST_FAIL;
+		goto out;
 	}
 
 	if (!eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
 		fprintf(stderr, "FAIL: eglMakeCurrent surfaceless (0x%x)\n", eglGetError());
-		goto out_egl;
+		st.egl_import = ST_FAIL;
+		goto out;
 	}
 	printf("GL renderer: %s\n", (const char *) glGetString(GL_RENDERER));
 
-	// --- 3. Import the DMA-BUF as an EGLImage ------------------------------
+	// --- 4. Import the DMA-BUF as an EGLImage ------------------------------
 	EGLAttrib attribs[64];
 	int a = 0;
 	attribs[a++] = EGL_WIDTH;
@@ -410,7 +536,10 @@ int main(int argc, char **argv)
 	attribs[a++] = frame.offset[0];
 	attribs[a++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
 	attribs[a++] = frame.pitch[0];
-	if (frame.modifier != DRM_FORMAT_MOD_INVALID) {
+	// Only pass modifier attributes when the driver reported a valid
+	// modifier AND the EGL implementation advertises the modifier
+	// extension; otherwise omit them entirely.
+	if (frame.modifier != DRM_FORMAT_MOD_INVALID && has_modifiers) {
 		attribs[a++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
 		attribs[a++] = (EGLAttrib) (frame.modifier & 0xFFFFFFFFu);
 		attribs[a++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
@@ -418,26 +547,28 @@ int main(int argc, char **argv)
 	}
 	attribs[a++] = EGL_NONE;
 
-	EGLImage image = eglCreateImage(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
-					NULL, attribs);
+	image = eglCreateImage(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
+			       NULL, attribs);
 	if (image == EGL_NO_IMAGE) {
 		fprintf(stderr, "FAIL: eglCreateImage(EGL_LINUX_DMA_BUF_EXT) error=0x%x\n",
 			eglGetError());
 		fprintf(stderr, "      -> this GPU/driver refuses to import the Hermes DMA-BUF\n");
-		goto out_egl;
+		st.egl_import = ST_FAIL;
+		goto out;
 	}
 	printf("PASS: eglCreateImage imported the Hermes DMA-BUF\n");
+	st.egl_import = ST_PASS;
 
-	// --- 4. Bind to a texture and read back through the GPU ----------------
+	// --- 5. Bind to a texture and read back through the GPU ----------------
 	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC_local image_target_texture =
 		(PFNGLEGLIMAGETARGETTEXTURE2DOESPROC_local)
 			eglGetProcAddress("glEGLImageTargetTexture2DOES");
 	if (!image_target_texture) {
 		fprintf(stderr, "FAIL: glEGLImageTargetTexture2DOES unavailable\n");
-		goto out_egl;
+		st.gl_validate = ST_FAIL;
+		goto out;
 	}
 
-	GLuint tex = 0;
 	glGenTextures(1, &tex);
 	glBindTexture(GL_TEXTURE_2D, tex);
 	image_target_texture(GL_TEXTURE_2D, image);
@@ -456,7 +587,8 @@ int main(int argc, char **argv)
 				eglGetProcAddress("glEGLImageTargetTexStorageEXT");
 		if (!image_target_storage) {
 			fprintf(stderr, "FAIL: glEGLImageTargetTexStorageEXT unavailable too\n");
-			goto out_egl;
+			st.gl_validate = ST_FAIL;
+			goto out;
 		}
 
 		glDeleteTextures(1, &tex);
@@ -466,27 +598,31 @@ int main(int argc, char **argv)
 		err = glGetError();
 		if (err != GL_NO_ERROR) {
 			fprintf(stderr, "FAIL: glEGLImageTargetTexStorageEXT error=0x%x\n", err);
-			goto out_egl;
+			st.gl_validate = ST_FAIL;
+			goto out;
 		}
 		printf("PASS: EGLImage bound as GL texture (TexStorageEXT path)\n");
 	} else {
 		printf("PASS: EGLImage bound as GL texture (OES path)\n");
 	}
 
-	GLuint fbo = 0;
 	glGenFramebuffers(1, &fbo);
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
 	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 			       GL_TEXTURE_2D, tex, 0);
 	if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
 		fprintf(stderr, "FAIL: FBO incomplete with imported texture\n");
-		goto out_egl;
+		st.gl_validate = ST_FAIL;
+		goto out;
 	}
 
 	uint32_t rows = frame.height < 8 ? frame.height : 8;
 	uint8_t *pixels = calloc((size_t) frame.width * rows, 4);
-	if (!pixels)
-		goto out_egl;
+	if (!pixels) {
+		fprintf(stderr, "FAIL: out of memory for readback buffer\n");
+		st.gl_validate = ST_FAIL;
+		goto out;
+	}
 
 	glPixelStorei(GL_PACK_ALIGNMENT, 1);
 	glReadPixels(0, 0, frame.width, rows, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
@@ -494,7 +630,8 @@ int main(int argc, char **argv)
 	if (err != GL_NO_ERROR) {
 		fprintf(stderr, "FAIL: glReadPixels from imported texture error=0x%x\n", err);
 		free(pixels);
-		goto out_egl;
+		st.gl_validate = ST_FAIL;
+		goto out;
 	}
 
 	uint32_t gpu_crc = 0;
@@ -509,34 +646,35 @@ int main(int argc, char **argv)
 		if (gpu_crc == cpu_crc)
 			printf("PASS: GPU readback matches CPU ground truth\n");
 		else
-			printf("WARN: GPU/CPU crc mismatch (0x%08x vs 0x%08x) — row order or "
-			       "cache coherency; inspect before trusting zero-copy\n",
+			printf("WARN: GPU/CPU crc mismatch (0x%08x vs 0x%08x); the compositor may "
+			       "have redrawn the live buffer between the reads, use pitch_detect "
+			       "for a drift-filtered verdict\n",
 			       gpu_crc, cpu_crc);
 	}
 
-	// --- 5. Emulate the real encoder pipeline --------------------------------
+	// --- 6. Emulate the real encoder pipeline --------------------------------
 	// Hermes/Sunshine never hands the *imported* texture to CUDA. The GL
 	// converter (egl::sws_t) samples it into textures Sunshine allocated
 	// itself, and only those are registered with CUDA. Reproduce that:
 	// blit imported -> own texture, then map the own texture into CUDA.
-	GLuint conv = 0;
 	glGenTextures(1, &conv);
 	glBindTexture(GL_TEXTURE_2D, conv);
 	glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, frame.width, frame.height);
 	err = glGetError();
 	if (err != GL_NO_ERROR) {
 		fprintf(stderr, "FAIL: allocating conversion texture error=0x%x\n", err);
-		goto out_egl;
+		st.gl_validate = ST_FAIL;
+		goto out;
 	}
 
-	GLuint draw_fbo = 0;
 	glGenFramebuffers(1, &draw_fbo);
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw_fbo);
 	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 			       GL_TEXTURE_2D, conv, 0);
 	if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
 		fprintf(stderr, "FAIL: draw FBO incomplete\n");
-		goto out_egl;
+		st.gl_validate = ST_FAIL;
+		goto out;
 	}
 
 	// read FBO still holds the imported texture
@@ -547,27 +685,62 @@ int main(int argc, char **argv)
 	err = glGetError();
 	if (err != GL_NO_ERROR) {
 		fprintf(stderr, "FAIL: GL blit imported->own texture error=0x%x\n", err);
-		goto out_egl;
+		st.gl_validate = ST_FAIL;
+		goto out;
 	}
 	printf("PASS: GL converter pass (imported -> own texture)\n");
+	st.gl_validate = ST_PASS;
 
 #ifdef HAVE_CUDA
-	if (do_cuda) {
+	if (!do_cuda) {
+		printf("INFO: CUDA stage skipped (--no-cuda)\n");
+		st.cuda_reg = ST_SKIPPED;
+	} else {
 		CUresult cr = cuInit(0);
 		if (cr != CUDA_SUCCESS) {
-			printf("INFO: cuInit failed (%d) — skipping CUDA stage\n", (int) cr);
+			printf("INFO: cuInit failed (%d), CUDA stage skipped\n", (int) cr);
+			st.cuda_reg = ST_SKIPPED;
 			goto cuda_done;
 		}
 
-		CUdevice dev;
+		// Match the CUDA device to the GL context created on the
+		// selected render node; device 0 may be a different GPU on
+		// multi-GPU hosts and a register failure there would say
+		// nothing about Hermes-KMS interop.
+		unsigned int dev_count = 0;
+		cr = cuGLGetDevices(&dev_count, &cuda_dev, 1, CU_GL_DEVICE_LIST_ALL);
+		if (cr != CUDA_SUCCESS || dev_count == 0) {
+			printf("INFO: no CUDA device backs the current GL context (%d), "
+			       "CUDA stage skipped\n", (int) cr);
+			st.cuda_reg = ST_SKIPPED;
+			goto cuda_done;
+		}
+
+		char dev_name[128] = {0};
+		if (cuDeviceGetName(dev_name, sizeof(dev_name) - 1, cuda_dev) == CUDA_SUCCESS)
+			printf("CUDA device (via cuGLGetDevices): %s\n", dev_name);
+
+		// The primary-context API is signature-stable across CUDA
+		// 11/12/13; the unversioned cuCtxCreate is not (CUDA 13 added
+		// a params argument). The context is released at the very end
+		// of main: releasing it while the EGL context still exists
+		// tears down shared GL-interop driver state underneath it and
+		// crashes at least the NVIDIA driver during EGL/GL teardown.
 		CUcontext cuctx;
-		if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS ||
-		    cuCtxCreate(&cuctx, NULL, 0, dev) != CUDA_SUCCESS) {
-			fprintf(stderr, "FAIL: CUDA context creation\n");
-			goto out_egl;
+		if (cuDevicePrimaryCtxRetain(&cuctx, cuda_dev) != CUDA_SUCCESS) {
+			fprintf(stderr, "FAIL: cuDevicePrimaryCtxRetain\n");
+			st.cuda_reg = ST_FAIL;
+			goto out;
+		}
+		cuda_ctx_retained = true;
+		if (cuCtxSetCurrent(cuctx) != CUDA_SUCCESS) {
+			fprintf(stderr, "FAIL: cuCtxSetCurrent\n");
+			st.cuda_reg = ST_FAIL;
+			goto out;
 		}
 
 		CUgraphicsResource res;
+		cuda_interop_ran = true;
 		cr = cuGraphicsGLRegisterImage(&res, conv, GL_TEXTURE_2D,
 					       CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY);
 		if (cr != CUDA_SUCCESS) {
@@ -575,8 +748,8 @@ int main(int argc, char **argv)
 			cuGetErrorString(cr, &es);
 			fprintf(stderr, "FAIL: cuGraphicsGLRegisterImage(own texture): %s\n",
 				es ? es : "?");
-			cuCtxDestroy(cuctx);
-			goto out_egl;
+			st.cuda_reg = ST_FAIL;
+			goto out;
 		}
 
 		CUarray arr;
@@ -584,23 +757,25 @@ int main(int argc, char **argv)
 		    cuGraphicsSubResourceGetMappedArray(&arr, res, 0, 0) != CUDA_SUCCESS) {
 			fprintf(stderr, "FAIL: mapping GL texture into CUDA\n");
 			cuGraphicsUnregisterResource(res);
-			cuCtxDestroy(cuctx);
-			goto out_egl;
+			st.cuda_reg = ST_FAIL;
+			goto out;
 		}
 
-		// Pull the first row through CUDA and CRC it against the same row
-		// read back through GL: both must see identical bytes of the same
-		// frozen copy (the blit decoupled it from the live desktop).
+		// Pull the first row through CUDA and CRC it against the same
+		// row read back through GL: both must see identical bytes of
+		// the same frozen copy (the blit decoupled it from the live
+		// desktop).
 		uint32_t row_bytes = frame.width * 4;
 		uint8_t *cuda_row = malloc(row_bytes);
 		uint8_t *gl_row = malloc(row_bytes);
 		if (!cuda_row || !gl_row) {
+			fprintf(stderr, "FAIL: out of memory for row buffers\n");
 			free(cuda_row);
 			free(gl_row);
 			cuGraphicsUnmapResources(1, &res, 0);
 			cuGraphicsUnregisterResource(res);
-			cuCtxDestroy(cuctx);
-			goto out_egl;
+			st.cuda_reg = ST_FAIL;
+			goto out;
 		}
 
 		CUDA_MEMCPY2D cp;
@@ -618,8 +793,8 @@ int main(int argc, char **argv)
 			free(gl_row);
 			cuGraphicsUnmapResources(1, &res, 0);
 			cuGraphicsUnregisterResource(res);
-			cuCtxDestroy(cuctx);
-			goto out_egl;
+			st.cuda_reg = ST_FAIL;
+			goto out;
 		}
 
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, draw_fbo);
@@ -632,33 +807,113 @@ int main(int argc, char **argv)
 
 		cuGraphicsUnmapResources(1, &res, 0);
 		cuGraphicsUnregisterResource(res);
-		cuCtxDestroy(cuctx);
 
 		printf("PASS: CUDA mapped the converter output (GL interop)\n");
+		st.cuda_reg = ST_PASS;
 		if (cuda_crc == glrow_crc)
-			printf("PASS: CUDA row matches GL row (crc32 0x%08x) — data is intact\n",
+			printf("PASS: CUDA row matches GL row (crc32 0x%08x), data is intact\n",
 			       cuda_crc);
 		else
 			printf("WARN: CUDA/GL row crc mismatch (0x%08x vs 0x%08x)\n",
 			       cuda_crc, glrow_crc);
 	}
-cuda_done:
+cuda_done:;
 #else
 	(void) do_cuda;
-	printf("INFO: built without CUDA support (make HAVE_CUDA=1)\n");
+	printf("INFO: built without CUDA support (make HAVE_CUDA=1), CUDA stage skipped\n");
+	st.cuda_reg = ST_SKIPPED;
 #endif
 
-	printf("\nRESULT: NVENC-style import chain OK "
-	       "(DMA-BUF -> EGL -> GL converter -> CUDA)\n");
-	ret = 0;
+out:
+	// The verdict must never be lost to a driver teardown quirk: print and
+	// flush it before any EGL/GL/CUDA cleanup runs.
+	printf("\nstage summary:\n");
+	printf("  frame acquisition:   %s\n", stage_name(st.acquire));
+	printf("  fence wait:          %s\n", stage_name(st.fence));
+	printf("  CPU reference read:  %s\n", stage_name(st.cpu_ref));
+	printf("  EGL import:          %s\n", stage_name(st.egl_import));
+	printf("  OpenGL validation:   %s\n", stage_name(st.gl_validate));
+	printf("  CUDA registration:   %s\n", stage_name(st.cuda_reg));
 
-out_egl:
+	bool any_fail = st.acquire == ST_FAIL || st.fence == ST_FAIL ||
+			st.cpu_ref == ST_FAIL || st.egl_import == ST_FAIL ||
+			st.gl_validate == ST_FAIL || st.cuda_reg == ST_FAIL;
+	bool complete = st.acquire == ST_PASS &&
+			(st.fence == ST_PASS || st.fence == ST_NOT_PROVIDED) &&
+			st.cpu_ref == ST_PASS &&
+			st.egl_import == ST_PASS &&
+			st.gl_validate == ST_PASS &&
+			st.cuda_reg == ST_PASS;
+
+	if (any_fail) {
+		printf("RESULT: FAIL, the chain is broken at the first failed stage above\n");
+		ret = 1;
+	} else if (complete) {
+		printf("RESULT: PASS, complete NVENC-style import chain "
+		       "(DMA-BUF -> EGL -> GL converter -> CUDA)\n");
+		ret = 0;
+	} else {
+		printf("RESULT: INCOMPLETE, no failures but skipped stages keep the "
+		       "chain unvalidated\n");
+		ret = 2;
+	}
+	fflush(stdout);
+
+#ifdef HAVE_CUDA
+	// NVIDIA (observed on 595.xx) segfaults inside the driver when the last
+	// GPU-side reference to an imported system-memory DMA-BUF is released
+	// after CUDA/GL interop touched it in the same process: whichever of
+	// eglDestroyImage, the texture delete or eglTerminate happens to drop
+	// that reference last crashes, in every ordering. Without the CUDA
+	// stage the full teardown below runs clean on the same driver. Close
+	// the kernel-side fds ourselves and leave the GPU object teardown to
+	// process cleanup, via _exit so driver atexit handlers cannot crash
+	// either. This keeps the exit code deterministic, which matters more
+	// for a diagnostic tool than freeing GPU handles a millisecond before
+	// the process ends.
+	if (cuda_interop_ran) {
+		fprintf(stderr, "INFO: skipping GPU object teardown after CUDA interop "
+				"(NVIDIA driver workaround)\n");
+		close_frame_fds(&frame);
+		if (hermes_fd >= 0)
+			close(hermes_fd);
+		_exit(ret);
+	}
+#endif
+
 	// Unbind before teardown: terminating the display while a context is
 	// still current crashes some drivers during process exit.
-	eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-	eglTerminate(dpy);
-out_frame:
+	if (egl_initialized) {
+		if (image != EGL_NO_IMAGE)
+			eglDestroyImage(dpy, image);
+		if (draw_fbo || fbo) {
+			GLuint fbos[2] = {fbo, draw_fbo};
+			glDeleteFramebuffers(2, fbos);
+		}
+		if (tex || conv) {
+			GLuint texs[2] = {tex, conv};
+			glDeleteTextures(2, texs);
+		}
+		eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+		if (ctx != EGL_NO_CONTEXT)
+			eglDestroyContext(dpy, ctx);
+		eglTerminate(dpy);
+	}
+	if (gbm)
+		gbm_device_destroy(gbm);
+	if (gpu_fd >= 0)
+		close(gpu_fd);
 	close_frame_fds(&frame);
-	close(hermes_fd);
+	if (hermes_fd >= 0)
+		close(hermes_fd);
+#ifdef HAVE_CUDA
+	// Released only now, after the EGL/GL teardown: see the retain comment
+	// in the CUDA stage.
+	if (cuda_ctx_retained) {
+		cuCtxSetCurrent(NULL);
+		cuDevicePrimaryCtxRelease(cuda_dev);
+	}
+#endif
+
 	return ret;
 }
