@@ -42,7 +42,14 @@ behind the GL context (`--gpu`), not blindly device 0, and context handling
 uses the primary-context API, which keeps the same signature across CUDA
 11/12/13 (the unversioned `cuCtxCreate` does not).
 
-Build:
+Build (from the repository root, together with the other tools):
+
+```bash
+make tools                # CUDA stage compiled out
+make tools HAVE_CUDA=1    # with the CUDA stage (needs cuda.h/cudaGL.h, libcuda)
+```
+
+Or standalone:
 
 ```bash
 cc -O2 -Wall -DHAVE_CUDA -I ../../include/uapi -I/usr/include/libdrm \
