@@ -23,6 +23,24 @@ CFLAGS ?= -O2 -g -Wall -Wextra
 UAPI_CFLAGS := -I$(PWD)/include/uapi
 IMPORT_CHECK_CFLAGS := $(shell pkg-config --cflags libva libva-drm libdrm 2>/dev/null)
 IMPORT_CHECK_LIBS := $(shell pkg-config --libs libva libva-drm libdrm 2>/dev/null)
+EGL_CHECK_CFLAGS := $(shell pkg-config --cflags libdrm gbm egl gl 2>/dev/null)
+EGL_CHECK_LIBS := $(shell pkg-config --libs libdrm gbm egl gl 2>/dev/null)
+
+# The CUDA stage of the EGL checker is opt-in: the tool compiles the stage out
+# when HAVE_CUDA is not set, so hosts without the CUDA toolkit still build the
+# full tools target. Enable with `make tools HAVE_CUDA=1` (needs cuda.h,
+# cudaGL.h and libcuda; override CUDA_CFLAGS/CUDA_LIBS for non-default
+# toolkit locations).
+HAVE_CUDA ?= 0
+CUDA_CFLAGS ?=
+CUDA_LIBS ?= -lcuda
+ifeq ($(HAVE_CUDA),1)
+EGL_CHECK_CUDA_CFLAGS := -DHAVE_CUDA $(CUDA_CFLAGS)
+EGL_CHECK_CUDA_LIBS := $(CUDA_LIBS)
+else
+EGL_CHECK_CUDA_CFLAGS :=
+EGL_CHECK_CUDA_LIBS :=
+endif
 UDEV_RULE_DIR ?= /etc/udev/rules.d
 SYSTEM_UDEV_RULE_DIR ?= /usr/lib/udev/rules.d
 
@@ -100,7 +118,8 @@ install-configs:
 	install -Dm0644 packaging/systemd/hermes-kms-seatd@.service \
 		$(DESTDIR)/usr/lib/systemd/system/hermes-kms-seatd@.service
 
-tools: tools/hermes-kmsctl/hermes-kmsctl tools/hermes-kms-import-check/hermes-kms-import-check
+tools: tools/hermes-kmsctl/hermes-kmsctl tools/hermes-kms-import-check/hermes-kms-import-check \
+	tools/hermes-egl-import-check/hermes-egl-import-check tools/hermes-egl-import-check/pitch-detect
 
 tools/hermes-kmsctl/hermes-kmsctl: tools/hermes-kmsctl/hermes_kmsctl.c include/uapi/drm/hermes_kms_drm.h
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) -o $@ $<
@@ -108,6 +127,14 @@ tools/hermes-kmsctl/hermes-kmsctl: tools/hermes-kmsctl/hermes_kmsctl.c include/u
 tools/hermes-kms-import-check/hermes-kms-import-check: tools/hermes-kms-import-check/hermes_kms_import_check.c include/uapi/drm/hermes_kms_drm.h
 	@test -n "$(IMPORT_CHECK_LIBS)" || { printf 'missing libva/libva-drm/libdrm pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(IMPORT_CHECK_CFLAGS) -o $@ $< $(IMPORT_CHECK_LIBS)
+
+tools/hermes-egl-import-check/hermes-egl-import-check: tools/hermes-egl-import-check/hermes_egl_import_check.c include/uapi/drm/hermes_kms_drm.h
+	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }
+	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(EGL_CHECK_CFLAGS) $(EGL_CHECK_CUDA_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS) $(EGL_CHECK_CUDA_LIBS)
+
+tools/hermes-egl-import-check/pitch-detect: tools/hermes-egl-import-check/pitch_detect.c include/uapi/drm/hermes_kms_drm.h
+	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }
+	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(EGL_CHECK_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS)
 
 install-runtime-udev:
 	install -Dm0644 udev/70-hermes-kms-session-seats.rules \
@@ -148,3 +175,5 @@ clean:
 	$(MAKE) -C $(KDIR) M=$(PWD)/kernel/hermes-kms $(LLVM_FLAG) clean
 	$(RM) tools/hermes-kmsctl/hermes-kmsctl
 	$(RM) tools/hermes-kms-import-check/hermes-kms-import-check
+	$(RM) tools/hermes-egl-import-check/hermes-egl-import-check
+	$(RM) tools/hermes-egl-import-check/pitch-detect

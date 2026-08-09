@@ -15,3 +15,5 @@ modules.builtin
 modules.order
 tools/hermes-kmsctl/hermes-kmsctl
 tools/hermes-kms-import-check/hermes-kms-import-check
+tools/hermes-egl-import-check/hermes-egl-import-check
+tools/hermes-egl-import-check/pitch-detect
