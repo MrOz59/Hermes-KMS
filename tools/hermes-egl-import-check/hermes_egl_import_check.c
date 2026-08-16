@@ -22,6 +22,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -320,6 +322,60 @@ static enum stage_result wait_frame_fence(const struct drm_hermes_kms_acquire_fr
 
 // CPU ground truth: mmap plane 0 and CRC a few rows so the GPU readback can be
 // compared against what is actually in the buffer.
+/*
+ * A GPU driver that reads past the end of an imported DMA-BUF faults inside
+ * libgallium, not in an API return code, and the process dies before any of
+ * the stage summary is printed - which is useless for a diagnostic tool people
+ * are asked to run. Catch the fault, report it as a failed stage, and stop.
+ *
+ * Longjmping out of a driver call leaves the GL context unusable, so anything
+ * after a caught fault is abandoned rather than continued.
+ */
+static sigjmp_buf fault_jmp;
+static volatile sig_atomic_t fault_armed;
+
+static void fault_handler(int sig)
+{
+	if (fault_armed) {
+		fault_armed = 0;
+		siglongjmp(fault_jmp, sig);
+	}
+	_exit(128 + sig);
+}
+
+/*
+ * Keep sigsetjmp inside its own frame: a jump buffer established in main()
+ * makes every live local there indeterminate after a longjmp, which the
+ * compiler rightly warns about. Here the only locals are the saved handlers.
+ */
+static bool guarded_readback(uint32_t width, uint32_t rows, uint8_t *pixels,
+			     int *fault_sig)
+{
+	struct sigaction fault_sa, old_bus, old_segv;
+	int sig;
+
+	memset(&fault_sa, 0, sizeof(fault_sa));
+	fault_sa.sa_handler = fault_handler;
+	sigemptyset(&fault_sa.sa_mask);
+	sigaction(SIGBUS, &fault_sa, &old_bus);
+	sigaction(SIGSEGV, &fault_sa, &old_segv);
+
+	sig = sigsetjmp(fault_jmp, 1);
+	if (sig == 0) {
+		fault_armed = 1;
+		glPixelStorei(GL_PACK_ALIGNMENT, 1);
+		glReadPixels(0, 0, width, rows, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+		glFinish();
+		fault_armed = 0;
+	}
+
+	sigaction(SIGBUS, &old_bus, NULL);
+	sigaction(SIGSEGV, &old_segv, NULL);
+
+	*fault_sig = sig;
+	return sig == 0;
+}
+
 static uint32_t crc32_simple(const uint8_t *data, size_t len, uint32_t crc)
 {
 	crc = ~crc;
@@ -432,6 +488,25 @@ int main(int argc, char **argv)
 	       frame.format & 0xff, (frame.format >> 8) & 0xff,
 	       (frame.format >> 16) & 0xff, (frame.format >> 24) & 0xff,
 	       (unsigned long long) frame.modifier, frame.plane_count, frame.pitch[0]);
+
+	/*
+	 * How much memory actually backs plane 0, against the minimum the
+	 * advertised geometry needs. A GPU importer may round the height up for
+	 * its own layout and read past a buffer that only covers pitch x height,
+	 * which faults inside the driver rather than failing an API call - so
+	 * report the headroom before anything tries to sample it.
+	 */
+	off_t plane0_size = lseek(frame.dma_buf_fd[0], 0, SEEK_END);
+	if (plane0_size > 0) {
+		unsigned long long need =
+			(unsigned long long) frame.pitch[0] * frame.height;
+		printf("plane 0 dma-buf: %lld bytes; pitch x height = %llu; spare = %lld bytes (%.1f rows)\n",
+		       (long long) plane0_size, need,
+		       (long long) plane0_size - (long long) need,
+		       frame.pitch[0] ?
+			       ((double) plane0_size - (double) need) / frame.pitch[0] :
+			       0.0);
+	}
 
 	// --- 2. Wait for the producer's write fence -----------------------------
 	st.fence = wait_frame_fence(&frame, (int) wait_ms);
@@ -624,8 +699,20 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	glPixelStorei(GL_PACK_ALIGNMENT, 1);
-	glReadPixels(0, 0, frame.width, rows, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+	int fault_sig = 0;
+	if (!guarded_readback(frame.width, rows, pixels, &fault_sig)) {
+		fprintf(stderr,
+			"FAIL: readback of the imported texture faulted (SIG%s) inside the GPU driver.\n"
+			"      The importer read outside the exported DMA-BUF. Compare the\n"
+			"      \"plane 0 dma-buf\" line above with the geometry it was given:\n"
+			"      a buffer covering only pitch x height leaves nothing for an\n"
+			"      importer that rounds the height up for its own layout.\n",
+			fault_sig == SIGBUS ? "BUS" : "SEGV");
+		free(pixels);
+		st.gl_validate = ST_FAIL;
+		goto out;
+	}
+
 	err = glGetError();
 	if (err != GL_NO_ERROR) {
 		fprintf(stderr, "FAIL: glReadPixels from imported texture error=0x%x\n", err);
