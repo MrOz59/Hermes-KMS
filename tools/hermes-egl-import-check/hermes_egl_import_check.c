@@ -702,11 +702,16 @@ int main(int argc, char **argv)
 	int fault_sig = 0;
 	if (!guarded_readback(frame.width, rows, pixels, &fault_sig)) {
 		fprintf(stderr,
-			"FAIL: readback of the imported texture faulted (SIG%s) inside the GPU driver.\n"
-			"      The importer read outside the exported DMA-BUF. Compare the\n"
-			"      \"plane 0 dma-buf\" line above with the geometry it was given:\n"
-			"      a buffer covering only pitch x height leaves nothing for an\n"
-			"      importer that rounds the height up for its own layout.\n",
+			"FAIL: CPU readback of the imported texture faulted (SIG%s) inside the\n"
+			"      GPU driver, on the first byte of its own mapping of the imported\n"
+			"      buffer - the importing driver could not back a CPU mapping of a\n"
+			"      DMA-BUF owned by another driver. This is a limitation of reading\n"
+			"      an imported buffer with the CPU, not evidence that the buffer is\n"
+			"      wrong: the size and stride reported above may be perfectly valid.\n"
+			"\n"
+			"      Hermes never does this. It samples the imported texture on the\n"
+			"      GPU into its own textures and encodes from those, so this stage\n"
+			"      failing does not by itself mean the encode path is broken.\n",
 			fault_sig == SIGBUS ? "BUS" : "SEGV");
 		free(pixels);
 		st.gl_validate = ST_FAIL;
