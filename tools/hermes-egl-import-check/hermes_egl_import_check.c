@@ -348,6 +348,49 @@ static void fault_handler(int sig)
  * makes every live local there indeterminate after a longjmp, which the
  * compiler rightly warns about. Here the only locals are the saved handlers.
  */
+static uint32_t crc32_simple(const uint8_t *data, size_t len, uint32_t crc);
+
+/* noinline: inlining this back into the sigsetjmp frame would make its
+ * locals indeterminate after a longjmp. */
+__attribute__((noinline))
+static uint32_t crc_rows_raw(const uint8_t *base, uint32_t rows, uint32_t height,
+			     uint32_t pitch, uint32_t row_bytes)
+{
+	uint32_t crc = 0;
+
+	for (uint32_t y = 0; y < rows && y < height; y++)
+		crc = crc32_simple(base + (size_t) y * pitch, row_bytes, crc);
+	return crc;
+}
+
+/* Same guard as the readback: a DMA-BUF whose pages the CPU cannot fault in
+ * kills the process on first touch, which loses every verdict printed so far. */
+static bool guarded_crc(const uint8_t *base, uint32_t rows, uint32_t height,
+			uint32_t pitch, uint32_t row_bytes, uint32_t *crc_out,
+			int *fault_sig)
+{
+	struct sigaction fault_sa, old_bus, old_segv;
+	int sig;
+
+	memset(&fault_sa, 0, sizeof(fault_sa));
+	fault_sa.sa_handler = fault_handler;
+	sigemptyset(&fault_sa.sa_mask);
+	sigaction(SIGBUS, &fault_sa, &old_bus);
+	sigaction(SIGSEGV, &fault_sa, &old_segv);
+
+	sig = sigsetjmp(fault_jmp, 1);
+	if (sig == 0) {
+		fault_armed = 1;
+		*crc_out = crc_rows_raw(base, rows, height, pitch, row_bytes);
+		fault_armed = 0;
+	}
+
+	sigaction(SIGBUS, &old_bus, NULL);
+	sigaction(SIGSEGV, &old_segv, NULL);
+	*fault_sig = sig;
+	return sig == 0;
+}
+
 static bool guarded_readback(uint32_t width, uint32_t rows, uint8_t *pixels,
 			     int *fault_sig)
 {
@@ -388,9 +431,11 @@ static uint32_t crc32_simple(const uint8_t *data, size_t len, uint32_t crc)
 }
 
 static bool cpu_crc_rows(const struct drm_hermes_kms_acquire_frame *frame,
-			 uint32_t rows, uint32_t *crc_out)
+			 uint32_t rows, uint32_t *crc_out, int *fault_sig)
 {
 	size_t map_len = (size_t) frame->pitch[0] * frame->height + frame->offset[0];
+
+	*fault_sig = 0;
 	void *map = mmap(NULL, map_len, PROT_READ, MAP_SHARED, frame->dma_buf_fd[0], 0);
 
 	if (map == MAP_FAILED)
@@ -408,8 +453,12 @@ static bool cpu_crc_rows(const struct drm_hermes_kms_acquire_frame *frame,
 	const uint8_t *base = (const uint8_t *) map + frame->offset[0];
 	uint32_t row_bytes = frame->width * 4;
 
-	for (uint32_t y = 0; y < rows && y < frame->height; y++)
-		crc = crc32_simple(base + (size_t) y * frame->pitch[0], row_bytes, crc);
+	if (!guarded_crc(base, rows, frame->height, frame->pitch[0], row_bytes,
+			 &crc, fault_sig)) {
+		// The mapping exists but its pages cannot be faulted in. Leave it
+		// mapped: unmapping is not worth another fault on the way out.
+		return false;
+	}
 
 	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
 	ioctl(frame->dma_buf_fd[0], DMA_BUF_IOCTL_SYNC, &sync);
@@ -514,10 +563,16 @@ int main(int argc, char **argv)
 		goto out;
 
 	uint32_t cpu_crc = 0;
-	bool have_cpu_crc = cpu_crc_rows(&frame, 8, &cpu_crc);
+	int cpu_fault = 0;
+	bool have_cpu_crc = cpu_crc_rows(&frame, 8, &cpu_crc, &cpu_fault);
 	if (have_cpu_crc) {
 		printf("PASS: CPU mmap of plane 0 (crc32 of first 8 rows: 0x%08x)\n", cpu_crc);
 		st.cpu_ref = ST_PASS;
+	} else if (cpu_fault) {
+		printf("FAIL: reading the mapped DMA-BUF faulted (SIG%s) on the exporter's\n"
+		       "      own mapping - the buffer's pages could not be faulted in.\n",
+		       cpu_fault == SIGBUS ? "BUS" : "SEGV");
+		st.cpu_ref = ST_FAIL;
 	} else {
 		printf("INFO: CPU mmap not supported by exporter, no CPU reference available\n");
 		st.cpu_ref = ST_SKIPPED;
