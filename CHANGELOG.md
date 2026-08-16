@@ -26,6 +26,23 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- A stale `/etc/modprobe.d/hermes-kms.conf` no longer silently keeps virtual
+  outputs connected at boot. The package installs its default to
+  `/usr/lib/modprobe.d/hermes-kms.conf`, but `/etc/modprobe.d` overrides
+  `/usr/lib/modprobe.d`, so an `initial_enabled=1` written there by an older
+  package — or by hand, following older setup instructions — masks the shipped
+  `initial_enabled=0`, and no upgrade can undo it because the package does not
+  own that file. A connector then comes up connected before Hermes owns it and
+  the compositor extends the desktop onto a virtual output nobody streams to,
+  which the user sees as a black screen in display settings.
+  - The package now reports the offending file on install and upgrade, with the
+    two ways to resolve it.
+  - The driver logs a `drm_warn` at probe when `initial_enabled` is set, naming
+    `/etc/modprobe.d` as the place to look, so the cause shows up in `dmesg`
+    instead of only in display settings.
+
 ## [0.3.1] - 2026-08-04
 
 ### Fixed

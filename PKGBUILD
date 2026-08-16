@@ -22,6 +22,8 @@ optdepends=('seatd: independent compositor sessions via private seat brokers'
             'kscreen: enable the virtual output on KDE/KWin')
 provides=('hermes-kms')
 conflicts=('hermes-kms')
+# Reports a stale /etc/modprobe.d override that masks the shipped default.
+install="${_pkgbase}.install"
 source=("git+https://github.com/MrOz59/Hermes-KMS.git")
 sha256sums=('SKIP')
 

@@ -2166,6 +2166,20 @@ static int hermes_kms_probe(struct platform_device *pdev)
 		 hdev->outputs[0].requested_width,
 		 hdev->outputs[0].requested_height,
 		 hdev->outputs[0].requested_refresh_hz);
+
+	/*
+	 * initial_enabled exists for driver development against modetest and
+	 * friends. Outside that, it hands a connected connector to whatever
+	 * compositor is running before Hermes can own it: the desktop extends
+	 * onto a virtual output nobody streams to and the user sees a black
+	 * screen. It usually arrives from a stale
+	 * /etc/modprobe.d/hermes-kms.conf, which overrides the disconnected
+	 * default this driver ships, so say where to look.
+	 */
+	if (initial_enabled)
+		drm_warn(drm,
+			 "initial_enabled=1 connects a virtual output with no owner; a compositor may extend the desktop onto it. Check /etc/modprobe.d for an override of the packaged initial_enabled=0 default.\n");
+
 	return 0;
 }
 
