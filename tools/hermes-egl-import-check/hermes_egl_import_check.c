@@ -107,7 +107,8 @@ struct stage_results {
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-		"Usage: %s [--device /dev/dri/cardN] [--gpu /dev/dri/renderDN] [--wait-ms MS] [--no-cuda]\n"
+		"Usage: %s [--device /dev/dri/cardN] [--gpu /dev/dri/renderDN] [--wait-ms MS]\n"
+		"       [--no-cuda] [--no-cpu-ref]\n"
 		"Exit codes: 0 = complete chain passed, 1 = a stage failed,\n"
 		"            2 = no failures but the chain is incomplete (stages skipped)\n",
 		argv0);
@@ -444,6 +445,24 @@ static bool cpu_crc_rows(const struct drm_hermes_kms_acquire_frame *frame,
 	// CPU access to a DMA-BUF mapping must be bracketed with the sync
 	// ioctl; this read is the reference every later stage is compared
 	// against, so an unsynchronized read here would poison all verdicts.
+	/*
+	 * Taking CPU access on a buffer the compositor is still scanning out can
+	 * block indefinitely, and on at least one host it wedged the whole
+	 * desktop instead of returning. Poll for read readiness first and give
+	 * up rather than hang - this stage only produces a reference CRC, and is
+	 * something Hermes itself never does.
+	 */
+	struct pollfd pfd;
+
+	memset(&pfd, 0, sizeof(pfd));
+	pfd.fd = frame->dma_buf_fd[0];
+	pfd.events = POLLIN;
+	if (poll(&pfd, 1, 2000) <= 0) {
+		munmap(map, map_len);
+		*fault_sig = -1;
+		return false;
+	}
+
 	struct dma_buf_sync sync;
 	memset(&sync, 0, sizeof(sync));
 	sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
@@ -474,6 +493,7 @@ int main(int argc, char **argv)
 	const char *gpu_path = NULL;
 	uint32_t wait_ms = 2000;
 	bool do_cuda = true;
+	bool do_cpu_ref = true;
 	int ret = 1;
 
 	struct stage_results st;
@@ -504,6 +524,8 @@ int main(int argc, char **argv)
 			gpu_path = argv[++i];
 		} else if (strcmp(argv[i], "--wait-ms") == 0 && i + 1 < argc) {
 			wait_ms = (uint32_t) strtoul(argv[++i], NULL, 0);
+		} else if (strcmp(argv[i], "--no-cpu-ref") == 0) {
+			do_cpu_ref = false;
 		} else if (strcmp(argv[i], "--no-cuda") == 0) {
 			do_cuda = false;
 		} else {
@@ -564,8 +586,19 @@ int main(int argc, char **argv)
 
 	uint32_t cpu_crc = 0;
 	int cpu_fault = 0;
-	bool have_cpu_crc = cpu_crc_rows(&frame, 8, &cpu_crc, &cpu_fault);
-	if (have_cpu_crc) {
+	bool have_cpu_crc = false;
+
+	if (!do_cpu_ref) {
+		printf("INFO: CPU reference read skipped (--no-cpu-ref)\n");
+		st.cpu_ref = ST_SKIPPED;
+	} else if ((have_cpu_crc = cpu_crc_rows(&frame, 8, &cpu_crc, &cpu_fault)),
+		   cpu_fault == -1) {
+		printf("FAIL: the DMA-BUF never became readable for the CPU within 2s -\n"
+		       "      something still holds it for writing. Re-run with --no-cpu-ref\n"
+		       "      to skip this stage and reach the EGL import; Hermes never\n"
+		       "      performs this read.\n");
+		st.cpu_ref = ST_FAIL;
+	} else if (have_cpu_crc) {
 		printf("PASS: CPU mmap of plane 0 (crc32 of first 8 rows: 0x%08x)\n", cpu_crc);
 		st.cpu_ref = ST_PASS;
 	} else if (cpu_fault) {
