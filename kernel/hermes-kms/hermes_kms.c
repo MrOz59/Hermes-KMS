@@ -1899,16 +1899,43 @@ static void hermes_kms_debugfs_init(struct drm_minor *minor)
  * width unchanged while padding each backing row so every advertised mode can
  * be imported by the encoding GPU, not only widths that happen to align.
  */
+#define HERMES_KMS_PITCH_ALIGN 256
+
+/*
+ * Importers also recompute the surface layout from the geometry and refuse a
+ * buffer that is smaller than that layout needs, rather than reading past its
+ * end. radeonsi does exactly this: si_texture_from_winsys_buffer() rejects the
+ * import when surface.total_size exceeds the buffer, and total_size is derived
+ * from a *padded* height (ac_surface.c computes
+ * surf_slice_size = pitch * surf_height * bpe). A buffer covering only
+ * pitch x height therefore imports on hardware that pads by nothing and is
+ * rejected on hardware that pads, which is invisible for the common
+ * resolutions because their heights are already aligned - 1080, 720 and 1440
+ * all are - and shows up on something like 1600x1068.
+ *
+ * Pad the backing height so the slack is always there. 16 rows covers the
+ * alignments importers are known to apply and costs at most 15 rows of
+ * padding: 230 KiB on a 4K buffer, nothing on the resolutions that were
+ * already aligned. The visible height is untouched; only the allocation grows.
+ */
+#define HERMES_KMS_IMPORT_HEIGHT_ALIGN 16
+
 static int hermes_kms_dumb_create(struct drm_file *file,
 				  struct drm_device *drm,
 				  struct drm_mode_create_dumb *args)
 {
 	struct drm_gem_shmem_object *shmem;
+	u64 padded_size;
 	int ret;
 
-	ret = drm_mode_size_dumb(drm, args, 256, 0);
+	ret = drm_mode_size_dumb(drm, args, HERMES_KMS_PITCH_ALIGN, 0);
 	if (ret)
 		return ret;
+
+	padded_size = (u64)args->pitch *
+		      ALIGN(args->height, HERMES_KMS_IMPORT_HEIGHT_ALIGN);
+	if (padded_size > args->size)
+		args->size = ALIGN(padded_size, PAGE_SIZE);
 
 	shmem = drm_gem_shmem_create(drm, args->size);
 	if (IS_ERR(shmem))

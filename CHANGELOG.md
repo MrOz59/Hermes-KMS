@@ -28,6 +28,21 @@ subject to change between minor releases.
 
 ### Fixed
 
+- Buffers are no longer refused by GPUs that pad a linear surface's height.
+  An importer recomputes the surface layout from the geometry and rejects a
+  buffer smaller than that layout needs rather than reading past its end —
+  radeonsi does this in `si_texture_from_winsys_buffer()`, comparing the
+  buffer against `surface.total_size`, which `ac_surface.c` derives from a
+  padded height (`surf_slice_size = pitch * surf_height * bpe`). The dumb
+  buffer covered only `pitch x height` rounded to a page, so it imported on
+  hardware that pads by nothing and was rejected on hardware that pads.
+  This stayed invisible because the common resolutions have heights that are
+  already aligned — 720, 1080 and 1440 all are — and surfaced on an unusual
+  one: a client at 1600x1068 fell 24576 bytes short.
+  - The backing height is now padded to 16 rows. The visible height is
+    untouched and only the allocation grows, by at most 15 rows: 60 KiB at
+    1080p, 230 KiB on a 4K buffer, and nothing at all for the resolutions
+    that were already aligned.
 - A stale `/etc/modprobe.d/hermes-kms.conf` no longer silently keeps virtual
   outputs connected at boot. The package installs its default to
   `/usr/lib/modprobe.d/hermes-kms.conf`, but `/etc/modprobe.d` overrides
