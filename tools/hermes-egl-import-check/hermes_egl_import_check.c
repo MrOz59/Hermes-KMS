@@ -392,6 +392,55 @@ static bool guarded_crc(const uint8_t *base, uint32_t rows, uint32_t height,
 	return sig == 0;
 }
 
+
+/*
+ * When an import is refused, ask the same GPU what it would allocate for that
+ * geometry itself. A driver that needs more than the exporter provided rejects
+ * the import rather than reading past the end, so the two numbers side by side
+ * turn a bare EGL error code into something actionable.
+ */
+static void report_native_allocation(struct gbm_device *gbm, uint32_t width,
+				     uint32_t height, uint32_t format,
+				     uint32_t their_pitch, long long their_size)
+{
+	struct gbm_bo *bo;
+	int fd;
+	long long size;
+	uint32_t stride;
+
+	if (!gbm)
+		return;
+
+	bo = gbm_bo_create(gbm, width, height, format,
+			   GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+	if (!bo) {
+		printf("INFO: this GPU cannot allocate %ux%u linear in that format either\n",
+		       width, height);
+		return;
+	}
+
+	stride = gbm_bo_get_stride(bo);
+	fd = gbm_bo_get_fd(bo);
+	size = (fd >= 0) ? (long long) lseek(fd, 0, SEEK_END) : -1;
+	if (fd >= 0)
+		close(fd);
+	gbm_bo_destroy(bo);
+
+	if (size < 0) {
+		printf("INFO: this GPU allocates stride=%u for %ux%u linear (size unknown)\n",
+		       stride, width, height);
+		return;
+	}
+
+	printf("INFO: for %ux%u linear this GPU allocates stride=%u size=%lld;\n"
+	       "      the imported buffer has stride=%u size=%lld (%+lld)\n",
+	       width, height, stride, size, their_pitch, their_size,
+	       their_size - size);
+	if (size > their_size)
+		printf("INFO: the GPU wants MORE than the exporter provided - a short\n"
+		       "      buffer is a plausible reason for the import to be refused\n");
+}
+
 static bool guarded_readback(uint32_t width, uint32_t rows, uint8_t *pixels,
 			     int *fault_sig)
 {
@@ -716,6 +765,9 @@ int main(int argc, char **argv)
 		fprintf(stderr, "FAIL: eglCreateImage(EGL_LINUX_DMA_BUF_EXT) error=0x%x\n",
 			eglGetError());
 		fprintf(stderr, "      -> this GPU/driver refuses to import the Hermes DMA-BUF\n");
+		fflush(stderr);
+		report_native_allocation(gbm, frame.width, frame.height, frame.format,
+					 frame.pitch[0], plane0_size);
 		st.egl_import = ST_FAIL;
 		goto out;
 	}
