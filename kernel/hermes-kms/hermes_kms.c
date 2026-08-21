@@ -1376,9 +1376,32 @@ hermes_kms_get_plane_dmabuf_locked(struct hermes_kms_output *output,
 		return output->export_dmabuf[index];
 	}
 
-	dmabuf = drm_gem_prime_export(obj, O_RDWR);
-	if (IS_ERR(dmabuf))
-		return dmabuf;
+	/*
+	 * The scanout object is not always one we allocated. A compositor that
+	 * renders on the real GPU can import that buffer into this device and
+	 * scan out of it directly, in which case gem_prime_import gives us a
+	 * shmem object with no shmem file behind it: import_attach is set and
+	 * obj->filp is NULL.
+	 *
+	 * Re-exporting such an object with drm_gem_prime_export() hands the
+	 * consumer a dma_buf whose pages cannot be pinned. The importing driver
+	 * discovers this only once it attaches - drm_gem_map_attach() ->
+	 * drm_gem_shmem_pin_locked() warns on drm_gem_is_imported(), then
+	 * drm_gem_get_pages() rejects the missing filp with -EINVAL - and the
+	 * failure surfaces far away as EGL_BAD_ALLOC out of eglCreateImage().
+	 *
+	 * Hand back the dma_buf it was imported from instead. That is the
+	 * buffer the GPU already understands, and the consumer imports it the
+	 * same way the compositor did.
+	 */
+	if (obj->import_attach) {
+		dmabuf = obj->import_attach->dmabuf;
+		get_dma_buf(dmabuf);
+	} else {
+		dmabuf = drm_gem_prime_export(obj, O_RDWR);
+		if (IS_ERR(dmabuf))
+			return dmabuf;
+	}
 
 	/* Replace the cache entry; the cache holds one reference. */
 	if (output->export_dmabuf[index])

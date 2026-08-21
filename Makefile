@@ -120,7 +120,8 @@ install-configs:
 
 tools: tools/hermes-kmsctl/hermes-kmsctl tools/hermes-kms-import-check/hermes-kms-import-check \
 	tools/hermes-egl-import-check/hermes-egl-import-check tools/hermes-egl-import-check/pitch-detect \
-	tools/hermes-sysmem-import-check/hermes-sysmem-import-check
+	tools/hermes-sysmem-import-check/hermes-sysmem-import-check \
+	tools/hermes-imported-scanout-test/hermes-imported-scanout-test
 
 tools/hermes-kmsctl/hermes-kmsctl: tools/hermes-kmsctl/hermes_kmsctl.c include/uapi/drm/hermes_kms_drm.h
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) -o $@ $<
@@ -132,6 +133,10 @@ tools/hermes-kms-import-check/hermes-kms-import-check: tools/hermes-kms-import-c
 tools/hermes-egl-import-check/hermes-egl-import-check: tools/hermes-egl-import-check/hermes_egl_import_check.c include/uapi/drm/hermes_kms_drm.h
 	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(EGL_CHECK_CFLAGS) $(EGL_CHECK_CUDA_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS) $(EGL_CHECK_CUDA_LIBS)
+
+tools/hermes-imported-scanout-test/hermes-imported-scanout-test: tools/hermes-imported-scanout-test/hermes_imported_scanout_test.c include/uapi/drm/hermes_kms_drm.h
+	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm pkg-config metadata\n' >&2; exit 1; }
+	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(EGL_CHECK_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS)
 
 tools/hermes-sysmem-import-check/hermes-sysmem-import-check: tools/hermes-sysmem-import-check/hermes_sysmem_import_check.c
 	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }

@@ -28,6 +28,24 @@ subject to change between minor releases.
 
 ### Fixed
 
+- Scanning out of a buffer the driver did not allocate no longer produces a
+  DMA-BUF the consumer cannot import. A compositor that renders on the real GPU
+  can import that buffer into this device and scan out of it directly rather
+  than drawing into a dumb buffer we allocated — Mutter does this where KWin
+  does not. `gem_prime_import` then hands us a shmem object with
+  `import_attach` set and no shmem file behind it, and `ACQUIRE_FRAME`
+  re-exported that object with `drm_gem_prime_export()`, producing a DMA-BUF
+  whose pages cannot be pinned.
+  - The consumer only discovered this on attach, far from the cause:
+    `drm_gem_map_attach()` → `drm_gem_shmem_pin_locked()` warns on
+    `drm_gem_is_imported()`, `drm_gem_get_pages()` rejects the NULL `filp` with
+    `-EINVAL`, and the user sees `EGL_BAD_ALLOC` out of `eglCreateImage()` — a
+    black stream with working audio and input (Hermes#22).
+  - An imported scanout object now hands back the DMA-BUF it was imported from,
+    which is the buffer the GPU already understands.
+  - `tools/hermes-imported-scanout-test` builds the situation without a GPU or
+    a compositor, using udmabuf, and reads the frame back. Before the fix it is
+    killed touching the returned buffer; after it, the data arrives intact.
 - Buffers are no longer refused by GPUs that pad a linear surface's height.
   An importer recomputes the surface layout from the geometry and rejects a
   buffer smaller than that layout needs rather than reading past its end —
