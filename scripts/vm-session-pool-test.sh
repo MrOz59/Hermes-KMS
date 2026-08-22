@@ -99,7 +99,22 @@ if printf '%s\n' "$host_properties" | grep -q '^ID_SEAT=hermes-kms-'; then
 	FAIL=1
 fi
 for index in 1 2; do
-	properties="$(udevadm info --query=property --name="${CARDS[$index]}")"
+	# The change event can race the udev database write under a loaded
+	# host: a query served from the db written before the event finished
+	# shows no ID_SEAT even though the rule matches. Poll briefly instead
+	# of reading once after a fixed sleep.
+	properties=
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		properties="$(udevadm info --query=property --name="${CARDS[$index]}")"
+		printf '%s\n' "$properties" | grep -q '^ID_SEAT=' && break
+		# The ruleset reload is asynchronous: a trigger fired right after
+		# --reload-rules can be processed against the previous rules, and
+		# udevadm info only reads the database. Re-fire the event and wait
+		# until the daemon stores the seat assignment.
+		udevadm trigger --subsystem-match=drm --action=change
+		udevadm settle
+		sleep 0.5
+	done
 	require_value "$properties" ID_SEAT "hermes-kms-$index"
 	wants="$(printf '%s\n' "$properties" |
 		awk -F= '$1 == "SYSTEMD_WANTS" { print $2; exit }')"
