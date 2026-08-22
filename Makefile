@@ -41,6 +41,8 @@ else
 EGL_CHECK_CUDA_CFLAGS :=
 EGL_CHECK_CUDA_LIBS :=
 endif
+CURSOR_PROBE_CFLAGS := $(shell pkg-config --cflags libdrm 2>/dev/null)
+CURSOR_PROBE_LIBS := $(shell pkg-config --libs libdrm 2>/dev/null)
 UDEV_RULE_DIR ?= /etc/udev/rules.d
 SYSTEM_UDEV_RULE_DIR ?= /usr/lib/udev/rules.d
 
@@ -121,7 +123,8 @@ install-configs:
 tools: tools/hermes-kmsctl/hermes-kmsctl tools/hermes-kms-import-check/hermes-kms-import-check \
 	tools/hermes-egl-import-check/hermes-egl-import-check tools/hermes-egl-import-check/pitch-detect \
 	tools/hermes-sysmem-import-check/hermes-sysmem-import-check \
-	tools/hermes-imported-scanout-test/hermes-imported-scanout-test
+	tools/hermes-imported-scanout-test/hermes-imported-scanout-test \
+	tools/hermes-pixel-peek/hermes_pixel_peek tools/hermes-cursor-probe/hermes_cursor_probe
 
 tools/hermes-kmsctl/hermes-kmsctl: tools/hermes-kmsctl/hermes_kmsctl.c include/uapi/drm/hermes_kms_drm.h
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) -o $@ $<
@@ -145,6 +148,12 @@ tools/hermes-sysmem-import-check/hermes-sysmem-import-check: tools/hermes-sysmem
 tools/hermes-egl-import-check/pitch-detect: tools/hermes-egl-import-check/pitch_detect.c include/uapi/drm/hermes_kms_drm.h
 	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(EGL_CHECK_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS)
+tools/hermes-pixel-peek/hermes_pixel_peek: tools/hermes-pixel-peek/hermes_pixel_peek.c include/uapi/drm/hermes_kms_drm.h
+	$(CC) $(CFLAGS) $(UAPI_CFLAGS) -o $@ $<
+
+tools/hermes-cursor-probe/hermes_cursor_probe: tools/hermes-cursor-probe/hermes_cursor_probe.c
+	@test -n "$(CURSOR_PROBE_LIBS)" || { printf 'missing libdrm pkg-config metadata\n' >&2; exit 1; }
+	$(CC) $(CFLAGS) $(CURSOR_PROBE_CFLAGS) -o $@ $< $(CURSOR_PROBE_LIBS)
 
 install-runtime-udev:
 	install -Dm0644 udev/70-hermes-kms-session-seats.rules \
@@ -187,3 +196,5 @@ clean:
 	$(RM) tools/hermes-kms-import-check/hermes-kms-import-check
 	$(RM) tools/hermes-egl-import-check/hermes-egl-import-check
 	$(RM) tools/hermes-egl-import-check/pitch-detect
+	$(RM) tools/hermes-pixel-peek/hermes_pixel_peek
+	$(RM) tools/hermes-cursor-probe/hermes_cursor_probe
