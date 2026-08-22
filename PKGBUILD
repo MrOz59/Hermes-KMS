@@ -8,7 +8,7 @@
 
 pkgname=hermes-kms-dkms-git
 _pkgbase=hermes-kms
-pkgver=0.3.1
+pkgver=0.3.2
 pkgrel=1
 pkgdesc="Hermes-KMS zero-copy virtual display DRM/KMS driver (DKMS)"
 arch=('x86_64')
