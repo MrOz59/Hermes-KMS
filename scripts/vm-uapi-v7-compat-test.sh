@@ -85,7 +85,7 @@ insmod "$KO" initial_enabled=0 hotplug_events=0 outputs=2
 sleep 0.5
 
 # These ioctl numbers and struct sizes must remain compatible.
-require_value "$("$OLD_CTL" version)" uapi_version 9
+require_value "$("$OLD_CTL" version)" uapi_version 10
 require_value "$("$OLD_CTL" identity)" output HERMES-1
 "$OLD_CTL" caps >/dev/null
 "$OLD_CTL" status >/dev/null
@@ -129,4 +129,4 @@ if [ "$FAIL" -ne 0 ]; then
 fi
 
 printf '%s\n' \
-	'PASS: unmodified v0.1.2 client remains bound to HERMES-1 under UAPI v9'
+	'PASS: unmodified v0.1.2 client remains bound to HERMES-1 under UAPI v10'

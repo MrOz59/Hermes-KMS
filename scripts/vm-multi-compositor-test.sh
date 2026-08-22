@@ -64,12 +64,8 @@ command -v seatd >/dev/null || { printf 'seatd is required in the VM\n' >&2; exi
 command -v runuser >/dev/null || { printf 'runuser is required in the VM\n' >&2; exit 1; }
 id "$TEST_USER" >/dev/null 2>&1 ||
 	{ printf 'test user does not exist: %s\n' "$TEST_USER" >&2; exit 1; }
-if [ "$TEST_USER" != root ] &&
-	! id -nG "$TEST_USER" | tr ' ' '\n' | grep -qx seat; then
-	printf 'test user %s must belong to the seat group\n' "$TEST_USER" >&2
-	exit 1
-fi
 chmod 0755 "$TEST_ROOT"
+printf '%s\n' "$(id -u "$TEST_USER")" >"$TEST_ROOT/session-user"
 
 mkdir -p "$(dirname "$RUNTIME_RULE")"
 cp "$REPO/udev/70-hermes-kms-session-seats.rules" "$RUNTIME_RULE"
@@ -114,9 +110,10 @@ for index in 0 1; do
 	seatd_runtime="$TEST_ROOT/seatd-runtime/$((index + 1))"
 	install -d -m 0700 -o "$TEST_USER" -g "$(id -gn "$TEST_USER")" "$runtime"
 	HERMES_SEATD_RUNTIME_ROOT="$TEST_ROOT/seatd-runtime" \
+	HERMES_SESSION_USER_FILE="$TEST_ROOT/session-user" \
 	unshare --mount --propagation private \
 		"$REPO/scripts/hermes-kms-seatd-instance" \
-		"$((index + 1))" root seat >"$runtime/seatd.log" 2>&1 &
+		"$((index + 1))" auto seat >"$runtime/seatd.log" 2>&1 &
 	SEATD_PIDS+=("$!")
 	for attempt in $(seq 1 100); do
 		[ -S "$seatd_runtime/seatd.sock" ] && break

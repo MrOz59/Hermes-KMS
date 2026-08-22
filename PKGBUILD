@@ -8,18 +8,19 @@
 
 pkgname=hermes-kms-dkms-git
 _pkgbase=hermes-kms
-pkgver=0.3.1
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="Hermes-KMS zero-copy virtual display DRM/KMS driver (DKMS)"
 arch=('x86_64')
 url="https://github.com/MrOz59/Hermes-KMS"
 license=('GPL2')
-depends=('dkms')
+depends=('dkms' 'seatd')
 makedepends=('git')
-optdepends=('seatd: independent compositor sessions via private seat brokers'
-            'libva: VAAPI import-check tool'
+install=hermes-kms.install
+optdepends=('libva: VAAPI import-check tool'
             'libdrm: VAAPI import-check tool'
-            'kscreen: enable the virtual output on KDE/KWin')
+            'kscreen: enable the virtual output on KDE/KWin'
+            'polkit: configure the private session pool from Hermes')
 provides=('hermes-kms')
 conflicts=('hermes-kms')
 # Reports a stale /etc/modprobe.d override that masks the shipped default.
@@ -64,6 +65,10 @@ package() {
     "$pkgdir/usr/lib/udev/rules.d/70-hermes-kms-session-seats.rules"
   install -Dm755 scripts/hermes-kms-seatd-instance \
     "$pkgdir/usr/lib/hermes-kms/hermes-kms-seatd-instance"
+  install -Dm755 scripts/hermes-kms-setup \
+    "$pkgdir/usr/lib/hermes-kms/hermes-kms-setup"
   install -Dm644 packaging/systemd/hermes-kms-seatd@.service \
     "$pkgdir/usr/lib/systemd/system/hermes-kms-seatd@.service"
+  install -Dm644 packaging/polkit/io.github.mroz59.hermes-kms.policy \
+    "$pkgdir/usr/share/polkit-1/actions/io.github.mroz59.hermes-kms.policy"
 }

@@ -172,6 +172,8 @@ static int print_caps(int fd)
 	       (caps.flags & HERMES_KMS_CAP_MULTI_OUTPUT) ? "true" : "false");
 	printf("multi_device=%s\n",
 	       (caps.flags & HERMES_KMS_CAP_MULTI_DEVICE) ? "true" : "false");
+	printf("session_device_pool=%s\n",
+	       (caps.flags & HERMES_KMS_CAP_SESSION_DEVICE_POOL) ? "true" : "false");
 	printf("zero_copy_target=%s\n",
 	       (caps.flags & HERMES_KMS_CAP_ZERO_COPY_TARGET) ? "true" : "false");
 	printf("writeback_connector=%s\n",
@@ -321,6 +323,12 @@ static int print_identity(int fd)
 	printf("device_index=%u\n", identity.device_index + 1);
 	printf("device_count=%u\n",
 	       identity.device_count ? identity.device_count : 1);
+	printf("device_role=%s\n",
+	       identity.device_role == HERMES_KMS_DEVICE_ROLE_HOST ? "host" :
+	       identity.device_role == HERMES_KMS_DEVICE_ROLE_SESSION ? "session" :
+	       "general");
+	printf("session_index=%u\n", identity.session_index);
+	printf("session_device_count=%u\n", identity.session_device_count);
 
 	return 0;
 }

@@ -1,0 +1,144 @@
+#!/bin/sh
+# Configure the packaged Hermes-KMS session pool for the user running Hermes.
+set -eu
+
+DEFAULT_SESSION_DEVICES=4
+MAX_SESSION_DEVICES=8
+MODPROBE_CONFIG=/etc/modprobe.d/hermes-kms.conf
+MODULES_CONFIG=/etc/modules-load.d/hermes-kms.conf
+SESSION_USER_FILE=/etc/hermes-kms/session-user
+
+usage() {
+	printf '%s\n' \
+		"Usage: hermes-kms-setup configure --user UID|auto [--session-devices N]" \
+		"" \
+		"Configures one seat0 host card plus N private session cards." >&2
+	exit 2
+}
+
+[ "${1:-}" = configure ] || usage
+shift
+
+TARGET_UID=
+SESSION_DEVICES=$DEFAULT_SESSION_DEVICES
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--user)
+			[ "$#" -ge 2 ] || usage
+			TARGET_UID=$2
+			shift 2
+			;;
+		--session-devices)
+			[ "$#" -ge 2 ] || usage
+			SESSION_DEVICES=$2
+			shift 2
+			;;
+		*)
+			usage
+			;;
+	esac
+done
+
+[ "$(id -u)" -eq 0 ] || {
+	printf 'hermes-kms-setup must run as root (use pkexec or sudo)\n' >&2
+	exit 1
+}
+
+if [ "$TARGET_UID" = auto ]; then
+	TARGET_UID="${PKEXEC_UID:-${SUDO_UID:-}}"
+fi
+case "$TARGET_UID" in
+	''|*[!0-9]*)
+		printf 'a numeric --user UID is required (or use auto through sudo/pkexec)\n' >&2
+		exit 2
+		;;
+esac
+case "$SESSION_DEVICES" in
+	''|*[!0-9]*) printf 'session device count must be 1-%s\n' "$MAX_SESSION_DEVICES" >&2; exit 2 ;;
+esac
+[ "$SESSION_DEVICES" -ge 1 ] &&
+	[ "$SESSION_DEVICES" -le "$MAX_SESSION_DEVICES" ] || {
+	printf 'session device count must be 1-%s\n' "$MAX_SESSION_DEVICES" >&2
+	exit 2
+}
+getent passwd "$TARGET_UID" >/dev/null || {
+	printf 'uid %s does not identify a local user\n' "$TARGET_UID" >&2
+	exit 2
+}
+command -v seatd >/dev/null || {
+	printf 'seatd is required; install the seatd package first\n' >&2
+	exit 3
+}
+command -v modprobe >/dev/null || {
+	printf 'modprobe is required\n' >&2
+	exit 3
+}
+
+install -d -m 0755 /etc/hermes-kms /etc/modprobe.d /etc/modules-load.d
+tmp_config="$(mktemp "${MODPROBE_CONFIG}.XXXXXX")"
+trap 'rm -f "$tmp_config"' EXIT HUP INT TERM
+{
+	printf '%s\n' \
+		'# Managed by hermes-kms-setup. Connectors stay disabled until owned.' \
+		"# One host card remains on seat0; ${SESSION_DEVICES} private cards are pre-created." \
+		"options hermes_kms initial_enabled=0 outputs=1 session_devices=${SESSION_DEVICES}"
+} >"$tmp_config"
+chmod 0644 "$tmp_config"
+mv "$tmp_config" "$MODPROBE_CONFIG"
+trap - EXIT HUP INT TERM
+printf '%s\n' "$TARGET_UID" >"$SESSION_USER_FILE"
+chmod 0644 "$SESSION_USER_FILE"
+printf '%s\n' hermes_kms >"$MODULES_CONFIG"
+chmod 0644 "$MODULES_CONFIG"
+
+systemctl daemon-reload
+udevadm control --reload-rules
+
+# Older prototype instructions enabled broker instances permanently. Remove
+# those enablement links for every supported slot; the role-aware DRM uevents
+# now start exactly the brokers that correspond to private session cards.
+instance=1
+while [ "$instance" -le "$MAX_SESSION_DEVICES" ]; do
+	systemctl disable "hermes-kms-seatd@${instance}.service" \
+		>/dev/null 2>&1 || true
+	instance=$((instance + 1))
+done
+
+if [ ! -d /sys/module/hermes_kms ]; then
+	if ! modprobe hermes_kms; then
+		printf 'failed to load hermes_kms; update the driver and check the kernel log\n' >&2
+		exit 4
+	fi
+fi
+
+if [ ! -r /sys/module/hermes_kms/parameters/session_devices ]; then
+	printf 'configuration saved; reboot required because the loaded Hermes-KMS driver predates automatic session pools\n'
+	exit 10
+fi
+
+running_session_devices="$(cat /sys/module/hermes_kms/parameters/session_devices)"
+if [ "$running_session_devices" != "$SESSION_DEVICES" ]; then
+	printf 'configuration saved; reboot required (running session_devices=%s, requested=%s)\n' \
+		"$running_session_devices" "$SESSION_DEVICES"
+	exit 10
+fi
+
+udevadm trigger --subsystem-match=drm --action=change
+udevadm settle
+
+# Stop stale brokers left by a previously larger pool. Desired instances are
+# restarted below after udev has established their current device mapping.
+instance=$((SESSION_DEVICES + 1))
+while [ "$instance" -le "$MAX_SESSION_DEVICES" ]; do
+	systemctl stop "hermes-kms-seatd@${instance}.service" || true
+	instance=$((instance + 1))
+done
+
+instance=1
+while [ "$instance" -le "$SESSION_DEVICES" ]; do
+	systemctl restart "hermes-kms-seatd@${instance}.service"
+	instance=$((instance + 1))
+done
+
+printf 'Hermes-KMS ready: user=%s session_devices=%s\n' \
+	"$TARGET_UID" "$SESSION_DEVICES"

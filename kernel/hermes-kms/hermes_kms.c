@@ -86,13 +86,17 @@
 #define HERMES_KMS_DRIVER_DESC "Hermes virtual KMS display"
 #define HERMES_KMS_DRIVER_DATE "20260625"
 #define HERMES_KMS_DRIVER_MAJOR 0
-#define HERMES_KMS_DRIVER_MINOR 3
-#define HERMES_KMS_DRIVER_PATCH 1
+#define HERMES_KMS_DRIVER_MINOR 4
+#define HERMES_KMS_DRIVER_PATCH 0
 #define HERMES_KMS_OUTPUT_NAME_PREFIX "HERMES-"
 #define HERMES_KMS_DEFAULT_OUTPUTS 1
 #define HERMES_KMS_MAX_OUTPUTS 8
 #define HERMES_KMS_DEFAULT_DEVICES 1
 #define HERMES_KMS_MAX_DEVICES 8
+#define HERMES_KMS_DEFAULT_SESSION_DEVICES 0
+#define HERMES_KMS_MAX_SESSION_DEVICES 8
+#define HERMES_KMS_MAX_REGISTERED_DEVICES \
+	(1 + HERMES_KMS_MAX_SESSION_DEVICES)
 
 #define HERMES_KMS_MIN_WIDTH 640
 #define HERMES_KMS_MIN_HEIGHT 480
@@ -111,6 +115,8 @@ static unsigned int initial_height = HERMES_KMS_DEFAULT_HEIGHT;
 static unsigned int initial_refresh_hz = HERMES_KMS_DEFAULT_REFRESH_HZ;
 static unsigned int outputs = HERMES_KMS_DEFAULT_OUTPUTS;
 static unsigned int devices = HERMES_KMS_DEFAULT_DEVICES;
+static unsigned int session_devices = HERMES_KMS_DEFAULT_SESSION_DEVICES;
+static unsigned int registered_device_count;
 
 module_param(initial_enabled, bool, 0644);
 MODULE_PARM_DESC(initial_enabled, "Initial virtual output state");
@@ -128,6 +134,8 @@ module_param(outputs, uint, 0444);
 MODULE_PARM_DESC(outputs, "Number of virtual outputs on the DRM device (1-8, default 1)");
 module_param(devices, uint, 0444);
 MODULE_PARM_DESC(devices, "Number of independent virtual DRM devices (1-8, default 1)");
+module_param(session_devices, uint, 0444);
+MODULE_PARM_DESC(session_devices, "Number of private session devices (0-8). When non-zero, also creates one seat0 host device");
 
 struct hermes_kms_device;
 
@@ -234,6 +242,9 @@ struct hermes_kms_device {
 	struct drm_device drm;
 	unsigned int device_index;
 	unsigned int device_count;
+	unsigned int device_role;
+	unsigned int session_index;
+	unsigned int session_device_count;
 	unsigned int output_count;
 	struct hermes_kms_output outputs[HERMES_KMS_MAX_OUTPUTS];
 };
@@ -1079,6 +1090,8 @@ static int hermes_kms_ioctl_get_caps(struct drm_device *drm, void *data,
 		      HERMES_KMS_CAP_SYNC_FILE;
 	if (hdev->device_count > 1)
 		caps->flags |= HERMES_KMS_CAP_MULTI_DEVICE;
+	if (session_devices)
+		caps->flags |= HERMES_KMS_CAP_SESSION_DEVICE_POOL;
 	caps->min_width = HERMES_KMS_MIN_WIDTH;
 	caps->min_height = HERMES_KMS_MIN_HEIGHT;
 	caps->max_width = HERMES_KMS_MAX_WIDTH;
@@ -1261,6 +1274,9 @@ static int hermes_kms_ioctl_get_identity(struct drm_device *drm, void *data,
 	identity->output_count = hdev->output_count;
 	identity->device_index = hdev->device_index;
 	identity->device_count = hdev->device_count;
+	identity->device_role = hdev->device_role;
+	identity->session_index = hdev->session_index;
+	identity->session_device_count = hdev->session_device_count;
 
 	return 0;
 }
@@ -2163,6 +2179,33 @@ static int hermes_kms_modeset_init(struct hermes_kms_device *hdev)
 	return 0;
 }
 
+static ssize_t hermes_kms_role_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct hermes_kms_device *hdev = dev_get_drvdata(dev);
+	const char *role = "general";
+
+	if (hdev) {
+		if (hdev->device_role == HERMES_KMS_DEVICE_ROLE_HOST)
+			role = "host";
+		else if (hdev->device_role == HERMES_KMS_DEVICE_ROLE_SESSION)
+			role = "session";
+	}
+
+	return sysfs_emit(buf, "%s\n", role);
+}
+static DEVICE_ATTR_RO(hermes_kms_role);
+
+static ssize_t hermes_kms_session_index_show(struct device *dev,
+					     struct device_attribute *attr,
+					     char *buf)
+{
+	struct hermes_kms_device *hdev = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", hdev ? hdev->session_index : 0);
+}
+static DEVICE_ATTR_RO(hermes_kms_session_index);
+
 static int hermes_kms_probe(struct platform_device *pdev)
 {
 	struct hermes_kms_device *hdev;
@@ -2179,7 +2222,22 @@ static int hermes_kms_probe(struct platform_device *pdev)
 	drm = &hdev->drm;
 	platform_set_drvdata(pdev, hdev);
 	hdev->device_index = pdev->id >= 0 ? pdev->id : 0;
-	hdev->device_count = devices;
+	hdev->device_count = registered_device_count;
+	hdev->session_device_count = session_devices;
+	if (session_devices) {
+		hdev->device_role = hdev->device_index == 0 ?
+				      HERMES_KMS_DEVICE_ROLE_HOST :
+				      HERMES_KMS_DEVICE_ROLE_SESSION;
+		hdev->session_index = hdev->device_index;
+	} else if (registered_device_count > 1) {
+		/* Preserve the UAPI v9 devices=N all-private layout. */
+		hdev->device_role = HERMES_KMS_DEVICE_ROLE_SESSION;
+		hdev->session_index = hdev->device_index + 1;
+		hdev->session_device_count = registered_device_count;
+	} else {
+		hdev->device_role = HERMES_KMS_DEVICE_ROLE_GENERAL;
+		hdev->session_index = 0;
+	}
 	if (output_count < 1 || output_count > HERMES_KMS_MAX_OUTPUTS) {
 		output_count = clamp(output_count, 1u,
 				     (unsigned int)HERMES_KMS_MAX_OUTPUTS);
@@ -2224,18 +2282,34 @@ static int hermes_kms_probe(struct platform_device *pdev)
 		hermes_kms_init_output_state(drm, output);
 	}
 
-	ret = hermes_kms_modeset_init(hdev);
+	/*
+	 * Publish parent attributes before drm_dev_register() emits the DRM card
+	 * uevent. The packaged rule uses them to keep the host card on seat0 and
+	 * map only private session cards to dedicated seats.
+	 */
+	ret = device_create_file(&pdev->dev, &dev_attr_hermes_kms_role);
 	if (ret)
 		return ret;
+	ret = device_create_file(&pdev->dev,
+				 &dev_attr_hermes_kms_session_index);
+	if (ret)
+		goto err_remove_role;
+
+	ret = hermes_kms_modeset_init(hdev);
+	if (ret)
+		goto err_remove_session_index;
 
 	ret = drm_dev_register(drm, 0);
 	if (ret)
-		return ret;
+		goto err_remove_session_index;
 
 	drm_info(drm,
-		 "registered Hermes-KMS virtual DRM device index=%u/%u outputs=%u initial_enabled=%d hotplug_events=%d non_desktop=%d initial_mode=%ux%u@%u\n",
+		 "registered Hermes-KMS virtual DRM device index=%u/%u role=%u session_index=%u/%u outputs=%u initial_enabled=%d hotplug_events=%d non_desktop=%d initial_mode=%ux%u@%u\n",
 		 hdev->device_index + 1,
 		 hdev->device_count,
+		 hdev->device_role,
+		 hdev->session_index,
+		 hdev->session_device_count,
 		 hdev->output_count,
 		 initial_enabled,
 		 hotplug_events,
@@ -2258,6 +2332,13 @@ static int hermes_kms_probe(struct platform_device *pdev)
 			 "initial_enabled=1 connects a virtual output with no owner; a compositor may extend the desktop onto it. Check /etc/modprobe.d for an override of the packaged initial_enabled=0 default.\n");
 
 	return 0;
+
+err_remove_session_index:
+	device_remove_file(&pdev->dev,
+			   &dev_attr_hermes_kms_session_index);
+err_remove_role:
+	device_remove_file(&pdev->dev, &dev_attr_hermes_kms_role);
+	return ret;
 }
 
 static void hermes_kms_remove(struct platform_device *pdev)
@@ -2300,6 +2381,9 @@ static void hermes_kms_remove(struct platform_device *pdev)
 		if (fb)
 			drm_framebuffer_put(fb);
 	}
+
+	device_remove_file(&pdev->dev, &dev_attr_hermes_kms_session_index);
+	device_remove_file(&pdev->dev, &dev_attr_hermes_kms_role);
 }
 
 static struct platform_driver hermes_kms_platform_driver = {
@@ -2311,7 +2395,7 @@ static struct platform_driver hermes_kms_platform_driver = {
 };
 
 static struct platform_device *
-hermes_kms_platform_devices[HERMES_KMS_MAX_DEVICES];
+hermes_kms_platform_devices[HERMES_KMS_MAX_REGISTERED_DEVICES];
 
 static int __init hermes_kms_init(void)
 {
@@ -2319,13 +2403,26 @@ static int __init hermes_kms_init(void)
 	unsigned int i;
 	int ret;
 
-	if (device_count < 1 || device_count > HERMES_KMS_MAX_DEVICES) {
+	if (session_devices > HERMES_KMS_MAX_SESSION_DEVICES) {
+		pr_warn("%s: session_devices=%u out of range, using %u\n",
+			HERMES_KMS_DRIVER_NAME, session_devices,
+			HERMES_KMS_MAX_SESSION_DEVICES);
+		session_devices = HERMES_KMS_MAX_SESSION_DEVICES;
+	}
+
+	if (session_devices) {
+		if (devices != HERMES_KMS_DEFAULT_DEVICES)
+			pr_warn("%s: session_devices=%u overrides devices=%u\n",
+				HERMES_KMS_DRIVER_NAME, session_devices, devices);
+		device_count = 1 + session_devices;
+	} else if (device_count < 1 || device_count > HERMES_KMS_MAX_DEVICES) {
 		device_count = clamp(device_count, 1u,
 				     (unsigned int)HERMES_KMS_MAX_DEVICES);
 		pr_warn("%s: devices=%u out of range, using %u\n",
 			HERMES_KMS_DRIVER_NAME, devices, device_count);
 		devices = device_count;
 	}
+	registered_device_count = device_count;
 
 	ret = platform_driver_register(&hermes_kms_platform_driver);
 	if (ret)
@@ -2354,8 +2451,8 @@ static int __init hermes_kms_init(void)
 		hermes_kms_platform_devices[i] = pdev;
 	}
 
-	pr_info("%s: module loaded devices=%u outputs_per_device=%u\n",
-		HERMES_KMS_DRIVER_NAME, device_count, outputs);
+	pr_info("%s: module loaded devices=%u session_devices=%u outputs_per_device=%u\n",
+		HERMES_KMS_DRIVER_NAME, device_count, session_devices, outputs);
 	return 0;
 
 err_unregister_devices:
@@ -2372,7 +2469,7 @@ static void __exit hermes_kms_exit(void)
 {
 	unsigned int i;
 
-	for (i = devices; i > 0; i--) {
+	for (i = registered_device_count; i > 0; i--) {
 		if (hermes_kms_platform_devices[i - 1]) {
 			platform_device_unregister(
 				hermes_kms_platform_devices[i - 1]);

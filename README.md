@@ -54,6 +54,9 @@ or your own tool — can use it by talking the same UAPI, with no fork required:
 3. For UAPI v9 independent sessions, discover every Hermes DRM card through
    `GET_IDENTITY.device_index/device_count` and give each compositor a
    different primary node. Each card is a separate DRM-master domain.
+   With UAPI v10, prefer cards whose identity role is `SESSION`; their
+   `session_index` maps directly to the packaged `hermes-kms-N` seat and
+   broker. The `HOST` card remains available to the normal desktop.
 4. Optionally `SET_OUTPUT` to request a specific mode (this does not take DRM
    master, so the compositor keeps it).
 5. Run the `WAIT_FRAME` → `ACQUIRE_FRAME` loop and import the returned DMA-BUF
@@ -91,9 +94,15 @@ same terms — see [License](#license).
   EDID serials;
 - 1–8 independent DRM cards (`devices=`, default 1), each with its own
   DRM-master domain so separate compositors can back separate graphical
-  sessions; `devices=N outputs=1` is the intended isolated-session layout.
-  The packaged udev rule assigns multi-device cards stable
-  `hermes-kms-1..8` seats while leaving the default `devices=1` card on seat0;
+  sessions. The legacy `devices=N outputs=1` layout remains available;
+- UAPI v10 automatic session pools (`session_devices=1..8`). A pool adds one
+  host card that remains on seat0 plus the requested private cards, so the
+  existing host-desktop path and isolated sessions can coexist without
+  reloading the module. The packaged default is four inert session cards.
+  Scanout buffers are allocated only while a client owns a card;
+- role-aware udev rules map only private cards to stable
+  `hermes-kms-1..8` seats and ask systemd to start the matching private seat
+  broker automatically;
 - exact requested mode synthesized from CVT timings and re-probed on
   `SET_OUTPUT`, preserving non-eight-aligned visible widths such as 854 pixels
   while keeping the framebuffer pitch independently aligned for DMA-BUF;
@@ -119,6 +128,28 @@ Clean:
 ```bash
 make clean
 ```
+
+### Install
+
+The Arch/CachyOS package installs DKMS, `seatd`, module-load/modprobe defaults,
+the role-aware udev rule, and the private broker units together:
+
+```bash
+makepkg -si
+```
+
+The package loads one host card plus a four-card private session pool on boot.
+Hermes' Audio/Video page can configure broker ownership for its current user
+with one administrator prompt. The equivalent command is:
+
+```bash
+sudo /usr/lib/hermes-kms/hermes-kms-setup configure --user auto
+```
+
+For a source installation, `sudo make dkms-install` now installs the same
+runtime files. If an older module topology is already loaded, the helper saves
+the new configuration and asks for one reboot instead of forcibly unloading a
+card that a compositor may still have open.
 
 ### Image-based systems (Bazzite, Silverblue, SteamOS)
 
@@ -201,26 +232,25 @@ sudo insmod kernel/hermes-kms/hermes_kms.ko initial_width=1920 initial_height=10
 sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=1
 sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0 outputs=2
 sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0 devices=2 outputs=1
+sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0 session_devices=4 outputs=1
 ```
 
-Independent compositors require the packaged
-`70-hermes-kms-session-seats.rules` and one packaged private seat broker per
-DRM device. For two devices, install `seatd`, add the Hermes user to the
-`seat` group, and start:
-
-```bash
-sudo systemctl enable --now hermes-kms-seatd@1.service hermes-kms-seatd@2.service
-```
+Independent compositors use the packaged
+`70-hermes-kms-session-seats.rules` and one private seat broker per session
+device. The udev rule starts those instances as cards appear; users no longer
+enable N units or join the `seat` group manually. `hermes-kms-setup` records
+the Hermes service uid, removes persistent broker enablement left by older
+prototype instructions, stops instances outside the configured pool, and
+restarts the required brokers with sockets owned by that user.
 
 The sockets are exposed as
 `/run/hermes-kms-seatd/1/seatd.sock`,
 `/run/hermes-kms-seatd/2/seatd.sock`, and so on. Each service runs the stock
 `seatd` daemon inside its own mount namespace because the daemon has a
 compile-time socket path and only permits one active compositor per daemon.
-The default `devices=1` configuration keeps the legacy platform path and host
-seat, so existing KWin/GNOME use is unchanged. These private brokers are an
-experimental session mechanism, not a security boundary between mutually
-untrusted local users.
+The pool's host-role card stays on seat0, so existing KWin/GNOME use is
+unchanged. These private brokers are experimental session plumbing, not a
+security boundary between mutually untrusted local users.
 
 There are two ways to drive the output, for two different purposes.
 
@@ -272,6 +302,14 @@ Other validation scripts (run as root, in the virtme-ng VM or on the host):
 - `scripts/vm-multi-output-test.sh` — drives two outputs concurrently at
   different modes and verifies distinct owners, framebuffers, DMA-BUFs,
   independent disconnect, and clean unload;
+- `scripts/vm-session-pool-test.sh` — validates one seat0 host card, private
+  role/index identities, automatic seat assignments, and systemd broker wants
+  for a two-card session pool;
+- `scripts/vm-setup-helper-test.sh` — validates one-click user/topology
+  persistence, exact broker restarts, and the safe reboot-required upgrade
+  path;
+- `scripts/vm-systemd-broker-test.sh` — boots a systemd guest and validates the
+  packaged unit's hardening plus configured-user socket ownership;
 - `scripts/vm-uapi-v7-compat-test.sh` — verifies an unmodified v0.1.2 control
   client remains confined to the first output under the current UAPI;
 - `scripts/vm-pacing-test.sh` — asserts the vblank timer fires at exactly
@@ -314,7 +352,10 @@ Initial ioctls:
 new fds default to output 0 for compatibility. `GET_IDENTITY` then exposes the
 selected stable Hermes-facing name (`HERMES-1`, `HERMES-2`, ...) while the DRM
 core may still expose connector objects as `Virtual-*`.
-UAPI v9 also exposes `GET_IDENTITY.device_index` and `device_count`.
+UAPI v9 also exposes `GET_IDENTITY.device_index` and `device_count`. UAPI v10
+adds `device_role`, `session_index`, and `session_device_count` in words that
+were previously reserved. Consumers must check
+`HERMES_KMS_CAP_SESSION_DEVICE_POOL` before interpreting them.
 `HERMES_KMS_CAP_MULTI_DEVICE` means the module can create multiple independent
 DRM devices with `devices=N`; every device has its own DRM-master ownership
 domain and contains `output_count` selectable outputs.

@@ -12,8 +12,8 @@ The canonical version lives in the driver source as three defines in
 
 ```c
 #define HERMES_KMS_DRIVER_MAJOR 0
-#define HERMES_KMS_DRIVER_MINOR 3
-#define HERMES_KMS_DRIVER_PATCH 1
+#define HERMES_KMS_DRIVER_MINOR 4
+#define HERMES_KMS_DRIVER_PATCH 0
 ```
 
 The DKMS config, the PKGBUILD, and the `GET_VERSION` ioctl all read from these,
@@ -26,6 +26,43 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Added
+
+- UAPI v10 host-compatible session pools. `session_devices=N` creates one
+  seat0 host card plus N private session cards and reports explicit
+  host/session roles and stable private-seat indices without changing the
+  identity struct size.
+- `hermes-kms-setup` configures the recommended four-session pool and assigns
+  broker sockets to the Hermes service uid with one privileged invocation. It
+  also removes legacy manual broker enablement and stops instances outside the
+  configured pool.
+- `scripts/vm-session-pool-test.sh` validates host/private roles, stable
+  indices, udev seat assignment, and automatic systemd broker wants.
+- A dedicated polkit action gives the one-click setup a scoped, localized
+  authentication prompt.
+- `scripts/vm-setup-helper-test.sh` validates persistent setup, exact broker
+  restarts, and the safe reboot-required upgrade path.
+- `scripts/vm-systemd-broker-test.sh` validates the actual packaged systemd
+  unit, its hardening, and configured-user socket ownership.
+
+### Changed
+
+- The Arch/CachyOS package now depends on `seatd`, installs all runtime files
+  together, and defaults to one host card plus four disconnected private
+  cards. No scanout memory is allocated until a client owns a card.
+- Role-aware udev rules keep the host card on seat0 and automatically start
+  only the broker instances corresponding to private cards.
+- `make dkms-install` now installs module-load/modprobe defaults, udev rules,
+  broker units, and the setup helper instead of leaving those as manual steps.
+  It detects an already-loaded older module and asks for a reboot instead of
+  implying that the new DKMS build is active.
+- Private broker sockets can be owned directly by the configured Hermes user,
+  removing the logout/login and supplementary `seat` group requirement.
+
+### Validated
+
+- The existing UAPI v7, multi-output, explicit `devices=N`, simultaneous DRM
+  master, DMA-BUF, and two-Weston VM regressions still pass under UAPI v10.
 ### Fixed
 
 - The module builds again on Linux 7.2. That release renamed

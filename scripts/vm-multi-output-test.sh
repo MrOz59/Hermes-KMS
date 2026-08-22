@@ -95,7 +95,7 @@ sleep 0.5
 
 VERSION="$("$CTL" version)"
 CAPS="$("$CTL" caps)"
-require_value "$VERSION" uapi_version 9
+require_value "$VERSION" uapi_version 10
 require_value "$CAPS" output_count 2
 require_value "$CAPS" multi_output true
 

@@ -4,9 +4,10 @@
 set -euo pipefail
 
 INSTANCE="${1:-}"
-SOCKET_OWNER="${2:-root}"
+SOCKET_OWNER="${2:-auto}"
 SOCKET_GROUP="${3:-seat}"
 RUNTIME_ROOT="${HERMES_SEATD_RUNTIME_ROOT:-/run/hermes-kms-seatd}"
+SESSION_USER_FILE="${HERMES_SESSION_USER_FILE:-/etc/hermes-kms/session-user}"
 
 if [[ ! "$INSTANCE" =~ ^[1-8]$ ]]; then
 	printf 'instance must be an integer from 1 through 8\n' >&2
@@ -28,6 +29,28 @@ command -v seatd >/dev/null || {
 	printf 'seatd is required\n' >&2
 	exit 1
 }
+
+# The one-click Hermes setup stores the service user's numeric uid. Resolve it
+# at service start so the broker socket is immediately accessible without a
+# logout/login cycle or a permanent supplementary-group change.
+if [ "$SOCKET_OWNER" = auto ]; then
+	SOCKET_OWNER=root
+	if [ -r "$SESSION_USER_FILE" ]; then
+		SESSION_UID="$(sed -n '1{s/[[:space:]]//g;p;q;}' "$SESSION_USER_FILE")"
+		case "$SESSION_UID" in
+			''|*[!0-9]*)
+				printf 'invalid uid in %s\n' "$SESSION_USER_FILE" >&2
+				exit 1
+				;;
+		esac
+		SOCKET_OWNER="$(getent passwd "$SESSION_UID" | cut -d: -f1)"
+		if [ -z "$SOCKET_OWNER" ]; then
+			printf 'uid %s from %s does not exist\n' \
+				"$SESSION_UID" "$SESSION_USER_FILE" >&2
+			exit 1
+		fi
+	fi
+fi
 
 SESSION_RUN="$RUNTIME_ROOT/$INSTANCE"
 install -d -m 0750 "$RUNTIME_ROOT" "$SESSION_RUN"

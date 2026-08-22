@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Hermes-KMS</vendor>
+  <vendor_url>https://github.com/MrOz59/Hermes-KMS</vendor_url>
+
+  <action id="io.github.mroz59.hermes-kms.configure-session-pool">
+    <description>Configure private virtual displays for Hermes</description>
+    <description xml:lang="pt-BR">Configurar monitores virtuais privados para o Hermes</description>
+    <message>Authentication is required to configure the Hermes-KMS private session pool</message>
+    <message xml:lang="pt-BR">É necessário autenticar para configurar o pool de sessões privadas do Hermes-KMS</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/hermes-kms/hermes-kms-setup</annotate>
+  </action>
+</policyconfig>

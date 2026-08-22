@@ -59,14 +59,22 @@ all: modules tools
 # Install the driver via DKMS so it persists across reboots and rebuilds for
 # every new kernel (the same mechanism evdi-dkms uses). Run as root.
 dkms-install:
+	-dkms remove -m $(DKMS_NAME) -v $(DKMS_VERSION) --all
+	$(RM) -r $(DKMS_SRC)
 	install -dm755 $(DKMS_SRC)
 	cp -a Makefile dkms.conf include kernel packaging tools udev scripts $(DKMS_SRC)/
 	dkms add -m $(DKMS_NAME) -v $(DKMS_VERSION)
 	dkms build -m $(DKMS_NAME) -v $(DKMS_VERSION)
 	dkms install -m $(DKMS_NAME) -v $(DKMS_VERSION)
 	$(MAKE) install-runtime-udev
-	@printf 'Hermes-KMS installed via DKMS. Load it with: sudo modprobe hermes_kms initial_enabled=0\n'
-	@printf 'For two independent sessions also run: sudo systemctl enable --now hermes-kms-seatd@1.service hermes-kms-seatd@2.service\n'
+	@printf 'Hermes-KMS installed via DKMS.\n'
+	@if grep -q '^hermes_kms ' /proc/modules 2>/dev/null; then \
+		printf 'An older Hermes-KMS module is already loaded; reboot once to activate version %s.\n' '$(DKMS_VERSION)'; \
+	else \
+		modprobe hermes_kms || true; \
+	fi
+	@printf 'To prepare the default independent-session pool for this user, run:\n'
+	@printf '  sudo /usr/lib/hermes-kms/hermes-kms-setup configure --user auto\n'
 
 dkms-uninstall:
 	-dkms remove -m $(DKMS_NAME) -v $(DKMS_VERSION) --all
@@ -156,20 +164,32 @@ tools/hermes-cursor-probe/hermes_cursor_probe: tools/hermes-cursor-probe/hermes_
 	$(CC) $(CFLAGS) $(CURSOR_PROBE_CFLAGS) -o $@ $< $(CURSOR_PROBE_LIBS)
 
 install-runtime-udev:
+	install -Dm0644 packaging/modules-load.d/hermes-kms.conf \
+		/usr/lib/modules-load.d/hermes-kms.conf
+	install -Dm0644 packaging/modprobe.d/hermes-kms.conf \
+		/usr/lib/modprobe.d/hermes-kms.conf
 	install -Dm0644 udev/70-hermes-kms-session-seats.rules \
 		$(SYSTEM_UDEV_RULE_DIR)/70-hermes-kms-session-seats.rules
 	install -Dm0755 scripts/hermes-kms-seatd-instance \
 		/usr/lib/hermes-kms/hermes-kms-seatd-instance
+	install -Dm0755 scripts/hermes-kms-setup \
+		/usr/lib/hermes-kms/hermes-kms-setup
 	install -Dm0644 packaging/systemd/hermes-kms-seatd@.service \
 		/usr/lib/systemd/system/hermes-kms-seatd@.service
+	install -Dm0644 packaging/polkit/io.github.mroz59.hermes-kms.policy \
+		/usr/share/polkit-1/actions/io.github.mroz59.hermes-kms.policy
 	-systemctl daemon-reload
 	-udevadm control --reload-rules
 	-udevadm trigger --subsystem-match=drm --action=change
 
 uninstall-runtime-udev:
+	$(RM) /usr/lib/modules-load.d/hermes-kms.conf
+	$(RM) /usr/lib/modprobe.d/hermes-kms.conf
 	$(RM) $(SYSTEM_UDEV_RULE_DIR)/70-hermes-kms-session-seats.rules
 	$(RM) /usr/lib/systemd/system/hermes-kms-seatd@.service
 	$(RM) /usr/lib/hermes-kms/hermes-kms-seatd-instance
+	$(RM) /usr/lib/hermes-kms/hermes-kms-setup
+	$(RM) /usr/share/polkit-1/actions/io.github.mroz59.hermes-kms.policy
 	-systemctl daemon-reload
 	-udevadm control --reload-rules
 	-udevadm trigger --subsystem-match=drm --action=change

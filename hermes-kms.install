@@ -40,4 +40,50 @@ post_install() {
 
 post_upgrade() {
 	_hermes_kms_stale_override
+
+_runtime_reload() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+  fi
+  if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules || true
+    udevadm trigger --subsystem-match=drm --action=change || true
+  fi
+}
+
+post_install() {
+  local dkms_version="${1%-*}"
+
+  _hermes_kms_stale_override
+
+  # Install immediately as well as through Arch's generic post-transaction
+  # DKMS hook, so a first package install can load the module without a reboot.
+  dkms install -m hermes-kms -v "${dkms_version}" || return 1
+  depmod -a
+  _runtime_reload
+  modprobe hermes_kms || true
+  printf '%s\n' \
+    'Hermes-KMS installed with a four-session pool.' \
+    'Hermes can configure broker access from its Audio/Video page.' \
+    'Manual equivalent: sudo /usr/lib/hermes-kms/hermes-kms-setup configure --user auto'
+}
+
+post_upgrade() {
+  local dkms_version="${1%-*}"
+
+  _hermes_kms_stale_override
+
+  dkms install -m hermes-kms -v "${dkms_version}" || return 1
+  depmod -a
+  _runtime_reload
+  if ! grep -q '^hermes_kms ' /proc/modules 2>/dev/null; then
+    modprobe hermes_kms || true
+  else
+    printf '%s\n' \
+      'Hermes-KMS was upgraded while loaded; reboot before testing the new driver.'
+  fi
+}
+
+post_remove() {
+  _runtime_reload
 }

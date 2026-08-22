@@ -101,8 +101,12 @@ for index in 0 1; do
 	CAPS="$("$CTL" --device "${CARDS[$index]}" caps)"
 	require_value "$IDENTITY" device_index "$((index + 1))"
 	require_value "$IDENTITY" device_count 2
+	require_value "$IDENTITY" device_role session
+	require_value "$IDENTITY" session_index "$((index + 1))"
+	require_value "$IDENTITY" session_device_count 2
 	require_value "$IDENTITY" output_count 1
 	require_value "$CAPS" multi_device true
+	require_value "$CAPS" session_device_pool false
 done
 
 "$CTL" --device "${CARDS[0]}" hold 854x480@60 \

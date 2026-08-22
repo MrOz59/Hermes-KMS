@@ -1,16 +1,18 @@
-# The default devices=1 card keeps its legacy "hermes-kms" platform path and
-# remains on seat0. Multi-device paths are hermes-kms.0..7; give each one a
-# stable independent seat so one compositor and one tagged Hermes input set
-# can own each client session.
+# Assign only Hermes-KMS devices whose kernel identity says "session" to
+# private seats. In the packaged session_devices=N pool, device 0 has role
+# "host" and deliberately falls through to the normal seat0 rules. Explicit
+# legacy devices=N layouts still mark every card as a session device.
 #
-# Keep these names synchronized with Hermes getHermesKmsSeatName().
-ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.0/drm/card*", ENV{ID_SEAT}="hermes-kms-1", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
-ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.1/drm/card*", ENV{ID_SEAT}="hermes-kms-2", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
-ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.2/drm/card*", ENV{ID_SEAT}="hermes-kms-3", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
-ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.3/drm/card*", ENV{ID_SEAT}="hermes-kms-4", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
-ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.4/drm/card*", ENV{ID_SEAT}="hermes-kms-5", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
-ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.5/drm/card*", ENV{ID_SEAT}="hermes-kms-6", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
-ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.6/drm/card*", ENV{ID_SEAT}="hermes-kms-7", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
-ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DEVPATH=="*/platform/hermes-kms.7/drm/card*", ENV{ID_SEAT}="hermes-kms-8", TAG+="seat", TAG+="master-of-seat", GROUP="video", MODE="0660", TAG+="uaccess"
+# The matching private seatd broker is pulled in automatically by the DRM-card
+# device. Users therefore do not need to enable N service instances manually.
+# Keep the seat names synchronized with Hermes getHermesKmsSeatName().
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_role}=="session", ATTRS{hermes_kms_session_index}=="1", ENV{ID_SEAT}="hermes-kms-1", TAG+="seat", TAG+="master-of-seat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hermes-kms-seatd@1.service", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_role}=="session", ATTRS{hermes_kms_session_index}=="2", ENV{ID_SEAT}="hermes-kms-2", TAG+="seat", TAG+="master-of-seat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hermes-kms-seatd@2.service", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_role}=="session", ATTRS{hermes_kms_session_index}=="3", ENV{ID_SEAT}="hermes-kms-3", TAG+="seat", TAG+="master-of-seat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hermes-kms-seatd@3.service", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_role}=="session", ATTRS{hermes_kms_session_index}=="4", ENV{ID_SEAT}="hermes-kms-4", TAG+="seat", TAG+="master-of-seat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hermes-kms-seatd@4.service", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_role}=="session", ATTRS{hermes_kms_session_index}=="5", ENV{ID_SEAT}="hermes-kms-5", TAG+="seat", TAG+="master-of-seat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hermes-kms-seatd@5.service", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_role}=="session", ATTRS{hermes_kms_session_index}=="6", ENV{ID_SEAT}="hermes-kms-6", TAG+="seat", TAG+="master-of-seat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hermes-kms-seatd@6.service", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_role}=="session", ATTRS{hermes_kms_session_index}=="7", ENV{ID_SEAT}="hermes-kms-7", TAG+="seat", TAG+="master-of-seat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hermes-kms-seatd@7.service", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_role}=="session", ATTRS{hermes_kms_session_index}=="8", ENV{ID_SEAT}="hermes-kms-8", TAG+="seat", TAG+="master-of-seat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hermes-kms-seatd@8.service", GROUP="video", MODE="0660", TAG+="uaccess"
 
-ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", DEVPATH=="*/platform/hermes-kms.*/drm/renderD*", GROUP="video", MODE="0660", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", DEVPATH=="*/platform/hermes-kms*/drm/renderD*", GROUP="video", MODE="0660", TAG+="uaccess"

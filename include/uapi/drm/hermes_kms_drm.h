@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define HERMES_KMS_UAPI_VERSION 9
+#define HERMES_KMS_UAPI_VERSION 10
 
 #define HERMES_KMS_NAME_LEN 32
 
@@ -32,6 +32,7 @@ extern "C" {
 #define HERMES_KMS_CAP_METRICS			(1ULL << 10)
 #define HERMES_KMS_CAP_MULTI_OUTPUT		(1ULL << 11)
 #define HERMES_KMS_CAP_MULTI_DEVICE		(1ULL << 12)
+#define HERMES_KMS_CAP_SESSION_DEVICE_POOL	(1ULL << 13)
 #define HERMES_KMS_CAP_DMABUF_EXPORT_PLANNED	(1ULL << 32)
 #define HERMES_KMS_CAP_ZERO_COPY_TARGET		(1ULL << 33)
 #define HERMES_KMS_CAP_WRITEBACK_CONNECTOR	(1ULL << 34)
@@ -64,6 +65,17 @@ extern "C" {
 #define HERMES_KMS_SET_OUTPUT_RESULT_CONNECTED		(1U << 0)
 #define HERMES_KMS_SET_OUTPUT_RESULT_OWNER_ASSIGNED	(1U << 1)
 #define HERMES_KMS_SET_OUTPUT_RESULT_HOTPLUG_SENT	(1U << 2)
+
+/*
+ * Device roles reported by GET_IDENTITY (uapi >= 10).
+ *
+ * GENERAL preserves the v9 devices=N layout. HOST is the seat0-compatible
+ * card in the packaged session pool. SESSION cards are reserved for private
+ * compositors and carry a stable 1-based session_index.
+ */
+#define HERMES_KMS_DEVICE_ROLE_GENERAL	0U
+#define HERMES_KMS_DEVICE_ROLE_HOST	1U
+#define HERMES_KMS_DEVICE_ROLE_SESSION	2U
 
 struct drm_hermes_kms_version {
 	__u32 uapi_version;
@@ -134,7 +146,11 @@ struct drm_hermes_kms_identity {
 	 */
 	__u32 device_index;
 	__u32 device_count;
-	__u32 reserved[4];
+	/* Role and stable private-seat identity (uapi >= 10). */
+	__u32 device_role;
+	__u32 session_index;
+	__u32 session_device_count;
+	__u32 reserved[1];
 };
 
 /*

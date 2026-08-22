@@ -1,8 +1,9 @@
 [Unit]
 Description=Hermes-KMS private seat broker for virtual device %i
 Documentation=https://github.com/MrOz59/Hermes-KMS
-After=systemd-udevd.service
+After=systemd-udevd.service systemd-sysusers.service
 Requires=systemd-udevd.service
+ConditionPathExists=/usr/bin/seatd
 
 [Service]
 Type=simple
@@ -11,7 +12,7 @@ Group=seat
 PrivateMounts=yes
 RuntimeDirectory=hermes-kms-seatd/%i
 RuntimeDirectoryMode=0750
-ExecStart=/usr/lib/hermes-kms/hermes-kms-seatd-instance %i root seat
+ExecStart=/usr/lib/hermes-kms/hermes-kms-seatd-instance %i auto seat
 Restart=on-failure
 RestartSec=1s
 
@@ -21,7 +22,9 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
-ReadWritePaths=/run/hermes-kms-seatd/%i
+# The launcher creates/owns the common runtime root before binding the
+# instance directory over its private /run.
+ReadWritePaths=/run/hermes-kms-seatd
 
 [Install]
 WantedBy=multi-user.target

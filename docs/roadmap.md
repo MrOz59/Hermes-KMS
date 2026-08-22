@@ -20,6 +20,8 @@
 - Packaged private seat-broker instances and a VM regression with two
   unprivileged Weston DRM compositors scanning out concurrently on separate
   Hermes cards.
+- UAPI v10 host-compatible automatic session pools, role-aware udev policy,
+  broker auto-start, and a one-command service-user setup path.
 
 ## Next
 

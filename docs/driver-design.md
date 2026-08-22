@@ -90,6 +90,36 @@ not a security boundary between mutually untrusted local users. Encoder import,
 input seats, and two Moonlight clients are not validated by these driver-only
 tests.
 
+### Host-compatible automatic pool
+
+UAPI v10 adds `session_devices=N`. Unlike the legacy `devices=N` topology, it
+creates one host-role card plus N session-role cards. The host card remains on
+seat0 for KWin/GNOME and normal shared-desktop streaming. Each session card
+reports a stable 1-based `session_index`; udev maps that index to
+`hermes-kms-N` and requests the matching private seat broker.
+
+The role and session metadata replace reserved identity words, so the ioctl
+struct size and all older fields remain unchanged. The new
+`HERMES_KMS_CAP_SESSION_DEVICE_POOL` capability gates interpretation of those
+fields. Old UAPI clients continue to see globally unique cards and outputs.
+
+The packaged default is `session_devices=4 outputs=1 initial_enabled=0`.
+Disconnected cards have KMS object state but no active scanout framebuffer, so
+the pool does not preallocate four display-sized buffers. A setup helper stores
+the Hermes service uid for broker socket ownership. If the loaded topology does
+not match, it requests a reboot instead of forcibly unloading a card held by a
+compositor. The packaged polkit action gives the authenticated setup request a
+Hermes-specific prompt and permits it only from an active local session. The
+helper also migrates legacy manually-enabled broker units to udev-managed
+activation and stops stale instances outside the selected pool.
+
+Status: **Prototype**. A disposable VM regression validates one host plus two
+private cards, role/index identity, udev seat mapping, and systemd broker wants.
+Another regression exercises the setup helper's persistent configuration,
+broker restart scope, and reboot-required migration. The existing
+two-compositor regression validates direct configured-user socket ownership
+without requiring `seat` group membership.
+
 ## Communication with Hermes
 
 Hermes-KMS should be controlled through explicit DRM ioctls, not by scraping logs or guessing connector names.
