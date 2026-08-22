@@ -6,13 +6,24 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KO="$REPO/kernel/hermes-kms/hermes_kms.ko"
 CTL="$REPO/tools/hermes-kmsctl/hermes-kmsctl"
 RUNTIME_RULE=/run/udev/rules.d/70-hermes-kms-session-seats.rules
+RULE_BACKUP=""
+MODULE_LOADED_BY_TEST=0
 CARDS=()
 FAIL=0
 
 cleanup()
 {
-	timeout -k 1s 5s rmmod hermes_kms 2>/dev/null || true
-	rm -f "$RUNTIME_RULE"
+	if [ "$MODULE_LOADED_BY_TEST" -eq 1 ]; then
+		timeout -k 1s 5s rmmod hermes_kms 2>/dev/null || true
+		MODULE_LOADED_BY_TEST=0
+	fi
+	if [ -n "$RULE_BACKUP" ]; then
+		cp -- "$RULE_BACKUP" "$RUNTIME_RULE"
+		rm -f -- "$RULE_BACKUP"
+		RULE_BACKUP=""
+	else
+		rm -f -- "$RUNTIME_RULE"
+	fi
 	udevadm control --reload-rules 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -44,10 +55,20 @@ require_value()
 }
 [ -f "$KO" ] || { printf 'module not built: %s\n' "$KO" >&2; exit 1; }
 [ -x "$CTL" ] || { printf 'control tool not built: %s\n' "$CTL" >&2; exit 1; }
+if grep -q '^hermes_kms ' /proc/modules 2>/dev/null; then
+	printf 'refusing to replace an already-loaded hermes_kms instance\n' >&2
+	exit 1
+fi
 
+if [ -e "$RUNTIME_RULE" ]; then
+	RULE_BACKUP="$(mktemp /tmp/hermes-udev-rule.XXXXXX)"
+	cp -- "$RUNTIME_RULE" "$RULE_BACKUP"
+fi
 install -Dm0644 "$REPO/udev/70-hermes-kms-session-seats.rules" "$RUNTIME_RULE"
 udevadm control --reload-rules
+DMESG_MARK="$(dmesg | wc -l)"
 insmod "$KO" initial_enabled=0 hotplug_events=0 session_devices=2 outputs=1
+MODULE_LOADED_BY_TEST=1
 udevadm trigger --subsystem-match=drm --action=change
 udevadm settle
 sleep 0.5
@@ -116,6 +137,16 @@ for index in 1 2; do
 		sleep 0.5
 	done
 	require_value "$properties" ID_SEAT "hermes-kms-$index"
+	if [ "$(stat -c '%u:%g:%a' "${CARDS[$index]}")" != '0:0:600' ]; then
+		printf 'FAIL: private card %s is not root:root mode 0600\n' \
+			"${CARDS[$index]}" >&2
+		FAIL=1
+	fi
+	if printf '%s\n' "$properties" | grep -Eq '^CURRENT_TAGS=.*uaccess'; then
+		printf 'FAIL: private card %s retained the uaccess tag\n' \
+			"${CARDS[$index]}" >&2
+		FAIL=1
+	fi
 	wants="$(printf '%s\n' "$properties" |
 		awk -F= '$1 == "SYSTEMD_WANTS" { print $2; exit }')"
 	case " $wants " in
@@ -136,6 +167,19 @@ require_value "hermes_kms_session_index=$(cat /sys/devices/platform/hermes-kms.1
 	hermes_kms_session_index 1
 require_value "hermes_kms_session_index=$(cat /sys/devices/platform/hermes-kms.2/hermes_kms_session_index)" \
 	hermes_kms_session_index 2
+
+if ! timeout -k 1s 5s rmmod hermes_kms; then
+	printf 'FAIL: module did not unload cleanly\n' >&2
+	FAIL=1
+fi
+SPLAT="$(dmesg | tail -n +"$((DMESG_MARK + 1))" | grep -iE \
+	'BUG:|KASAN|use-after-free|WARNING:|RIP:|slab corruption|Redzone|Poison|refcount|general protection|null pointer' \
+	|| true)"
+if [ -n "$SPLAT" ]; then
+	printf '%s\n' "$SPLAT" >&2
+	printf 'FAIL: kernel splat detected\n' >&2
+	FAIL=1
+fi
 
 if [ "$FAIL" -ne 0 ]; then
 	dmesg | tail -n 160 >&2 || true

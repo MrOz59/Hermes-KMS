@@ -15,22 +15,26 @@
 
 #include <drm/hermes_kms_drm.h>
 
+#include "../hermes_session.h"
+
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
 		"Usage:\n"
-		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] version\n"
-		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] outputs\n"
-		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] identity\n"
-		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] caps\n"
-		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] status\n"
-		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] metrics\n"
-		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] diagnose\n"
-		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] wait [AFTER_SEQUENCE] [TIMEOUT_MS]\n"
-		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] frame [--require-dmabuf] [--sync-file]\n"
-		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] enable [WIDTHxHEIGHT@HZ]\n"
-		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] hold [WIDTHxHEIGHT@HZ]\n"
-		"  %s [--device /dev/dri/cardN] [--output N] [--verbose] disable\n",
+		"  %s [OPTIONS] version\n"
+		"  %s [OPTIONS] outputs\n"
+		"  %s [OPTIONS] identity\n"
+		"  %s [OPTIONS] caps\n"
+		"  %s [OPTIONS] status\n"
+		"  %s [OPTIONS] metrics\n"
+		"  %s [OPTIONS] diagnose\n"
+		"  %s [OPTIONS] wait [AFTER_SEQUENCE] [TIMEOUT_MS]\n"
+		"  %s [OPTIONS] frame [--require-dmabuf] [--sync-file]\n"
+		"  %s [OPTIONS] enable [WIDTHxHEIGHT@HZ]  (holds until Ctrl+C)\n"
+		"  %s [OPTIONS] hold [WIDTHxHEIGHT@HZ]\n"
+		"  %s [OPTIONS] disable\n"
+		"Options: --device PATH --output N --session-file PATH --verbose\n"
+		"For hold/enable, --session-file is created mode 0600; other commands read and bind it.\n",
 		argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
 		argv0, argv0, argv0, argv0);
 }
@@ -56,7 +60,8 @@ static int open_if_hermes(const char *path, bool verbose)
 	}
 
 	memset(&version, 0, sizeof(version));
-	if (ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_VERSION, &version) == 0 &&
+	if (hermes_session_require_driver(fd) == 0 &&
+	    ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_VERSION, &version) == 0 &&
 	    strcmp(version.driver_name, "hermes-kms") == 0)
 		return fd;
 
@@ -71,8 +76,11 @@ static int open_auto_device(bool verbose)
 {
 	struct dirent *entry;
 	DIR *dir;
-	int fd = -1;
-	int pass;
+	int best_fd = -1;
+	unsigned int best_role_rank = UINT_MAX;
+	unsigned int best_device_index = UINT_MAX;
+	unsigned int best_node_rank = UINT_MAX;
+	char best_path[PATH_MAX] = "";
 
 	dir = opendir("/dev/dri");
 	if (!dir) {
@@ -81,29 +89,80 @@ static int open_auto_device(bool verbose)
 		return -1;
 	}
 
-	for (pass = 0; pass < 2 && fd < 0; pass++) {
-		rewinddir(dir);
+	while ((entry = readdir(dir)) != NULL) {
+		struct drm_hermes_kms_identity identity;
+		const char *number;
+		char *end = NULL;
+		char path[PATH_MAX];
+		unsigned int node_rank;
+		unsigned int role_rank;
+		unsigned int device_index;
+		int fd;
 
-		while ((entry = readdir(dir)) != NULL) {
-			char path[PATH_MAX];
+		if (strncmp(entry->d_name, "renderD", 7) == 0) {
+			number = entry->d_name + 7;
+			node_rank = 0;
+		} else if (strncmp(entry->d_name, "card", 4) == 0) {
+			number = entry->d_name + 4;
+			node_rank = 1;
+		} else {
+			continue;
+		}
+		if (!*number)
+			continue;
+		errno = 0;
+		(void)strtoul(number, &end, 10);
+		if (errno || !end || *end)
+			continue;
 
-			if (pass == 0) {
-				if (strncmp(entry->d_name, "renderD", 7) != 0)
-					continue;
-			} else {
-				if (strncmp(entry->d_name, "card", 4) != 0)
-					continue;
-			}
+		snprintf(path, sizeof(path), "/dev/dri/%s", entry->d_name);
+		fd = open_if_hermes(path, verbose);
+		if (fd < 0)
+			continue;
 
-			snprintf(path, sizeof(path), "/dev/dri/%s", entry->d_name);
-			fd = open_if_hermes(path, verbose);
-			if (fd >= 0)
+		memset(&identity, 0, sizeof(identity));
+		if (ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_IDENTITY, &identity) == 0) {
+			device_index = identity.device_index;
+			switch (identity.device_role) {
+			case HERMES_KMS_DEVICE_ROLE_HOST:
+				role_rank = 0;
 				break;
+			case HERMES_KMS_DEVICE_ROLE_GENERAL:
+				role_rank = 1;
+				break;
+			default:
+				role_rank = 2;
+				break;
+			}
+		} else {
+			/* Pre-identity UAPI: retain deterministic path ordering. */
+			device_index = UINT_MAX;
+			role_rank = 1;
+		}
+
+		if (best_fd < 0 || role_rank < best_role_rank ||
+		    (role_rank == best_role_rank && device_index < best_device_index) ||
+		    (role_rank == best_role_rank && device_index == best_device_index &&
+		     node_rank < best_node_rank) ||
+		    (role_rank == best_role_rank && device_index == best_device_index &&
+		     node_rank == best_node_rank && strcmp(path, best_path) < 0)) {
+			if (best_fd >= 0)
+				close(best_fd);
+			best_fd = fd;
+			best_role_rank = role_rank;
+			best_device_index = device_index;
+			best_node_rank = node_rank;
+			strncpy(best_path, path, sizeof(best_path) - 1);
+			best_path[sizeof(best_path) - 1] = '\0';
+		} else {
+			close(fd);
 		}
 	}
 
 	closedir(dir);
-	return fd;
+	if (verbose && best_fd >= 0)
+		fprintf(stderr, "auto-selected %s\n", best_path);
+	return best_fd;
 }
 
 static int open_device(const char *path, bool verbose)
@@ -174,6 +233,8 @@ static int print_caps(int fd)
 	       (caps.flags & HERMES_KMS_CAP_MULTI_DEVICE) ? "true" : "false");
 	printf("session_device_pool=%s\n",
 	       (caps.flags & HERMES_KMS_CAP_SESSION_DEVICE_POOL) ? "true" : "false");
+	printf("session_token=%s\n",
+	       (caps.flags & HERMES_KMS_CAP_SESSION_TOKEN) ? "true" : "false");
 	printf("zero_copy_target=%s\n",
 	       (caps.flags & HERMES_KMS_CAP_ZERO_COPY_TARGET) ? "true" : "false");
 	printf("writeback_connector=%s\n",
@@ -219,6 +280,9 @@ static int print_metrics(int fd)
 	printf("last_wait_duration_ns=%llu\n", (unsigned long long)metrics.last_wait_duration_ns);
 	printf("last_dmabuf_export_ns=%llu\n", (unsigned long long)metrics.last_dmabuf_export_ns);
 	printf("last_sync_file_export_ns=%llu\n", (unsigned long long)metrics.last_sync_file_export_ns);
+	printf("vblank_count=%llu\n", (unsigned long long)metrics.vblank_count);
+	printf("vblank_overrun_count=%llu\n",
+	       (unsigned long long)metrics.vblank_overrun_count);
 
 	return 0;
 }
@@ -228,6 +292,8 @@ static int parse_u64(const char *value, uint64_t *out)
 	char *end;
 	unsigned long long parsed;
 
+	if (!value || !*value || *value == '-')
+		return -1;
 	errno = 0;
 	parsed = strtoull(value, &end, 0);
 	if (errno || !end || *end)
@@ -401,15 +467,23 @@ static int print_outputs(int fd)
 static int print_frame(int fd, int argc, char **argv)
 {
 	struct drm_hermes_kms_acquire_frame frame;
+	bool require_dmabuf = false;
+	bool require_sync_file = false;
+	int ret = 0;
 
 	memset(&frame, 0, sizeof(frame));
+	for (uint32_t i = 0; i < 4; i++)
+		frame.dma_buf_fd[i] = -1;
+	frame.sync_file_fd = -1;
 
 	for (int i = 0; i < argc; i++) {
-		if (strcmp(argv[i], "--require-dmabuf") == 0)
+		if (strcmp(argv[i], "--require-dmabuf") == 0) {
 			frame.flags |= HERMES_KMS_FRAME_REQUEST_DMABUF;
-		else if (strcmp(argv[i], "--sync-file") == 0)
+			require_dmabuf = true;
+		} else if (strcmp(argv[i], "--sync-file") == 0) {
 			frame.flags |= HERMES_KMS_FRAME_REQUEST_SYNC_FILE;
-		else {
+			require_sync_file = true;
+		} else {
 			fprintf(stderr, "Unknown frame option '%s'\n", argv[i]);
 			return 2;
 		}
@@ -443,7 +517,39 @@ static int print_frame(int fd, int argc, char **argv)
 	}
 	printf("sync_file_fd=%d\n", frame.sync_file_fd);
 
-	return 0;
+	if (require_dmabuf &&
+	    !(frame.flags & HERMES_KMS_FRAME_DMABUF_VALID)) {
+		fprintf(stderr, "ACQUIRE_FRAME did not provide the required DMA-BUF\n");
+		ret = 1;
+	}
+	if (require_dmabuf &&
+	    (!frame.plane_count || frame.plane_count > 4)) {
+		fprintf(stderr, "ACQUIRE_FRAME returned invalid plane_count=%u\n",
+			frame.plane_count);
+		ret = 1;
+	}
+	if (require_dmabuf) {
+		for (uint32_t i = 0; i < frame.plane_count && i < 4; i++) {
+			if (frame.dma_buf_fd[i] < 0) {
+				fprintf(stderr, "ACQUIRE_FRAME returned no fd for plane %u\n", i);
+				ret = 1;
+			}
+		}
+	}
+	if (require_sync_file &&
+	    (!(frame.flags & HERMES_KMS_FRAME_SYNC_FILE_VALID) ||
+	     frame.sync_file_fd < 0)) {
+		fprintf(stderr, "ACQUIRE_FRAME did not provide the requested sync_file\n");
+		ret = 1;
+	}
+	for (uint32_t i = 0; i < 4; i++) {
+		if (frame.dma_buf_fd[i] >= 0)
+			close(frame.dma_buf_fd[i]);
+	}
+	if (frame.sync_file_fd >= 0)
+		close(frame.sync_file_fd);
+
+	return ret;
 }
 
 static int print_status(int fd)
@@ -599,14 +705,16 @@ static int print_diagnose(int fd)
 }
 
 static bool parse_mode(const char *value, uint32_t *width, uint32_t *height,
-		       uint32_t *refresh_hz)
+			       uint32_t *refresh_hz)
 {
 	unsigned int parsed_width;
 	unsigned int parsed_height;
 	unsigned int parsed_refresh;
+	char extra;
 
-	if (sscanf(value, "%ux%u@%u", &parsed_width, &parsed_height,
-		   &parsed_refresh) != 3)
+	if (sscanf(value, "%ux%u@%u%c", &parsed_width, &parsed_height,
+		   &parsed_refresh, &extra) != 3 || !parsed_width ||
+	    !parsed_height || !parsed_refresh)
 		return false;
 
 	*width = parsed_width;
@@ -658,22 +766,66 @@ static void drop_master_if_held(int fd, bool verbose)
 		fprintf(stderr, "DROP_MASTER ignored: %s\n", strerror(errno));
 }
 
-static int hold_output(int fd, const char *mode, bool verbose)
+static int hold_output(int fd, const char *mode, bool verbose,
+			       const char *session_file)
 {
-	struct sigaction action;
-	int ret;
+	struct hermes_session_credentials credentials;
+	struct sigaction action, old_int, old_term;
+	sigset_t blocked_signals, original_mask, wait_mask;
+	bool int_handler_installed = false;
+	bool term_handler_installed = false;
+	bool output_enabled = false;
+	bool session_published = false;
+	int cleanup_ret;
+	int ret = 1;
 
-	ret = set_output(fd, true, mode);
-	if (ret)
-		return ret;
-
-	drop_master_if_held(fd, verbose);
+	sigemptyset(&blocked_signals);
+	sigaddset(&blocked_signals, SIGINT);
+	sigaddset(&blocked_signals, SIGTERM);
+	if (sigprocmask(SIG_BLOCK, &blocked_signals, &original_mask) < 0) {
+		perror("sigprocmask");
+		return 1;
+	}
 
 	memset(&action, 0, sizeof(action));
 	action.sa_handler = handle_stop_signal;
 	sigemptyset(&action.sa_mask);
-	sigaction(SIGINT, &action, NULL);
-	sigaction(SIGTERM, &action, NULL);
+	if (sigaction(SIGINT, &action, &old_int) < 0) {
+		perror("sigaction(SIGINT)");
+		goto out_restore;
+	}
+	int_handler_installed = true;
+	if (sigaction(SIGTERM, &action, &old_term) < 0) {
+		perror("sigaction(SIGTERM)");
+		goto out_restore;
+	}
+	term_handler_installed = true;
+
+	ret = set_output(fd, true, mode);
+	if (ret)
+		goto out_restore;
+	output_enabled = true;
+
+	memset(&credentials, 0, sizeof(credentials));
+	if (session_file) {
+		if (hermes_session_get_owner_token(fd, &credentials) < 0) {
+			perror("SESSION_ACCESS GET_TOKEN");
+			ret = 1;
+			goto out_disable;
+		}
+		if (hermes_session_write_file(session_file, &credentials) < 0) {
+			fprintf(stderr, "Could not publish session file %s: %s\n",
+				session_file, strerror(errno));
+			hermes_session_forget(&credentials);
+			ret = 1;
+			goto out_disable;
+		}
+		session_published = true;
+		printf("session_file=%s\n", session_file);
+		hermes_session_forget(&credentials);
+	}
+
+	drop_master_if_held(fd, verbose);
 
 	printf("holding Hermes-KMS output");
 	if (mode)
@@ -681,15 +833,44 @@ static int hold_output(int fd, const char *mode, bool verbose)
 	printf("; press Ctrl+C to disconnect\n");
 	fflush(stdout);
 
+	wait_mask = original_mask;
+	sigdelset(&wait_mask, SIGINT);
+	sigdelset(&wait_mask, SIGTERM);
 	while (!stop_requested)
-		pause();
+		sigsuspend(&wait_mask);
+	ret = 0;
 
-	return set_output(fd, false, NULL);
+out_disable:
+	hermes_session_forget(&credentials);
+	if (session_published && unlink(session_file) < 0 && errno != ENOENT) {
+		fprintf(stderr, "Could not remove session file %s: %s\n",
+			session_file, strerror(errno));
+		if (!ret)
+			ret = 1;
+	}
+	if (output_enabled) {
+		cleanup_ret = set_output(fd, false, NULL);
+		if (!ret && cleanup_ret)
+			ret = cleanup_ret;
+	}
+
+out_restore:
+	if (sigprocmask(SIG_SETMASK, &original_mask, NULL) < 0) {
+		perror("sigprocmask restore");
+		if (!ret)
+			ret = 1;
+	}
+	if (term_handler_installed)
+		(void)sigaction(SIGTERM, &old_term, NULL);
+	if (int_handler_installed)
+		(void)sigaction(SIGINT, &old_int, NULL);
+	return ret;
 }
 
 int main(int argc, char **argv)
 {
 	const char *device = NULL;
+	const char *session_file = NULL;
 	const char *command;
 	uint32_t output_number = 1;
 	bool output_selected = false;
@@ -697,6 +878,7 @@ int main(int argc, char **argv)
 	int fd;
 	int ret;
 	bool verbose = false;
+	bool session_bound = false;
 
 	if (argc < 2) {
 		usage(argv[0]);
@@ -724,6 +906,13 @@ int main(int argc, char **argv)
 		} else if (strcmp(argv[argi], "--verbose") == 0) {
 			verbose = true;
 			argi++;
+		} else if (strcmp(argv[argi], "--session-file") == 0) {
+			if (argi + 1 >= argc) {
+				fprintf(stderr, "--session-file requires a path\n");
+				return 2;
+			}
+			session_file = argv[argi + 1];
+			argi += 2;
 		} else {
 			fprintf(stderr, "Unknown option '%s'\n", argv[argi]);
 			usage(argv[0]);
@@ -737,16 +926,59 @@ int main(int argc, char **argv)
 	}
 
 	command = argv[argi++];
-	fd = open_device(device, verbose);
+	if (session_file && !device && strcmp(command, "hold") != 0 &&
+	    strcmp(command, "enable") != 0) {
+		char bound_device[PATH_MAX];
+		uint32_t bound_output;
+
+		fd = hermes_session_open_bound_render(session_file, bound_device,
+						     sizeof(bound_device),
+						     &bound_output);
+		if (fd >= 0) {
+			session_bound = true;
+			if (verbose)
+				fprintf(stderr, "session bound to %s\n", bound_device);
+			if (output_selected && bound_output != output_number - 1) {
+				fprintf(stderr,
+					"--output %u does not match session file output %u\n",
+					output_number, bound_output + 1);
+				close(fd);
+				return 2;
+			}
+			output_number = bound_output + 1;
+			output_selected = true;
+		}
+	} else {
+		fd = open_device(device, verbose);
+	}
 	if (fd < 0) {
-		fprintf(stderr, "Could not find/open Hermes-KMS DRM device");
+		fprintf(stderr, "Could not find/open or bind a Hermes-KMS DRM device");
 		if (device)
 			fprintf(stderr, " at %s", device);
 		fprintf(stderr, "\n");
 		return 1;
 	}
 
-	if (output_selected && select_output(fd, output_number)) {
+	if (session_file && !session_bound && strcmp(command, "hold") != 0 &&
+	    strcmp(command, "enable") != 0) {
+		uint32_t bound_output;
+
+		if (hermes_session_bind_file(fd, session_file, &bound_output) < 0) {
+			fprintf(stderr, "Could not bind session file %s: %s\n",
+				session_file, strerror(errno));
+			close(fd);
+			return 1;
+		}
+		if (output_selected && bound_output != output_number - 1) {
+			fprintf(stderr,
+				"--output %u does not match session file output %u\n",
+				output_number, bound_output + 1);
+			close(fd);
+			return 2;
+		}
+		output_number = bound_output + 1;
+		output_selected = true;
+	} else if (output_selected && select_output(fd, output_number)) {
 		close(fd);
 		return 1;
 	}
@@ -769,10 +1001,14 @@ int main(int argc, char **argv)
 		ret = wait_frame(fd, argc - argi, &argv[argi]);
 	else if (strcmp(command, "frame") == 0)
 		ret = print_frame(fd, argc - argi, &argv[argi]);
-	else if (strcmp(command, "enable") == 0)
-		ret = set_output(fd, true, argi < argc ? argv[argi] : NULL);
+	else if (strcmp(command, "enable") == 0) {
+		fprintf(stderr, "note: output ownership is fd-scoped; holding until Ctrl+C\n");
+		ret = hold_output(fd, argi < argc ? argv[argi] : NULL, verbose,
+				  session_file);
+	}
 	else if (strcmp(command, "hold") == 0)
-		ret = hold_output(fd, argi < argc ? argv[argi] : NULL, verbose);
+		ret = hold_output(fd, argi < argc ? argv[argi] : NULL, verbose,
+				  session_file);
 	else if (strcmp(command, "disable") == 0)
 		ret = set_output(fd, false, NULL);
 	else {

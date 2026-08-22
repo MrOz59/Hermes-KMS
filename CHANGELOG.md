@@ -28,6 +28,24 @@ subject to change between minor releases.
 
 ### Added
 
+- UAPI v11 generic session-capability handoff. An output owner obtains a random,
+  opaque 128-bit token and can authorize separate capture fds with an atomic
+  token/session/output bind. Closing or disabling the owner revokes the session.
+  The mechanism is deliberately independent of Hermes, Steam, executable names,
+  UIDs and process relationships so other projects can use the driver unchanged.
+- UAPI v11 separate cursor capture. `HERMES_KMS_CAP_CURSOR_CAPTURE`,
+  `GET_IDENTITY.cursor_plane_id`, `WAIT_UPDATE`, and `ACQUIRE_CURSOR` expose
+  cursor position, hotspot, clipped destination/source geometry, visibility,
+  image/state sequences, ARGB8888 DMA-BUFs, and explicit sync_file fences
+  without advancing the primary-frame stream on cursor-only motion.
+- The cursor probe can bind through the generic session helper and exercise the
+  cursor wait/acquire, fence, DMA-BUF mapping, and cursor-only sequence contract
+  at runtime.
+- `vblank_count` and `vblank_overrun_count` are now public UAPI metrics, using
+  previously reserved words without changing the metrics struct size.
+- CI builds the kernel module and optional diagnostic tools, checks packaged
+  configuration syntax, and compiles/runs `tests/uapi-abi.c` for native x86-64
+  and i386 userspace ABIs.
 - UAPI v10 host-compatible session pools. `session_devices=N` creates one
   seat0 host card plus N private session cards and reports explicit
   host/session roles and stable private-seat indices without changing the
@@ -47,6 +65,17 @@ subject to change between minor releases.
 
 ### Changed
 
+- The default `make` target builds only the kernel module. Developers can use
+  `make full` to opt into diagnostic tools and their libdrm/VAAPI/GBM/EGL/GL
+  dependencies.
+- Active-session status, frame acquisition, waits and metrics now require the
+  owner fd or a fd bound with the generic UAPI v11 session capability. A
+  root-only `insecure_legacy_unbound_access=1` migration switch can restore old
+  behavior for diagnostics, but is disabled by default.
+- External consumers are documented as a first-class integration path. They
+  validate a candidate node with core `DRM_IOCTL_VERSION` before private ioctls,
+  and can install the syscall-note UAPI plus the application-neutral,
+  MIT-licensed session helper without installing Hermes application code.
 - The Arch/CachyOS package now depends on `seatd`, installs all runtime files
   together, and defaults to one host card plus four disconnected private
   cards. No scanout memory is allocated until a client owns a card.
@@ -61,10 +90,47 @@ subject to change between minor releases.
 
 ### Validated
 
+- Public UAPI sizes, alignment-sensitive offsets, and encoded ioctl values are
+  identical for newly compiled x86-64 and i386 clients under UAPI v11,
+  including the cursor acquire and dual-stream wait structures.
 - The existing UAPI v7, multi-output, explicit `devices=N`, simultaneous DRM
   master, DMA-BUF, and two-Weston VM regressions still pass under UAPI v10.
+
 ### Fixed
 
+- GNOME/Mutter can now use the Hermes cursor plane. The driver no longer sets
+  `DRIVER_CURSOR_HOTSPOT`, whose opt-in client capability caused the DRM core to
+  hide the plane from ordinary compositors; cursor coordinates remain standard
+  universal-plane coordinates and the optional hotspot metadata stays invalid
+  unless a future protocol supplies it explicitly.
+- Cursor framebuffers smaller than a display mode are no longer rejected by
+  the DRM core. `mode_config.min_width/min_height` describe every framebuffer,
+  so setting them to the 640x480 minimum mode made Mutter's 256x256 ARGB cursor
+  fail both `ADDFB2` and legacy `ADDFB` with `-EINVAL` before `fb_create`.
+  Framebuffer minima are now 1x1 while connector modes and `SET_OUTPUT` retain
+  the 640x480 limit; the imported-scanout regression tool pins this exact case.
+- Active primary and cursor planes now provide the no-op `atomic_update` and
+  `atomic_disable` hooks required by `drm_atomic_helper_commit_planes()`. A
+  previous bookkeeping refactor left those callable slots NULL and could jump
+  to address zero on the first active commit.
+- Capture damage is no longer reused unsafely after a consumer skips a frame.
+  Consecutive new sequences may carry the compositor's clip, re-acquiring the
+  same sequence returns a valid empty rectangle, first/gapped acquisitions fall
+  back to the full frame, and cursor-only atomic commits no longer advance the
+  primary-frame sequence.
+- Primary and cursor state from one atomic commit are latched before a single
+  waiter wake. `WAIT_UPDATE` returns a coherent current snapshot while retaining
+  independent frame and cursor sequence spaces, so consumers never have to
+  infer that unrelated sequence numbers form one transaction ID.
+- DMA-BUF and sync_file export revalidates the selected session and buffer
+  generation before installing fds. A replacement race returns `-ESTALE` for a
+  bounded latest-state retry instead of pairing stale metadata with a new fd.
+- Frame and dual-stream waits revalidate authorization on timeout and poll
+  paths, so session revocation wins with `-EACCES` rather than being mistaken
+  for an ordinary timeout.
+- Public structs now use explicitly aligned 64-bit fields and `GET_STATUS`
+  replaces LP64-only implicit padding with a named reserved word. Newly compiled
+  32-bit and 64-bit userspace therefore uses the same ioctl encodings.
 - The module builds again on Linux 7.2. That release renamed
   `struct drm_atomic_state` to `struct drm_atomic_commit` — the object was
   always one commit's worth of state, never the device's entire state — and

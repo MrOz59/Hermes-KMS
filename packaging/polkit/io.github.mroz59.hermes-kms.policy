@@ -7,8 +7,8 @@
   <vendor_url>https://github.com/MrOz59/Hermes-KMS</vendor_url>
 
   <action id="io.github.mroz59.hermes-kms.configure-session-pool">
-    <description>Configure private virtual displays for Hermes</description>
-    <description xml:lang="pt-BR">Configurar monitores virtuais privados para o Hermes</description>
+    <description>Configure the Hermes-KMS private virtual-display pool</description>
+    <description xml:lang="pt-BR">Configurar o pool de monitores virtuais privados do Hermes-KMS</description>
     <message>Authentication is required to configure the Hermes-KMS private session pool</message>
     <message xml:lang="pt-BR">É necessário autenticar para configurar o pool de sessões privadas do Hermes-KMS</message>
     <defaults>

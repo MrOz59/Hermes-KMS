@@ -17,7 +17,6 @@
 // the final RESULT only claims a complete chain when every required stage
 // actually ran and passed.
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -37,6 +36,8 @@
 
 #include <drm/drm_fourcc.h>
 #include <drm/hermes_kms_drm.h>
+
+#include "../hermes_session.h"
 
 #include <xf86drm.h>
 
@@ -77,6 +78,7 @@ enum stage_result {
 	ST_FAIL,
 	ST_SKIPPED,
 	ST_NOT_PROVIDED,
+	ST_INCONCLUSIVE,
 };
 
 static const char *stage_name(enum stage_result s)
@@ -90,6 +92,8 @@ static const char *stage_name(enum stage_result s)
 		return "SKIPPED";
 	case ST_NOT_PROVIDED:
 		return "NOT PROVIDED";
+	case ST_INCONCLUSIVE:
+		return "INCONCLUSIVE";
 	default:
 		return "not run";
 	}
@@ -104,13 +108,72 @@ struct stage_results {
 	enum stage_result cuda_reg;
 };
 
+static bool parse_u32(const char *text, uint32_t minimum, uint32_t maximum,
+		      uint32_t *value)
+{
+	char *end = NULL;
+	unsigned long parsed;
+
+	if (!text || !*text || *text == '-')
+		return false;
+	errno = 0;
+	parsed = strtoul(text, &end, 0);
+	if (errno || !end || *end || parsed < minimum || parsed > maximum)
+		return false;
+	*value = (uint32_t)parsed;
+	return true;
+}
+
+static bool format_is_32bpp(uint32_t format)
+{
+	switch (format) {
+	case DRM_FORMAT_XRGB8888:
+	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_ABGR8888:
+	case DRM_FORMAT_RGBX8888:
+	case DRM_FORMAT_RGBA8888:
+	case DRM_FORMAT_BGRX8888:
+	case DRM_FORMAT_BGRA8888:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool validate_frame_layout(
+	const struct drm_hermes_kms_acquire_frame *frame,
+	off_t *object_size)
+{
+	size_t map_length;
+	size_t plane_bytes;
+	uint32_t row_bytes;
+
+	if (frame->plane_count != 1 || !frame->width || !frame->height ||
+	    frame->width > (uint32_t)INT_MAX ||
+	    frame->height > (uint32_t)INT_MAX ||
+	    frame->width > UINT32_MAX / 4U || !format_is_32bpp(frame->format))
+		return false;
+	row_bytes = frame->width * 4U;
+	if (frame->pitch[0] < row_bytes ||
+	    (size_t)frame->height > SIZE_MAX / (size_t)frame->pitch[0])
+		return false;
+	plane_bytes = (size_t)frame->pitch[0] * (size_t)frame->height;
+	if ((size_t)frame->offset[0] > SIZE_MAX - plane_bytes)
+		return false;
+	map_length = (size_t)frame->offset[0] + plane_bytes;
+	*object_size = lseek(frame->dma_buf_fd[0], 0, SEEK_END);
+	return *object_size >= 0 &&
+	       (uintmax_t)*object_size >= (uintmax_t)map_length;
+}
+
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-		"Usage: %s [--device /dev/dri/cardN] [--gpu /dev/dri/renderDN] [--wait-ms MS]\n"
+		"Usage: %s [--device /dev/dri/renderDN] [--output N] [--session-file PATH] [--gpu /dev/dri/renderDN] [--wait-ms MS]\n"
 		"       [--no-cuda] [--no-cpu-ref]\n"
 		"Exit codes: 0 = complete chain passed, 1 = a stage failed,\n"
-		"            2 = no failures but the chain is incomplete (stages skipped)\n",
+		"            2 = no failures but the chain is incomplete/inconclusive\n",
 		argv0);
 }
 
@@ -124,7 +187,8 @@ static int open_if_hermes(const char *path)
 		return -1;
 
 	memset(&version, 0, sizeof(version));
-	if (ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_VERSION, &version) == 0 &&
+	if (hermes_session_require_driver(fd) == 0 &&
+	    ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_VERSION, &version) == 0 &&
 	    strcmp(version.driver_name, "hermes-kms") == 0)
 		return fd;
 
@@ -132,56 +196,20 @@ static int open_if_hermes(const char *path)
 	return -1;
 }
 
-static int open_auto_hermes(void)
-{
-	struct dirent *entry;
-	DIR *dir;
-	int fd = -1;
-
-	dir = opendir("/dev/dri");
-	if (!dir)
-		return -1;
-
-	while ((entry = readdir(dir)) != NULL) {
-		char path[PATH_MAX];
-
-		if (strncmp(entry->d_name, "card", 4) != 0 &&
-		    strncmp(entry->d_name, "renderD", 7) != 0)
-			continue;
-
-		snprintf(path, sizeof(path), "/dev/dri/%s", entry->d_name);
-		fd = open_if_hermes(path);
-		if (fd >= 0)
-			break;
-	}
-
-	closedir(dir);
-	return fd;
-}
-
 // Open the first render node that is NOT the Hermes virtual device: that is
 // the real GPU which must import the frame (mirrors
 // display_hermes_vram_t::open_real_render_node in Hermes).
 static int open_real_gpu(const char *path, char *name_out, size_t name_len)
 {
-	struct dirent *entry;
-	DIR *dir;
 	int fd = -1;
 
 	if (path) {
 		fd = open(path, O_RDWR | O_CLOEXEC);
 	} else {
-		dir = opendir("/dev/dri");
-		if (!dir)
-			return -1;
-
-		while ((entry = readdir(dir)) != NULL) {
+		for (int i = 128; i <= 255; i++) {
 			char candidate[PATH_MAX];
 
-			if (strncmp(entry->d_name, "renderD", 7) != 0)
-				continue;
-
-			snprintf(candidate, sizeof(candidate), "/dev/dri/%s", entry->d_name);
+			snprintf(candidate, sizeof(candidate), "/dev/dri/renderD%d", i);
 			fd = open(candidate, O_RDWR | O_CLOEXEC);
 			if (fd < 0)
 				continue;
@@ -198,7 +226,6 @@ static int open_real_gpu(const char *path, char *name_out, size_t name_len)
 			}
 			break;
 		}
-		closedir(dir);
 	}
 
 	if (fd >= 0 && name_out) {
@@ -296,24 +323,15 @@ static void close_frame_fds(struct drm_hermes_kms_acquire_frame *frame)
 static enum stage_result wait_frame_fence(const struct drm_hermes_kms_acquire_frame *frame,
 					  int timeout_ms)
 {
-	struct pollfd pfd;
-	int rv;
-
 	if (!(frame->flags & HERMES_KMS_FRAME_SYNC_FILE_VALID) ||
 	    frame->sync_file_fd < 0) {
 		printf("INFO: driver provided no sync file for this frame\n");
 		return ST_NOT_PROVIDED;
 	}
 
-	pfd.fd = frame->sync_file_fd;
-	pfd.events = POLLIN;
-	pfd.revents = 0;
-	do {
-		rv = poll(&pfd, 1, timeout_ms);
-	} while (rv < 0 && errno == EINTR);
-
-	if (rv <= 0) {
-		fprintf(stderr, "FAIL: frame fence did not signal within %d ms\n", timeout_ms);
+	if (hermes_sync_file_wait(frame->sync_file_fd, timeout_ms) < 0) {
+		fprintf(stderr, "FAIL: frame fence wait failed: %s\n",
+			strerror(errno));
 		return ST_FAIL;
 	}
 
@@ -321,8 +339,8 @@ static enum stage_result wait_frame_fence(const struct drm_hermes_kms_acquire_fr
 	return ST_PASS;
 }
 
-// CPU ground truth: mmap plane 0 and CRC a few rows so the GPU readback can be
-// compared against what is actually in the buffer.
+// CPU ground truth: mmap plane 0 and CRC a few rows in canonical BGRA order so
+// the GPU readback can be compared without treating X bits or swizzles as data.
 /*
  * A GPU driver that reads past the end of an imported DMA-BUF faults inside
  * libgallium, not in an API return code, and the process dies before any of
@@ -354,21 +372,71 @@ static uint32_t crc32_simple(const uint8_t *data, size_t len, uint32_t crc);
 /* noinline: inlining this back into the sigsetjmp frame would make its
  * locals indeterminate after a longjmp. */
 __attribute__((noinline))
-static uint32_t crc_rows_raw(const uint8_t *base, uint32_t rows, uint32_t height,
-			     uint32_t pitch, uint32_t row_bytes)
+static void pixel_to_bgra(uint32_t format, const uint8_t *source,
+			  uint8_t destination[4])
+{
+	switch (format) {
+	case DRM_FORMAT_XRGB8888:
+	case DRM_FORMAT_ARGB8888:
+		destination[0] = source[0];
+		destination[1] = source[1];
+		destination[2] = source[2];
+		destination[3] = format == DRM_FORMAT_ARGB8888 ? source[3] : 0xff;
+		break;
+	case DRM_FORMAT_XBGR8888:
+	case DRM_FORMAT_ABGR8888:
+		destination[0] = source[2];
+		destination[1] = source[1];
+		destination[2] = source[0];
+		destination[3] = format == DRM_FORMAT_ABGR8888 ? source[3] : 0xff;
+		break;
+	case DRM_FORMAT_RGBX8888:
+	case DRM_FORMAT_RGBA8888:
+		destination[0] = source[1];
+		destination[1] = source[2];
+		destination[2] = source[3];
+		destination[3] = format == DRM_FORMAT_RGBA8888 ? source[0] : 0xff;
+		break;
+	case DRM_FORMAT_BGRX8888:
+	case DRM_FORMAT_BGRA8888:
+		destination[0] = source[3];
+		destination[1] = source[2];
+		destination[2] = source[1];
+		destination[3] = format == DRM_FORMAT_BGRA8888 ? source[0] : 0xff;
+		break;
+	default:
+		memset(destination, 0, 4);
+		break;
+	}
+}
+
+/* glReadPixels below returns canonical BGRA bytes. Convert the CPU mapping to
+ * that representation too: raw-byte CRCs mishandle channel-swizzled formats,
+ * and the X component of XRGB-like formats is intentionally undefined. */
+static uint32_t crc_rows_bgra(const uint8_t *base, uint32_t rows,
+			      uint32_t height, uint32_t pitch,
+			      uint32_t row_bytes, uint32_t format)
 {
 	uint32_t crc = 0;
 
-	for (uint32_t y = 0; y < rows && y < height; y++)
-		crc = crc32_simple(base + (size_t) y * pitch, row_bytes, crc);
+	for (uint32_t y = 0; y < rows && y < height; y++) {
+		const uint8_t *row = base + (size_t)y * pitch;
+
+		for (uint32_t x = 0; x < row_bytes; x += 4) {
+			uint8_t bgra[4];
+
+			pixel_to_bgra(format, row + x, bgra);
+			crc = crc32_simple(bgra, sizeof(bgra), crc);
+		}
+	}
 	return crc;
 }
 
 /* Same guard as the readback: a DMA-BUF whose pages the CPU cannot fault in
  * kills the process on first touch, which loses every verdict printed so far. */
 static bool guarded_crc(const uint8_t *base, uint32_t rows, uint32_t height,
-			uint32_t pitch, uint32_t row_bytes, uint32_t *crc_out,
-			int *fault_sig)
+			uint32_t pitch, uint32_t row_bytes, uint32_t format,
+			uint32_t *crc_out, int *fault_sig)
 {
 	struct sigaction fault_sa, old_bus, old_segv;
 	int sig;
@@ -382,7 +450,8 @@ static bool guarded_crc(const uint8_t *base, uint32_t rows, uint32_t height,
 	sig = sigsetjmp(fault_jmp, 1);
 	if (sig == 0) {
 		fault_armed = 1;
-		*crc_out = crc_rows_raw(base, rows, height, pitch, row_bytes);
+		*crc_out = crc_rows_bgra(base, rows, height, pitch, row_bytes,
+					 format);
 		fault_armed = 0;
 	}
 
@@ -457,7 +526,8 @@ static bool guarded_readback(uint32_t width, uint32_t rows, uint8_t *pixels,
 	if (sig == 0) {
 		fault_armed = 1;
 		glPixelStorei(GL_PACK_ALIGNMENT, 1);
-		glReadPixels(0, 0, width, rows, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+		glReadPixels(0, 0, (GLsizei)width, (GLsizei)rows,
+			     GL_BGRA, GL_UNSIGNED_BYTE, pixels);
 		glFinish();
 		fault_armed = 0;
 	}
@@ -484,9 +554,16 @@ static bool cpu_crc_rows(const struct drm_hermes_kms_acquire_frame *frame,
 			 uint32_t rows, uint32_t *crc_out, int *fault_sig)
 {
 	size_t map_len = (size_t) frame->pitch[0] * frame->height + frame->offset[0];
+	struct dma_buf_sync sync;
+	struct pollfd pfd;
+	const uint8_t *base;
+	void *map;
+	uint32_t row_bytes;
+	uint32_t crc = 0;
+	int poll_ret;
 
 	*fault_sig = 0;
-	void *map = mmap(NULL, map_len, PROT_READ, MAP_SHARED, frame->dma_buf_fd[0], 0);
+	map = mmap(NULL, map_len, PROT_READ, MAP_SHARED, frame->dma_buf_fd[0], 0);
 
 	if (map == MAP_FAILED)
 		return false;
@@ -501,35 +578,43 @@ static bool cpu_crc_rows(const struct drm_hermes_kms_acquire_frame *frame,
 	 * up rather than hang - this stage only produces a reference CRC, and is
 	 * something Hermes itself never does.
 	 */
-	struct pollfd pfd;
-
 	memset(&pfd, 0, sizeof(pfd));
 	pfd.fd = frame->dma_buf_fd[0];
 	pfd.events = POLLIN;
-	if (poll(&pfd, 1, 2000) <= 0) {
+	do {
+		poll_ret = poll(&pfd, 1, 2000);
+	} while (poll_ret < 0 && errno == EINTR);
+	if (poll_ret <= 0 || !(pfd.revents & POLLIN)) {
 		munmap(map, map_len);
 		*fault_sig = -1;
 		return false;
 	}
 
-	struct dma_buf_sync sync;
 	memset(&sync, 0, sizeof(sync));
 	sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
-	ioctl(frame->dma_buf_fd[0], DMA_BUF_IOCTL_SYNC, &sync);
+	if (ioctl(frame->dma_buf_fd[0], DMA_BUF_IOCTL_SYNC, &sync) < 0) {
+		munmap(map, map_len);
+		*fault_sig = -2;
+		return false;
+	}
 
-	uint32_t crc = 0;
-	const uint8_t *base = (const uint8_t *) map + frame->offset[0];
-	uint32_t row_bytes = frame->width * 4;
+	base = (const uint8_t *) map + frame->offset[0];
+	row_bytes = frame->width * 4;
 
 	if (!guarded_crc(base, rows, frame->height, frame->pitch[0], row_bytes,
-			 &crc, fault_sig)) {
-		// The mapping exists but its pages cannot be faulted in. Leave it
-		// mapped: unmapping is not worth another fault on the way out.
+			 frame->format, &crc, fault_sig)) {
+		sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+		(void)ioctl(frame->dma_buf_fd[0], DMA_BUF_IOCTL_SYNC, &sync);
+		munmap(map, map_len);
 		return false;
 	}
 
 	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
-	ioctl(frame->dma_buf_fd[0], DMA_BUF_IOCTL_SYNC, &sync);
+	if (ioctl(frame->dma_buf_fd[0], DMA_BUF_IOCTL_SYNC, &sync) < 0) {
+		munmap(map, map_len);
+		*fault_sig = -2;
+		return false;
+	}
 
 	munmap(map, map_len);
 	*crc_out = crc;
@@ -540,6 +625,9 @@ int main(int argc, char **argv)
 {
 	const char *hermes_path = NULL;
 	const char *gpu_path = NULL;
+	const char *session_file = NULL;
+	uint32_t output_number = 1;
+	bool output_selected = false;
 	uint32_t wait_ms = 2000;
 	bool do_cuda = true;
 	bool do_cpu_ref = true;
@@ -556,6 +644,8 @@ int main(int argc, char **argv)
 	EGLImage image = EGL_NO_IMAGE;
 	GLuint tex = 0, fbo = 0, conv = 0, draw_fbo = 0;
 	bool egl_initialized = false;
+	bool gpu_context_faulted = false;
+	bool gpu_cpu_mismatch = false;
 #ifdef HAVE_CUDA
 	CUdevice cuda_dev = 0;
 	bool cuda_ctx_retained = false;
@@ -569,10 +659,21 @@ int main(int argc, char **argv)
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
 			hermes_path = argv[++i];
+		} else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
+			if (!parse_u32(argv[++i], 1, UINT32_MAX, &output_number)) {
+				fprintf(stderr, "invalid 1-based output number\n");
+				return 2;
+			}
+			output_selected = true;
+		} else if (strcmp(argv[i], "--session-file") == 0 && i + 1 < argc) {
+			session_file = argv[++i];
 		} else if (strcmp(argv[i], "--gpu") == 0 && i + 1 < argc) {
 			gpu_path = argv[++i];
 		} else if (strcmp(argv[i], "--wait-ms") == 0 && i + 1 < argc) {
-			wait_ms = (uint32_t) strtoul(argv[++i], NULL, 0);
+			if (!parse_u32(argv[++i], 0, INT_MAX, &wait_ms)) {
+				fprintf(stderr, "invalid wait timeout\n");
+				return 2;
+			}
 		} else if (strcmp(argv[i], "--no-cpu-ref") == 0) {
 			do_cpu_ref = false;
 		} else if (strcmp(argv[i], "--no-cuda") == 0) {
@@ -584,9 +685,34 @@ int main(int argc, char **argv)
 	}
 
 	// --- 1. Acquire a frame from Hermes-KMS ---------------------------------
-	hermes_fd = hermes_path ? open_if_hermes(hermes_path) : open_auto_hermes();
+	if (!session_file) {
+		fprintf(stderr, "FAIL: --session-file is required for secure UAPI v11 capture\n");
+		st.acquire = ST_FAIL;
+		goto out;
+	}
+	uint32_t bound_output = 0;
+	if (hermes_path) {
+		hermes_fd = open_if_hermes(hermes_path);
+		if (hermes_fd >= 0 &&
+		    hermes_session_bind_file(hermes_fd, session_file,
+					     &bound_output) < 0) {
+			int bind_errno = errno;
+
+			close(hermes_fd);
+			hermes_fd = -1;
+			errno = bind_errno;
+		}
+	} else {
+		hermes_fd = hermes_session_open_bound_render(session_file, NULL, 0,
+						     &bound_output);
+	}
 	if (hermes_fd < 0) {
-		fprintf(stderr, "FAIL: no Hermes-KMS device found (module loaded? output enabled?)\n");
+		fprintf(stderr, "FAIL: SESSION_ACCESS BIND: %s\n", strerror(errno));
+		st.acquire = ST_FAIL;
+		goto out;
+	}
+	if (output_selected && bound_output != output_number - 1) {
+		fprintf(stderr, "FAIL: --output does not match the session file\n");
 		st.acquire = ST_FAIL;
 		goto out;
 	}
@@ -602,6 +728,15 @@ int main(int argc, char **argv)
 		goto out;
 	}
 	st.acquire = ST_PASS;
+	off_t plane0_size;
+	if (!validate_frame_layout(&frame, &plane0_size)) {
+		fprintf(stderr,
+			"FAIL: unsupported or invalid single-plane 32-bpp frame layout\n");
+		st.acquire = ST_FAIL;
+		goto out;
+	}
+	GLsizei gl_width = (GLsizei)frame.width;
+	GLsizei gl_height = (GLsizei)frame.height;
 
 	printf("frame: %ux%u format=0x%08x ('%c%c%c%c') modifier=0x%016llx planes=%u pitch0=%u\n",
 	       frame.width, frame.height, frame.format,
@@ -616,7 +751,6 @@ int main(int argc, char **argv)
 	 * which faults inside the driver rather than failing an API call - so
 	 * report the headroom before anything tries to sample it.
 	 */
-	off_t plane0_size = lseek(frame.dma_buf_fd[0], 0, SEEK_END);
 	if (plane0_size > 0) {
 		unsigned long long need =
 			(unsigned long long) frame.pitch[0] * frame.height;
@@ -647,8 +781,12 @@ int main(int argc, char **argv)
 		       "      to skip this stage and reach the EGL import; Hermes never\n"
 		       "      performs this read.\n");
 		st.cpu_ref = ST_FAIL;
+	} else if (cpu_fault == -2) {
+		printf("FAIL: DMA_BUF_IOCTL_SYNC rejected the CPU reference read\n");
+		st.cpu_ref = ST_FAIL;
 	} else if (have_cpu_crc) {
-		printf("PASS: CPU mmap of plane 0 (crc32 of first 8 rows: 0x%08x)\n", cpu_crc);
+		printf("PASS: CPU mmap of plane 0 (canonical BGRA crc32 of first 8 rows: 0x%08x)\n",
+		       cpu_crc);
 		st.cpu_ref = ST_PASS;
 	} else if (cpu_fault) {
 		printf("FAIL: reading the mapped DMA-BUF faulted (SIG%s) on the exporter's\n"
@@ -855,6 +993,7 @@ int main(int argc, char **argv)
 			fault_sig == SIGBUS ? "BUS" : "SEGV");
 		free(pixels);
 		st.gl_validate = ST_FAIL;
+		gpu_context_faulted = true;
 		goto out;
 	}
 
@@ -877,11 +1016,13 @@ int main(int argc, char **argv)
 	if (have_cpu_crc) {
 		if (gpu_crc == cpu_crc)
 			printf("PASS: GPU readback matches CPU ground truth\n");
-		else
-			printf("WARN: GPU/CPU crc mismatch (0x%08x vs 0x%08x); the compositor may "
-			       "have redrawn the live buffer between the reads, use pitch_detect "
-			       "for a drift-filtered verdict\n",
+		else {
+			printf("INCONCLUSIVE: GPU/CPU crc mismatch (0x%08x vs 0x%08x); the "
+			       "live buffer may have changed between reads. Use pitch_detect "
+			       "for a drift-filtered verdict.\n",
 			       gpu_crc, cpu_crc);
+			gpu_cpu_mismatch = true;
+		}
 	}
 
 	// --- 6. Emulate the real encoder pipeline --------------------------------
@@ -891,7 +1032,7 @@ int main(int argc, char **argv)
 	// blit imported -> own texture, then map the own texture into CUDA.
 	glGenTextures(1, &conv);
 	glBindTexture(GL_TEXTURE_2D, conv);
-	glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, frame.width, frame.height);
+	glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, gl_width, gl_height);
 	err = glGetError();
 	if (err != GL_NO_ERROR) {
 		fprintf(stderr, "FAIL: allocating conversion texture error=0x%x\n", err);
@@ -910,8 +1051,8 @@ int main(int argc, char **argv)
 	}
 
 	// read FBO still holds the imported texture
-	glBlitFramebuffer(0, 0, frame.width, frame.height,
-			  0, 0, frame.width, frame.height,
+	glBlitFramebuffer(0, 0, gl_width, gl_height,
+			  0, 0, gl_width, gl_height,
 			  GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	glFinish();
 	err = glGetError();
@@ -921,7 +1062,7 @@ int main(int argc, char **argv)
 		goto out;
 	}
 	printf("PASS: GL converter pass (imported -> own texture)\n");
-	st.gl_validate = ST_PASS;
+	st.gl_validate = gpu_cpu_mismatch ? ST_INCONCLUSIVE : ST_PASS;
 
 #ifdef HAVE_CUDA
 	if (!do_cuda) {
@@ -1045,9 +1186,11 @@ int main(int argc, char **argv)
 		if (cuda_crc == glrow_crc)
 			printf("PASS: CUDA row matches GL row (crc32 0x%08x), data is intact\n",
 			       cuda_crc);
-		else
-			printf("WARN: CUDA/GL row crc mismatch (0x%08x vs 0x%08x)\n",
+		else {
+			printf("FAIL: CUDA/GL row crc mismatch (0x%08x vs 0x%08x)\n",
 			       cuda_crc, glrow_crc);
+			st.cuda_reg = ST_FAIL;
+		}
 	}
 cuda_done:;
 #else
@@ -1085,11 +1228,19 @@ out:
 		       "(DMA-BUF -> EGL -> GL converter -> CUDA)\n");
 		ret = 0;
 	} else {
-		printf("RESULT: INCOMPLETE, no failures but skipped stages keep the "
+		printf("RESULT: INCOMPLETE, skipped or inconclusive stages keep the "
 		       "chain unvalidated\n");
 		ret = 2;
 	}
 	fflush(stdout);
+
+	if (gpu_context_faulted) {
+		fprintf(stderr, "INFO: skipping GPU teardown after a trapped driver fault\n");
+		close_frame_fds(&frame);
+		if (hermes_fd >= 0)
+			close(hermes_fd);
+		_exit(ret);
+	}
 
 #ifdef HAVE_CUDA
 	// NVIDIA (observed on 595.xx) segfaults inside the driver when the last

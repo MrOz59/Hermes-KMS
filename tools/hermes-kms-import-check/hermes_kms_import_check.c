@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -14,6 +13,9 @@
 
 #include <drm/drm_fourcc.h>
 #include <drm/hermes_kms_drm.h>
+#include <xf86drm.h>
+
+#include "../hermes_session.h"
 
 #include <va/va.h>
 #include <va/va_drm.h>
@@ -37,7 +39,7 @@ static const struct import_format import_formats[] = {
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-		"Usage: %s [--device /dev/dri/cardN] [--va-device /dev/dri/renderDN] [--wait-ms MS]\n",
+		"Usage: %s [--device /dev/dri/renderDN] [--output N] [--session-file PATH] [--va-device /dev/dri/renderDN] [--wait-ms MS]\n",
 		argv0);
 }
 
@@ -61,7 +63,8 @@ static int open_if_hermes(const char *path)
 		return -1;
 
 	memset(&version, 0, sizeof(version));
-	if (ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_VERSION, &version) == 0 &&
+	if (hermes_session_require_driver(fd) == 0 &&
+	    ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_VERSION, &version) == 0 &&
 	    strcmp(version.driver_name, "hermes-kms") == 0)
 		return fd;
 
@@ -69,67 +72,38 @@ static int open_if_hermes(const char *path)
 	return -1;
 }
 
-static int open_auto_hermes(void)
-{
-	struct dirent *entry;
-	DIR *dir;
-	int fd = -1;
-
-	dir = opendir("/dev/dri");
-	if (!dir)
-		return -1;
-
-	while ((entry = readdir(dir)) != NULL) {
-		char path[PATH_MAX];
-
-		if (strncmp(entry->d_name, "card", 4) != 0)
-			continue;
-
-		snprintf(path, sizeof(path), "/dev/dri/%s", entry->d_name);
-		fd = open_if_hermes(path);
-		if (fd >= 0)
-			break;
-	}
-
-	closedir(dir);
-	return fd;
-}
-
-static int open_hermes(const char *path)
-{
-	if (path)
-		return open_if_hermes(path);
-
-	return open_auto_hermes();
-}
-
 static int open_va_device(const char *path)
 {
-	struct dirent *entry;
-	DIR *dir;
-	int fd = -1;
+	int first = path ? 0 : 128;
+	int last = path ? 0 : 255;
 
-	if (path)
-		return open(path, O_RDWR | O_CLOEXEC);
-
-	dir = opendir("/dev/dri");
-	if (!dir)
-		return -1;
-
-	while ((entry = readdir(dir)) != NULL) {
+	for (int i = first; i <= last; i++) {
 		char candidate[PATH_MAX];
+		drmVersionPtr version;
+		int fd;
+		bool usable;
 
-		if (strncmp(entry->d_name, "renderD", 7) != 0)
-			continue;
+		if (path)
+			snprintf(candidate, sizeof(candidate), "%s", path);
+		else
+			snprintf(candidate, sizeof(candidate), "/dev/dri/renderD%d", i);
 
-		snprintf(candidate, sizeof(candidate), "/dev/dri/%s", entry->d_name);
 		fd = open(candidate, O_RDWR | O_CLOEXEC);
-		if (fd >= 0)
+		if (fd < 0)
+			continue;
+		version = drmGetVersion(fd);
+		usable = version && version->name &&
+			 strcmp(version->name, "hermes-kms") != 0 &&
+			 strcmp(version->name, "evdi") != 0;
+		if (version)
+			drmFreeVersion(version);
+		if (usable)
+			return fd;
+		close(fd);
+		if (path)
 			break;
 	}
-
-	closedir(dir);
-	return fd;
+	return -1;
 }
 
 static int wait_for_frame(int fd, uint32_t wait_ms)
@@ -216,6 +190,20 @@ static void init_invalid_frame_fds(struct drm_hermes_kms_acquire_frame *frame)
 	frame->sync_file_fd = -1;
 }
 
+static int wait_frame_fence(const struct drm_hermes_kms_acquire_frame *frame)
+{
+	if (!(frame->flags & HERMES_KMS_FRAME_SYNC_FILE_VALID) ||
+	    frame->sync_file_fd < 0) {
+		fprintf(stderr, "ACQUIRE_FRAME did not return the requested sync_file\n");
+		return 1;
+	}
+	if (hermes_sync_file_wait(frame->sync_file_fd, 2000) < 0) {
+		fprintf(stderr, "producer fence wait failed: %s\n", strerror(errno));
+		return 1;
+	}
+	return 0;
+}
+
 static int import_with_vaapi(int va_fd,
 			     const struct drm_hermes_kms_acquire_frame *frame)
 {
@@ -232,6 +220,10 @@ static int import_with_vaapi(int va_fd,
 	if (!format) {
 		fprintf(stderr, "unsupported DRM format 0x%08x for VA import check\n",
 			frame->format);
+		return 1;
+	}
+	if (!frame->width || !frame->height) {
+		fprintf(stderr, "invalid zero-sized frame\n");
 		return 1;
 	}
 
@@ -257,9 +249,20 @@ static int import_with_vaapi(int va_fd,
 	descriptor.layers[0].num_planes = frame->plane_count;
 
 	for (uint32_t i = 0; i < frame->plane_count; i++) {
+		off_t object_size = lseek(frame->dma_buf_fd[i], 0, SEEK_END);
+
+		if (!frame->pitch[i] || object_size <= 0 ||
+		    (uintmax_t)object_size > UINT32_MAX ||
+		    frame->offset[i] >= (uintmax_t)object_size) {
+			fprintf(stderr,
+				"invalid plane %u layout (pitch=%u offset=%u size=%jd)\n",
+				i, frame->pitch[i], frame->offset[i],
+				(intmax_t)object_size);
+			vaTerminate(display);
+			return 1;
+		}
 		descriptor.objects[i].fd = frame->dma_buf_fd[i];
-		descriptor.objects[i].size = frame->offset[i] +
-					     frame->pitch[i] * frame->height;
+		descriptor.objects[i].size = (uint32_t)object_size;
 		descriptor.objects[i].drm_format_modifier = frame->modifier;
 		descriptor.layers[0].object_index[i] = i;
 		descriptor.layers[0].offset[i] = frame->offset[i];
@@ -322,6 +325,9 @@ int main(int argc, char **argv)
 {
 	const char *hermes_device = NULL;
 	const char *va_device = NULL;
+	const char *session_file = NULL;
+	uint32_t output_number = 1;
+	bool output_selected = false;
 	uint32_t wait_ms = 1000;
 	struct drm_hermes_kms_acquire_frame frame;
 	int hermes_fd;
@@ -331,6 +337,18 @@ int main(int argc, char **argv)
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
 			hermes_device = argv[++i];
+		} else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
+			char *end = NULL;
+			unsigned long parsed = strtoul(argv[++i], &end, 0);
+
+			if (!end || *end || parsed < 1 || parsed > UINT32_MAX) {
+				fprintf(stderr, "invalid 1-based output number\n");
+				return 2;
+			}
+			output_number = (uint32_t)parsed;
+			output_selected = true;
+		} else if (strcmp(argv[i], "--session-file") == 0 && i + 1 < argc) {
+			session_file = argv[++i];
 		} else if (strcmp(argv[i], "--va-device") == 0 && i + 1 < argc) {
 			va_device = argv[++i];
 		} else if (strcmp(argv[i], "--wait-ms") == 0 && i + 1 < argc) {
@@ -352,9 +370,33 @@ int main(int argc, char **argv)
 		}
 	}
 
-	hermes_fd = open_hermes(hermes_device);
+	if (!session_file) {
+		fprintf(stderr, "--session-file is required for secure UAPI v11 capture\n");
+		return 1;
+	}
+	uint32_t bound_output = 0;
+	if (hermes_device) {
+		hermes_fd = open_if_hermes(hermes_device);
+		if (hermes_fd >= 0 &&
+		    hermes_session_bind_file(hermes_fd, session_file,
+					     &bound_output) < 0) {
+			int bind_errno = errno;
+
+			close(hermes_fd);
+			hermes_fd = -1;
+			errno = bind_errno;
+		}
+	} else {
+		hermes_fd = hermes_session_open_bound_render(session_file, NULL, 0,
+						     &bound_output);
+	}
 	if (hermes_fd < 0) {
-		fprintf(stderr, "could not open Hermes-KMS device\n");
+		fprintf(stderr, "SESSION_ACCESS BIND failed: %s\n", strerror(errno));
+		return 1;
+	}
+	if (output_selected && bound_output != output_number - 1) {
+		fprintf(stderr, "--output does not match the session file\n");
+		close(hermes_fd);
 		return 1;
 	}
 
@@ -373,6 +415,11 @@ int main(int argc, char **argv)
 	ret = acquire_frame(hermes_fd, &frame);
 	if (ret)
 		goto out;
+	ret = wait_frame_fence(&frame);
+	if (ret) {
+		close_frame_fds(&frame);
+		goto out;
+	}
 
 	ret = import_with_vaapi(va_fd, &frame);
 	close_frame_fds(&frame);

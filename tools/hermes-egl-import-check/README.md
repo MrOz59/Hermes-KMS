@@ -68,7 +68,11 @@ flip, R/B swap, brute-forced pitch scan, drift-filtered rows). Waits on the
 exported sync file and brackets both CPU snapshots with
 `DMA_BUF_IOCTL_SYNC` so the reference cannot be an in-flight frame.
 
-Options: `--device /dev/dri/cardN`, `--gpu /dev/dri/renderDN`.
+Options: `--session-file PATH` (required), `--device /dev/dri/cardN`,
+`--gpu /dev/dri/renderDN`. The session file is the mode-0600 credential
+published by the output owner (for example, via `hermes-kmsctl --session-file
+PATH hold ...`). It authorizes this separate capture file descriptor without
+coupling the tool or driver to any particular application.
 
 ## Known finding (2026-08, NVIDIA 595.84, RTX 5060 Ti)
 

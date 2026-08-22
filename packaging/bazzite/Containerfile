@@ -1,70 +1,99 @@
+# syntax=docker/dockerfile:1
 # Layer Hermes-KMS into a Bazzite (or any bootc/ostree) image.
 #
-# Image-based distributions do not run DKMS: /usr is read-only at runtime, so
-# there is no moment at which a module can be built on the installed system.
-# The module is instead compiled against the image's kernel while the image is
-# being built, and baked into /usr/lib/modules/<kver>/extra — the same place
-# akmods and the ublue-os kmod images put theirs.
+# Build unsigned:
+#   podman build -t localhost/bazzite-hermes:latest \
+#     -f packaging/bazzite/Containerfile .
 #
-# Build:
-#   podman build -t localhost/bazzite-hermes:latest -f packaging/bazzite/Containerfile .
+# Build with a private key without copying it into the build context or image:
+#   podman build \
+#     --no-cache \
+#     --secret id=module_sign_key,src=/path/to/MOK.priv \
+#     --secret id=module_sign_cert,src=/path/to/MOK.der \
+#     -t localhost/bazzite-hermes:latest \
+#     -f packaging/bazzite/Containerfile .
+# Secret contents do not participate in normal layer cache keys, hence
+# --no-cache when signing or rotating a key.
 #
 # Rebase onto it:
 #   sudo bootc switch --transport containers-storage localhost/bazzite-hermes:latest
-#
-# Push it somewhere and rebase from there instead if you want automatic updates.
-#
-# SECURE BOOT: Bazzite enables Secure Boot with the Universal Blue key. A module
-# built here is unsigned, so the kernel refuses to load it while Secure Boot is
-# on. Either enroll your own key and set MODULE_SIGN_KEY/MODULE_SIGN_CERT below,
-# or turn Secure Boot off in firmware. There is no third option — an unsigned
-# out-of-tree module and an enforcing Secure Boot cannot coexist.
 
 ARG BASE_IMAGE=ghcr.io/ublue-os/bazzite
 ARG BASE_TAG=latest
 
-FROM ${BASE_IMAGE}:${BASE_TAG} AS build
+# Build tools, kernel headers and signing secrets exist only in this discarded
+# stage. COPY is deliberately allow-listed; .containerignore is an additional
+# guard against sending repository metadata or local key material to a builder.
+FROM ${BASE_IMAGE}:${BASE_TAG} AS hermes-build
 
-# Sign the module with your own MOK. Both must be enrolled in firmware; leave
-# them unset to build unsigned (then Secure Boot has to be off).
-ARG MODULE_SIGN_KEY=""
-ARG MODULE_SIGN_CERT=""
+WORKDIR /src/hermes-kms
+COPY Makefile ./Makefile
+COPY include ./include
+COPY kernel ./kernel
+COPY packaging/modprobe.d ./packaging/modprobe.d
+COPY packaging/modules-load.d ./packaging/modules-load.d
+COPY packaging/polkit ./packaging/polkit
+COPY packaging/systemd ./packaging/systemd
+COPY udev/70-hermes-kms-session-seats.rules ./udev/70-hermes-kms-session-seats.rules
+COPY scripts/hermes-kms-seatd-instance scripts/hermes-kms-setup ./scripts/
 
-COPY . /src/hermes-kms
+RUN --mount=type=secret,id=module_sign_key,required=false \
+    --mount=type=secret,id=module_sign_cert,required=false \
+    set -eux; \
+	    kver="$(rpm -q --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-core | sort -V | tail -n1)"; \
+    test -n "${kver}"; \
+    test -d "/usr/lib/modules/${kver}" || kver="$(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -n1)"; \
+    test -n "${kver}"; \
+    echo "building against kernel ${kver}"; \
+    rpm-ostree install -y \
+        "kernel-devel-${kver}" \
+        gcc make elfutils-libelf-devel openssl-devel; \
+    make modules \
+        KERNELRELEASE="${kver}" \
+        KDIR="/usr/lib/modules/${kver}/build"; \
+    key=/run/secrets/module_sign_key; \
+    cert=/run/secrets/module_sign_cert; \
+    if [ -e "${key}" ] || [ -e "${cert}" ]; then \
+        test -r "${key}" && test -r "${cert}" || { \
+            echo 'both module_sign_key and module_sign_cert secrets are required' >&2; \
+            exit 1; \
+        }; \
+        echo 'signing hermes_kms.ko with build secrets'; \
+        "/usr/lib/modules/${kver}/build/scripts/sign-file" \
+            sha256 "${key}" "${cert}" kernel/hermes-kms/hermes_kms.ko; \
+    else \
+        echo 'WARNING: hermes_kms.ko is unsigned; Secure Boot must be disabled' >&2; \
+    fi; \
+    make modules-install install-configs \
+        KERNELRELEASE="${kver}" \
+        DESTDIR=/out; \
+    modinfo kernel/hermes-kms/hermes_kms.ko >/dev/null
+
+# Start again from the clean base. No compiler, source checkout, .git directory
+# or private signing material can be inherited from hermes-build.
+FROM ${BASE_IMAGE}:${BASE_TAG}
+
+# The base normally includes polkit; install only genuinely missing runtime
+# packages so rpm-ostree does not reject an already-present package request.
+RUN set -eux; \
+    missing=; \
+    rpm -q seatd >/dev/null 2>&1 || missing="${missing} seatd"; \
+    rpm -q polkit >/dev/null 2>&1 || missing="${missing} polkit"; \
+    if [ -n "${missing}" ]; then \
+        rpm-ostree install -y ${missing}; \
+    fi
+
+COPY --from=hermes-build /out/usr/ /usr/
 
 RUN set -eux; \
-    # An ostree image carries exactly one kernel; take its version from the
-    # module tree rather than uname, which reports the build host's kernel.
-    kver="$(rpm -q --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-core | head -n1)"; \
-    test -d "/usr/lib/modules/${kver}" || kver="$(ls /usr/lib/modules | head -n1)"; \
-    echo "building against kernel ${kver}"; \
-    \
-    rpm-ostree install -y \
-    "kernel-devel-${kver}" \
-    gcc make elfutils-libelf-devel openssl-devel; \
-    \
-    cd /src/hermes-kms; \
-    make modules \
-    KERNELRELEASE="${kver}" \
-    KDIR="/usr/lib/modules/${kver}/build"; \
-    \
-    if [ -n "${MODULE_SIGN_KEY}" ] && [ -n "${MODULE_SIGN_CERT}" ]; then \
-    echo "signing hermes_kms.ko"; \
-    "/usr/lib/modules/${kver}/build/scripts/sign-file" \
-    sha256 "${MODULE_SIGN_KEY}" "${MODULE_SIGN_CERT}" \
-    kernel/hermes-kms/hermes_kms.ko; \
-    else \
-    echo "WARNING: hermes_kms.ko is unsigned; Secure Boot must be disabled to load it" >&2; \
-    fi; \
-    \
-    make modules-install install-configs KERNELRELEASE="${kver}" DESTDIR=/; \
-    \
-    # The build toolchain and headers have no business in the shipped image.
-    rpm-ostree uninstall -y \
-    "kernel-devel-${kver}" \
-    gcc make elfutils-libelf-devel openssl-devel; \
-    rm -rf /src/hermes-kms; \
-    \
-    # Fail the build rather than ship an image whose module cannot be resolved.
-    modinfo "/usr/lib/modules/${kver}/extra/hermes-kms/hermes_kms.ko" > /dev/null; \
+	    kver="$(rpm -q --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-core | sort -V | tail -n1)"; \
+    test -n "${kver}"; \
+    test -d "/usr/lib/modules/${kver}" || kver="$(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -V | tail -n1)"; \
+    test -n "${kver}"; \
+    test -f "/usr/lib/modules/${kver}/extra/hermes-kms/hermes_kms.ko"; \
+    depmod -a "${kver}"; \
+    modinfo "/usr/lib/modules/${kver}/extra/hermes-kms/hermes_kms.ko" >/dev/null; \
+    test -x /usr/lib/hermes-kms/hermes-kms-setup; \
+    test -f /usr/share/polkit-1/actions/io.github.mroz59.hermes-kms.policy; \
+    test -x /usr/bin/seatd; \
     ostree container commit

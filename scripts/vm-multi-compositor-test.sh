@@ -9,10 +9,13 @@ CTL="$REPO/tools/hermes-kmsctl/hermes-kmsctl"
 TEST_ROOT="$(mktemp -d /tmp/hermes-compositors.XXXXXX)"
 TEST_USER="${HERMES_TEST_USER:-$(stat -c %U "$REPO")}"
 CARDS=()
+SESSION_FILES=("$TEST_ROOT/session-1.auth" "$TEST_ROOT/session-2.auth")
 HOLD_PIDS=()
 WESTON_PIDS=()
 SEATD_PIDS=()
 RUNTIME_RULE="/run/udev/rules.d/70-hermes-kms-session-seats.rules"
+RULE_BACKUP=""
+MODULE_LOADED_BY_TEST=0
 
 cleanup()
 {
@@ -26,8 +29,17 @@ cleanup()
 		[ -n "$pid" ] || continue
 		wait "$pid" 2>/dev/null || true
 	done
-	timeout -k 1s 5s rmmod hermes_kms 2>/dev/null || true
-	rm -f -- "$RUNTIME_RULE"
+	if [ "$MODULE_LOADED_BY_TEST" -eq 1 ]; then
+		timeout -k 1s 5s rmmod hermes_kms 2>/dev/null || true
+		MODULE_LOADED_BY_TEST=0
+	fi
+	if [ -n "$RULE_BACKUP" ]; then
+		cp -- "$RULE_BACKUP" "$RUNTIME_RULE"
+		rm -f -- "$RULE_BACKUP"
+		RULE_BACKUP=""
+	else
+		rm -f -- "$RUNTIME_RULE"
+	fi
 	udevadm control --reload-rules 2>/dev/null || true
 	rm -rf -- "$TEST_ROOT"
 }
@@ -64,13 +76,22 @@ command -v seatd >/dev/null || { printf 'seatd is required in the VM\n' >&2; exi
 command -v runuser >/dev/null || { printf 'runuser is required in the VM\n' >&2; exit 1; }
 id "$TEST_USER" >/dev/null 2>&1 ||
 	{ printf 'test user does not exist: %s\n' "$TEST_USER" >&2; exit 1; }
+if grep -q '^hermes_kms ' /proc/modules 2>/dev/null; then
+	printf 'refusing to replace an already-loaded hermes_kms instance\n' >&2
+	exit 1
+fi
 chmod 0755 "$TEST_ROOT"
 printf '%s\n' "$(id -u "$TEST_USER")" >"$TEST_ROOT/session-user"
 
 mkdir -p "$(dirname "$RUNTIME_RULE")"
+if [ -e "$RUNTIME_RULE" ]; then
+	RULE_BACKUP="$(mktemp /tmp/hermes-udev-rule.XXXXXX)"
+	cp -- "$RUNTIME_RULE" "$RULE_BACKUP"
+fi
 cp "$REPO/udev/70-hermes-kms-session-seats.rules" "$RUNTIME_RULE"
 udevadm control --reload-rules
 insmod "$KO" initial_enabled=0 hotplug_events=0 devices=2 outputs=1
+MODULE_LOADED_BY_TEST=1
 udevadm trigger --subsystem-match=drm --action=change
 udevadm settle
 sleep 0.5
@@ -97,13 +118,18 @@ for index in 0 1; do
 		fail_with_logs "${CARDS[$index]} has seat ${seat:-<none>}"
 done
 
-"$CTL" --device "${CARDS[0]}" hold 854x480@60 \
+"$CTL" --device "${CARDS[0]}" --session-file "${SESSION_FILES[0]}" hold 854x480@60 \
 	>"$TEST_ROOT/hold-1.log" 2>&1 &
 HOLD_PIDS+=("$!")
-"$CTL" --device "${CARDS[1]}" hold 1920x1080@60 \
+"$CTL" --device "${CARDS[1]}" --session-file "${SESSION_FILES[1]}" hold 1920x1080@60 \
 	>"$TEST_ROOT/hold-2.log" 2>&1 &
 HOLD_PIDS+=("$!")
-sleep 0.5
+for attempt in $(seq 1 100); do
+	[ -f "${SESSION_FILES[0]}" ] && [ -f "${SESSION_FILES[1]}" ] && break
+	sleep 0.02
+done
+[ -f "${SESSION_FILES[0]}" ] && [ -f "${SESSION_FILES[1]}" ] ||
+	fail_with_logs "owners did not publish both session files"
 
 for index in 0 1; do
 	runtime="$TEST_ROOT/weston-$((index + 1))"
@@ -151,7 +177,7 @@ done
 for attempt in $(seq 1 100); do
 	ready=0
 	for index in 0 1; do
-		status="$("$CTL" --device "${CARDS[$index]}" status)"
+		status="$("$CTL" --device "${CARDS[$index]}" --session-file "${SESSION_FILES[$index]}" status)"
 		[ "$(printf '%s\n' "$status" | value frame_valid)" = true ] &&
 			[ "$(printf '%s\n' "$status" | value scanout_active)" = true ] &&
 			ready=$((ready + 1))
@@ -166,8 +192,8 @@ done
 [ "${ready:-0}" -eq 2 ] ||
 	fail_with_logs "timed out waiting for two Weston scanouts"
 
-STATUS_1="$("$CTL" --device "${CARDS[0]}" status)"
-STATUS_2="$("$CTL" --device "${CARDS[1]}" status)"
+STATUS_1="$("$CTL" --device "${CARDS[0]}" --session-file "${SESSION_FILES[0]}" status)"
+STATUS_2="$("$CTL" --device "${CARDS[1]}" --session-file "${SESSION_FILES[1]}" status)"
 [ "$(printf '%s\n' "$STATUS_1" | value active)" = "854x480@60" ] ||
 	fail_with_logs "first compositor did not scan out at 854x480@60"
 [ "$(printf '%s\n' "$STATUS_2" | value active)" = "1920x1080@60" ] ||

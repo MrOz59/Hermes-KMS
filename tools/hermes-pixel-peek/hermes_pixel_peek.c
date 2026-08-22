@@ -12,7 +12,8 @@
  *
  * Build: cc -I<repo>/include/uapi -o hermes_pixel_peek hermes_pixel_peek.c
  *
- * Usage: hermes_pixel_peek [--device /dev/dri/renderDN] [--region x,y,w,h]
+ * Usage: hermes_pixel_peek --session-file PATH
+ *                          [--device /dev/dri/renderDN] [--region x,y,w,h]
  *                          [--frames N] [--no-dmabuf]
  */
 #include <errno.h>
@@ -25,10 +26,14 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include <linux/dma-buf.h>
 #include <drm/drm.h>
 #include <drm/hermes_kms_drm.h>
+
+#include "../hermes_session.h"
 
 #define XR24 0x34325258 /* DRM_FORMAT_XRGB8888 little-endian fourcc */
 #define AR24 0x34325241 /* DRM_FORMAT_ARGB8888 */
@@ -37,7 +42,8 @@ int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 
-	const char *dev = "/dev/dri/renderD128";
+	const char *dev = NULL;
+	const char *session_file = NULL;
 	long frames = 0; /* 0 = until interrupted */
 	int no_dmabuf = 0;
 	int has_region = 0;
@@ -46,37 +52,84 @@ int main(int argc, char **argv)
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--device") && i + 1 < argc) {
 			dev = argv[++i];
+		} else if (!strcmp(argv[i], "--session-file") && i + 1 < argc) {
+			session_file = argv[++i];
 		} else if (!strcmp(argv[i], "--region") && i + 1 < argc) {
-			if (sscanf(argv[++i], "%u,%u,%u,%u", &rx, &ry, &rw, &rh) != 4) {
+			char extra;
+
+			if (sscanf(argv[++i], "%u,%u,%u,%u%c", &rx, &ry, &rw, &rh,
+				   &extra) != 4) {
 				fprintf(stderr, "--region expects x,y,w,h\n");
 				return 1;
 			}
 			has_region = 1;
 		} else if (!strcmp(argv[i], "--frames") && i + 1 < argc) {
-			frames = atol(argv[++i]);
+			char *end = NULL;
+
+			errno = 0;
+			frames = strtol(argv[++i], &end, 10);
+			if (errno || !end || *end || frames <= 0) {
+				fprintf(stderr, "--frames expects a positive integer\n");
+				return 1;
+			}
 		} else if (!strcmp(argv[i], "--no-dmabuf")) {
 			no_dmabuf = 1;
 		} else {
 			fprintf(stderr,
-			        "usage: %s [--device /dev/dri/renderDN] [--region x,y,w,h] [--frames N] [--no-dmabuf]\n",
+			        "usage: %s [--device /dev/dri/renderDN] [--session-file PATH] [--region x,y,w,h] [--frames N] [--no-dmabuf]\n",
 			        argv[0]);
 			return 1;
 		}
 	}
 
-	int fd = open(dev, O_RDWR | O_CLOEXEC);
-	if (fd < 0) {
-		perror("open");
+	if (!session_file) {
+		fprintf(stderr,
+			"--session-file is required for capture on secure UAPI v11 sessions\n");
 		return 1;
 	}
 
+	char discovered_device[256];
+	int already_bound = 0;
+	int fd;
+
+	if (dev) {
+		fd = open(dev, O_RDWR | O_CLOEXEC);
+		if (fd < 0) {
+			perror("open");
+			return 1;
+		}
+	} else {
+		fd = hermes_session_open_bound_render(session_file,
+						     discovered_device,
+						     sizeof(discovered_device), NULL);
+		if (fd < 0) {
+			fprintf(stderr, "could not find the render node for session %s: %s\n",
+				session_file, strerror(errno));
+			return 1;
+		}
+		dev = discovered_device;
+		already_bound = 1;
+	}
+
+	if (!already_bound && hermes_session_require_token_uapi(fd) < 0) {
+		fprintf(stderr, "%s is not a Hermes-KMS v11 session device: %s\n",
+			dev, strerror(errno));
+		close(fd);
+		return 1;
+	}
 	struct drm_hermes_kms_version ver = {0};
 	if (ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_VERSION, &ver) != 0) {
 		perror("GET_VERSION (is this a hermes-kms device?)");
+		close(fd);
 		return 1;
 	}
-	printf("driver: %s %u.%u.%u uapi=%u\n", ver.driver_name, ver.driver_major,
+	printf("device: %s\ndriver: %s %u.%u.%u uapi=%u\n", dev, ver.driver_name, ver.driver_major,
 	       ver.driver_minor, ver.driver_patch, ver.uapi_version);
+	if (!already_bound && hermes_session_bind_file(fd, session_file, NULL) < 0) {
+		fprintf(stderr, "SESSION_ACCESS BIND failed: %s\n", strerror(errno));
+		close(fd);
+		return 1;
+	}
 
 	uint64_t after_seq = 0;
 	uint32_t last_checksum = 0;
@@ -127,7 +180,7 @@ int main(int argc, char **argv)
 		}
 		uint32_t cw = rw ? rw : w - rx;
 		uint32_t ch = rh ? rh : h - ry;
-		if (rx + cw > w || ry + ch > h) {
+		if (cw > w - rx || ch > h - ry) {
 			fprintf(stderr, "region exceeds framebuffer (%ux%u)\n", w, h);
 			return 1;
 		}
@@ -141,19 +194,64 @@ int main(int argc, char **argv)
 		printf(" dmabuf=%s\n", dma_ok ? "yes" : "NO");
 
 		if (!dma_ok) {
-			printf("  (no DMA-BUF: set FRAME_REQUEST_DMABUF failed; try without --no-dmabuf)\n");
+			printf("  (no DMA-BUF%s)\n",
+			       no_dmabuf ? ": metadata-only mode requested" : ": export failed");
+			if (!no_dmabuf)
+				return 1;
 			count++;
 			continue;
+		}
+		if (frame.plane_count != 1 || frame.dma_buf_fd[0] < 0 ||
+		    frame.pitch[0] == 0) {
+			fprintf(stderr, "unsupported DMA-BUF layout: planes=%u pitch=%u fd=%d\n",
+				frame.plane_count, frame.pitch[0], frame.dma_buf_fd[0]);
+			for (uint32_t i = 0; i < 4; i++)
+				if (frame.dma_buf_fd[i] >= 0)
+					close(frame.dma_buf_fd[i]);
+			if (frame.sync_file_fd >= 0)
+				close(frame.sync_file_fd);
+			return 1;
 		}
 
 		/* wait for the producer fence (plane 0 sync file) */
 		if (frame.sync_file_fd >= 0) {
-			struct pollfd pfd = {.fd = frame.sync_file_fd, .events = POLLIN};
-			poll(&pfd, 1, 2000);
+			if (hermes_sync_file_wait(frame.sync_file_fd, 2000) < 0) {
+				fprintf(stderr, "producer fence wait failed: %s\n",
+					strerror(errno));
+				close(frame.sync_file_fd);
+				close(frame.dma_buf_fd[0]);
+				return 1;
+			}
 			close(frame.sync_file_fd);
 		}
 
-		void *map = mmap(NULL, (size_t)frame.pitch[0] * h, PROT_READ, MAP_SHARED,
+		if ((size_t)h > (SIZE_MAX - frame.offset[0]) / frame.pitch[0]) {
+			fprintf(stderr, "DMA-BUF mapping length overflow\n");
+			close(frame.dma_buf_fd[0]);
+			return 1;
+		}
+		size_t bpp = (frame.format == XR24 || frame.format == AR24) ? 4u : 0u;
+		if (!bpp) {
+			fprintf(stderr, "unsupported pixel format (expected XR24/AR24)\n");
+			close(frame.dma_buf_fd[0]);
+			return 1;
+		}
+		if ((size_t)w > SIZE_MAX / bpp ||
+		    (size_t)frame.pitch[0] < (size_t)w * bpp) {
+			fprintf(stderr, "DMA-BUF pitch is smaller than a pixel row\n");
+			close(frame.dma_buf_fd[0]);
+			return 1;
+		}
+		size_t map_len = frame.offset[0] + (size_t)frame.pitch[0] * h;
+		off_t object_size = lseek(frame.dma_buf_fd[0], 0, SEEK_END);
+		if (object_size < 0 || (uintmax_t)object_size < (uintmax_t)map_len) {
+			fprintf(stderr, "frame metadata exceeds DMA-BUF: need=%zu size=%jd\n",
+				map_len, (intmax_t)object_size);
+			close(frame.dma_buf_fd[0]);
+			return 1;
+		}
+
+		void *map = mmap(NULL, map_len, PROT_READ, MAP_SHARED,
 		                 frame.dma_buf_fd[0], 0);
 		if (map == MAP_FAILED) {
 			perror("mmap dmabuf");
@@ -161,10 +259,17 @@ int main(int argc, char **argv)
 			return 1;
 		}
 
-		int bpp = (frame.format == XR24 || frame.format == AR24) ? 4 : 0;
-		if (bpp == 0) {
-			printf("  unsupported format for peek (expected XR24/AR24)\n");
-		} else {
+		struct dma_buf_sync dma_sync = {
+			.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
+		};
+		if (ioctl(frame.dma_buf_fd[0], DMA_BUF_IOCTL_SYNC, &dma_sync) < 0) {
+			perror("DMA_BUF_IOCTL_SYNC START");
+			munmap(map, map_len);
+			close(frame.dma_buf_fd[0]);
+			return 1;
+		}
+
+		{
 			const uint8_t *base = (const uint8_t *)map + frame.offset[0];
 			uint32_t checksum = 0;
 			for (uint32_t y = ry; y < ry + ch; y++) {
@@ -180,19 +285,26 @@ int main(int argc, char **argv)
 			last_checksum = checksum;
 
 			/* first 4 pixels of the region */
-			for (int py = 0; py < 4 && ry + (uint32_t)py < ry + ch; py++) {
+			for (uint32_t py = 0; py < 4 && py < ch; py++) {
 				const uint8_t *row = base + (size_t)(ry + py) * frame.pitch[0] + (size_t)rx * bpp;
-				printf("\n    row+%d: ", py);
+				printf("\n    row+%u: ", py);
 				for (uint32_t px = 0; px < 4 && px < cw; px++)
 					printf("%02x%02x%02x ", row[px * bpp], row[px * bpp + 1], row[px * bpp + 2]);
 			}
 			printf("\n");
 		}
 
-		munmap(map, (size_t)frame.pitch[0] * h);
+		dma_sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+		if (ioctl(frame.dma_buf_fd[0], DMA_BUF_IOCTL_SYNC, &dma_sync) < 0) {
+			perror("DMA_BUF_IOCTL_SYNC END");
+			munmap(map, map_len);
+			close(frame.dma_buf_fd[0]);
+			return 1;
+		}
+		munmap(map, map_len);
 		close(frame.dma_buf_fd[0]);
-		if (new_frame)
-			count++;
+		/* A timeout still produced a valid sample of the current scanout. */
+		count++;
 	}
 
 	close(fd);

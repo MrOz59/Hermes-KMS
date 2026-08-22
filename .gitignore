@@ -19,3 +19,5 @@ tools/hermes-egl-import-check/hermes-egl-import-check
 tools/hermes-egl-import-check/pitch-detect
 tools/hermes-cursor-probe/hermes_cursor_probe
 tools/hermes-pixel-peek/hermes_pixel_peek
+tools/hermes-sysmem-import-check/hermes-sysmem-import-check
+tools/hermes-imported-scanout-test/hermes-imported-scanout-test

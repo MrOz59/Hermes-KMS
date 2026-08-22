@@ -19,17 +19,36 @@ set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KO="$REPO/kernel/hermes-kms/hermes_kms.ko"
 SRC="$REPO/scripts/hermes-export-stress.c"
-BIN="${TMPDIR:-/tmp}/hermes-export-stress"
+TEST_TMP="$(mktemp -d /tmp/hermes-export-stress.XXXXXX)"
+BIN="$TEST_TMP/hermes-export-stress"
+BUILD_LOG="$TEST_TMP/build.log"
+RMMOD_LOG="$TEST_TMP/rmmod.log"
 SECONDS_RUN="${1:-15}"
 THREADS="${2:-12}"
 FAIL=0
+LOADED_BY_TEST=0
+
+cleanup() {
+  if [ "$LOADED_BY_TEST" -eq 1 ]; then
+    rmmod hermes_kms 2>/dev/null || true
+  fi
+  rm -rf -- "$TEST_TMP"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ "$(id -u)" -ne 0 ]; then echo "run as root: sudo $0" >&2; exit 1; fi
 if [ ! -f "$KO" ]; then echo "module not built: $KO" >&2; exit 1; fi
+if [ -d /sys/module/hermes_kms ]; then
+  echo "hermes_kms is already loaded; use a disposable VM or unload it first" >&2
+  exit 1
+fi
 
 if ! cc -O2 -pthread -I/usr/include/libdrm -I"$REPO/include/uapi" \
-        -o "$BIN" "$SRC" -ldrm 2>/tmp/stress-build.log; then
-  echo "### could not build hermes-export-stress:"; cat /tmp/stress-build.log; exit 1
+        -o "$BIN" "$SRC" -ldrm 2>"$BUILD_LOG"; then
+  echo "### could not build hermes-export-stress:"; cat "$BUILD_LOG"; exit 1
 fi
 
 # Report whether a memory-debug facility is active so results are interpretable.
@@ -38,10 +57,10 @@ grep -qE "slub_debug|page_poison|kasan" /proc/cmdline \
   && echo "### mem-debug cmdline: $(cat /proc/cmdline)" \
   || echo "### WARNING: no slub_debug/page_poison/kasan on cmdline -- UAF coverage is weak. See script header."
 
-lsmod | grep -q '^hermes_kms' && rmmod hermes_kms 2>/dev/null
 insmod "$KO" initial_enabled=1 hotplug_events=0 \
        initial_width=1920 initial_height=1080 initial_refresh_hz=60 || {
   echo "### insmod FAILED"; exit 1; }
+LOADED_BY_TEST=1
 sleep 0.3
 
 # Snapshot dmesg high-water so we only judge splats produced during the run.
@@ -51,7 +70,12 @@ echo "### running stress (${SECONDS_RUN}s, ${THREADS} threads)"
 "$BIN" "$SECONDS_RUN" "$THREADS"
 STRESS_RC=$?
 
-echo "### dmesg splat check (new lines only):"
+# Verify the export cache fully drained: after the producer stops, disabling the
+# output (rmmod path) must drop all cached dma-bufs with no leak warning.
+rmmod hermes_kms 2>"$RMMOD_LOG" && { echo "### rmmod OK"; LOADED_BY_TEST=0; } \
+  || { echo "### rmmod FAILED:"; cat "$RMMOD_LOG"; FAIL=1; }
+
+echo "### dmesg splat check (new lines, including unload):"
 SPLAT=$(dmesg | tail -n +"$((DMESG_MARK + 1))" \
   | grep -iE "BUG:|KASAN|use-after-free|WARNING:|RIP:|slab corruption|Redzone|Poison|refcount|general protection|null pointer" \
   || true)
@@ -60,11 +84,6 @@ if [ -n "$SPLAT" ]; then
 else
   echo "###   clean"
 fi
-
-# Verify the export cache fully drained: after the producer stops, disabling the
-# output (rmmod path) must drop all cached dma-bufs with no leak warning.
-rmmod hermes_kms 2>/tmp/rmmod.log && echo "### rmmod OK" \
-  || { echo "### rmmod FAILED:"; cat /tmp/rmmod.log; FAIL=1; }
 
 [ "$STRESS_RC" -ne 0 ] && FAIL=1
 

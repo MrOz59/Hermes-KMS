@@ -8,13 +8,14 @@ ConditionPathExists=/usr/bin/seatd
 [Service]
 Type=simple
 User=root
-Group=seat
+Group=root
 PrivateMounts=yes
 RuntimeDirectory=hermes-kms-seatd/%i
-RuntimeDirectoryMode=0750
-ExecStart=/usr/lib/hermes-kms/hermes-kms-seatd-instance %i auto seat
+RuntimeDirectoryMode=0711
+ExecStart=/usr/lib/hermes-kms/hermes-kms-seatd-instance %i auto root
 Restart=on-failure
 RestartSec=1s
+UMask=0077
 
 # seatd mediates DRM/input access and therefore intentionally needs root and
 # unrestricted device access. Keep the remaining service surface small.
@@ -22,6 +23,20 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SYS_ADMIN CAP_SYS_TTY_CONFIG
 # The launcher creates/owns the common runtime root before binding the
 # instance directory over its private /run.
 ReadWritePaths=/run/hermes-kms-seatd

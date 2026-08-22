@@ -1,5 +1,5 @@
 #!/bin/sh
-# Configure the packaged Hermes-KMS session pool for the user running Hermes.
+# Configure the packaged Hermes-KMS session pool for one non-root consumer.
 set -eu
 
 DEFAULT_SESSION_DEVICES=4
@@ -7,12 +7,14 @@ MAX_SESSION_DEVICES=8
 MODPROBE_CONFIG=/etc/modprobe.d/hermes-kms.conf
 MODULES_CONFIG=/etc/modules-load.d/hermes-kms.conf
 SESSION_USER_FILE=/etc/hermes-kms/session-user
+RUNTIME_ROOT=/run/hermes-kms-seatd
+ACCESS_RULE=/etc/udev/rules.d/90-hermes-kms-user.rules
 
 usage() {
 	printf '%s\n' \
 		"Usage: hermes-kms-setup configure --user UID|auto [--session-devices N]" \
 		"" \
-		"Configures one seat0 host card plus N private session cards." >&2
+		"Configures one seat0 host card plus N private session cards for the selected UID." >&2
 	exit 2
 }
 
@@ -54,13 +56,9 @@ case "$TARGET_UID" in
 		;;
 esac
 case "$SESSION_DEVICES" in
-	''|*[!0-9]*) printf 'session device count must be 1-%s\n' "$MAX_SESSION_DEVICES" >&2; exit 2 ;;
+	1|2|3|4|5|6|7|8) ;;
+	*) printf 'session device count must be 1-%s\n' "$MAX_SESSION_DEVICES" >&2; exit 2 ;;
 esac
-[ "$SESSION_DEVICES" -ge 1 ] &&
-	[ "$SESSION_DEVICES" -le "$MAX_SESSION_DEVICES" ] || {
-	printf 'session device count must be 1-%s\n' "$MAX_SESSION_DEVICES" >&2
-	exit 2
-}
 getent passwd "$TARGET_UID" >/dev/null || {
 	printf 'uid %s does not identify a local user\n' "$TARGET_UID" >&2
 	exit 2
@@ -73,23 +71,72 @@ command -v modprobe >/dev/null || {
 	printf 'modprobe is required\n' >&2
 	exit 3
 }
+command -v systemctl >/dev/null || {
+	printf 'systemctl is required\n' >&2
+	exit 3
+}
+command -v udevadm >/dev/null || {
+	printf 'udevadm is required\n' >&2
+	exit 3
+}
+if [ -L /etc/hermes-kms ]; then
+	printf 'refusing symlink configuration directory: /etc/hermes-kms\n' >&2
+	exit 3
+fi
+install -d -o root -g root -m 0755 \
+	/etc/hermes-kms /etc/modprobe.d /etc/modules-load.d /etc/udev/rules.d
 
-install -d -m 0755 /etc/hermes-kms /etc/modprobe.d /etc/modules-load.d
+tmp_config=
+tmp_user=
+tmp_modules=
+tmp_access_rule=
+cleanup_tmp() {
+	for tmp_file in "$tmp_config" "$tmp_user" "$tmp_modules" "$tmp_access_rule"; do
+		[ -n "$tmp_file" ] && rm -f -- "$tmp_file"
+	done
+}
+trap cleanup_tmp EXIT
+trap 'exit 1' HUP INT TERM
 tmp_config="$(mktemp "${MODPROBE_CONFIG}.XXXXXX")"
-trap 'rm -f "$tmp_config"' EXIT HUP INT TERM
+tmp_user="$(mktemp "${SESSION_USER_FILE}.XXXXXX")"
+tmp_modules="$(mktemp "${MODULES_CONFIG}.XXXXXX")"
+tmp_access_rule="$(mktemp "${ACCESS_RULE}.XXXXXX")"
 {
 	printf '%s\n' \
 		'# Managed by hermes-kms-setup. Connectors stay disabled until owned.' \
 		"# One host card remains on seat0; ${SESSION_DEVICES} private cards are pre-created." \
 		"options hermes_kms initial_enabled=0 outputs=1 session_devices=${SESSION_DEVICES}"
 } >"$tmp_config"
-chmod 0644 "$tmp_config"
-mv "$tmp_config" "$MODPROBE_CONFIG"
+printf '%s\n' "$TARGET_UID" >"$tmp_user"
+printf '%s\n' hermes_kms >"$tmp_modules"
+{
+	printf '%s\n' \
+		'# Managed by hermes-kms-setup. Grants one configured UID render-node access.' \
+		'# Numeric non-system OWNER is deprecated by udev; use is temporary until a managed group/ACL design replaces it.' \
+		"ACTION==\"add|change\", SUBSYSTEM==\"drm\", KERNEL==\"renderD[0-9]*\", DEVPATH==\"*/platform/hermes-kms*/drm/renderD*\", OWNER=\"${TARGET_UID}\", GROUP=\"root\", MODE=\"0600\", TAG-=\"uaccess\""
+} >"$tmp_access_rule"
+chmod 0644 "$tmp_config" "$tmp_user" "$tmp_modules" "$tmp_access_rule"
+mv -fT -- "$tmp_config" "$MODPROBE_CONFIG"
+mv -fT -- "$tmp_user" "$SESSION_USER_FILE"
+mv -fT -- "$tmp_modules" "$MODULES_CONFIG"
+mv -fT -- "$tmp_access_rule" "$ACCESS_RULE"
+tmp_config=
+tmp_user=
+tmp_modules=
+tmp_access_rule=
 trap - EXIT HUP INT TERM
-printf '%s\n' "$TARGET_UID" >"$SESSION_USER_FILE"
-chmod 0644 "$SESSION_USER_FILE"
-printf '%s\n' hermes_kms >"$MODULES_CONFIG"
-chmod 0644 "$MODULES_CONFIG"
+
+# Repair the ownership left by launcher versions that made this common root
+# writable by the session user. /run itself is root-owned, so this path cannot
+# be replaced while its ownership and mode are corrected.
+if [ -L "$RUNTIME_ROOT" ]; then
+	printf 'refusing symlink runtime directory: %s\n' "$RUNTIME_ROOT" >&2
+	exit 3
+fi
+if [ -d "$RUNTIME_ROOT" ]; then
+	chown root:root "$RUNTIME_ROOT"
+	chmod 0711 "$RUNTIME_ROOT"
+fi
 
 systemctl daemon-reload
 udevadm control --reload-rules
@@ -111,15 +158,21 @@ if [ ! -d /sys/module/hermes_kms ]; then
 	fi
 fi
 
-if [ ! -r /sys/module/hermes_kms/parameters/session_devices ]; then
+if [ ! -r /sys/module/hermes_kms/parameters/session_devices ] ||
+   [ ! -r /sys/module/hermes_kms/parameters/outputs ] ||
+   [ ! -r /sys/module/hermes_kms/parameters/initial_enabled ]; then
 	printf 'configuration saved; reboot required because the loaded Hermes-KMS driver predates automatic session pools\n'
 	exit 10
 fi
 
 running_session_devices="$(cat /sys/module/hermes_kms/parameters/session_devices)"
-if [ "$running_session_devices" != "$SESSION_DEVICES" ]; then
-	printf 'configuration saved; reboot required (running session_devices=%s, requested=%s)\n' \
-		"$running_session_devices" "$SESSION_DEVICES"
+running_outputs="$(cat /sys/module/hermes_kms/parameters/outputs)"
+running_initial_enabled="$(cat /sys/module/hermes_kms/parameters/initial_enabled)"
+if [ "$running_session_devices" != "$SESSION_DEVICES" ] ||
+   [ "$running_outputs" != 1 ] ||
+   { [ "$running_initial_enabled" != N ] && [ "$running_initial_enabled" != 0 ]; }; then
+	printf '%s\n' \
+		"configuration saved; reboot required (running session_devices=${running_session_devices}, requested=${SESSION_DEVICES}; running outputs=${running_outputs}, requested=1; running initial_enabled=${running_initial_enabled}, requested=0)"
 	exit 10
 fi
 

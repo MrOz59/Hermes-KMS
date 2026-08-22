@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  userspace-and-packaging:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install build and validation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            dash \
+            gcc-multilib \
+            libc6-dev-i386 \
+            libdrm-dev \
+            libegl-dev \
+            libgbm-dev \
+            libgl-dev \
+            libva-dev \
+            libxml2-utils \
+            pkg-config \
+            udev
+
+      - name: Run userspace regression checks
+        run: make check
+
+      - name: Check shell and packaged configuration syntax
+        shell: bash
+        run: |
+          mapfile -t shell_files < <(
+            git ls-files '*.sh' hermes-kms.install \
+              scripts/hermes-kms-setup scripts/hermes-kms-seatd-instance
+          )
+          bash -n "${shell_files[@]}"
+          bash -n PKGBUILD
+          dash -n scripts/hermes-kms-setup
+          xmllint --noout packaging/polkit/io.github.mroz59.hermes-kms.policy
+          udevadm verify udev/70-hermes-kms-session-seats.rules
+          udevadm verify udev/99-hermes-kms-ignore-seat.rules
+          sudo install -Dm0755 scripts/hermes-kms-seatd-instance \
+            /usr/lib/hermes-kms/hermes-kms-seatd-instance
+          systemd-analyze verify packaging/systemd/hermes-kms-seatd@.service
+
+      - name: Build optional userspace tools
+        run: make -j2 tools
+
+      - name: Smoke-test staged runtime installation
+        run: |
+          make install-configs install-uapi \
+            DESTDIR="$RUNNER_TEMP/stage" \
+            SYSTEM_UDEV_RULE_DIR=/usr/lib/udev/rules.d
+          test -f "$RUNNER_TEMP/stage/usr/lib/modprobe.d/hermes-kms.conf"
+          test -x "$RUNNER_TEMP/stage/usr/lib/hermes-kms/hermes-kms-setup"
+          test -f "$RUNNER_TEMP/stage/usr/lib/systemd/system/hermes-kms-seatd@.service"
+          test -f "$RUNNER_TEMP/stage/usr/include/drm/hermes_kms_drm.h"
+          test -f "$RUNNER_TEMP/stage/usr/include/hermes-kms/hermes_session.h"
+          test -f "$RUNNER_TEMP/stage/usr/share/licenses/hermes-kms/MIT.txt"
+          printf '%s\n' \
+            '#include <hermes-kms/hermes_session.h>' \
+            'int main(void) { return 0; }' | \
+            cc -std=c11 -Werror -pedantic \
+              -I"$RUNNER_TEMP/stage/usr/include" \
+              $(pkg-config --cflags libdrm) \
+              -x c -c -o "$RUNNER_TEMP/installed-header.o" -
+          printf '%s\n' \
+            '#include <hermes-kms/hermes_session.h>' \
+            'int main() { return 0; }' | \
+            c++ -std=c++17 -Werror -pedantic \
+              -I"$RUNNER_TEMP/stage/usr/include" \
+              $(pkg-config --cflags libdrm) \
+              -x c++ -c -o "$RUNNER_TEMP/installed-header-cxx.o" -
+
+      - name: Clean every build product
+        run: |
+          make clean-tools
+          test ! -e tools/hermes-kmsctl/hermes-kmsctl
+          test ! -e tools/hermes-sysmem-import-check/hermes-sysmem-import-check
+          test ! -e tools/hermes-imported-scanout-test/hermes-imported-scanout-test
+
+      - name: Reject whitespace errors
+        run: git diff --check
+
+  kernel-module:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container: archlinux:base-devel
+
+    steps:
+      - name: Install rolling kernel build dependencies
+        run: |
+          pacman -Syu --noconfirm \
+            bc \
+            bison \
+            elfutils \
+            flex \
+            git \
+            linux-headers \
+            openssl
+
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Locate current Arch kernel headers
+        shell: bash
+        run: |
+          module_dir="$(find /usr/lib/modules -mindepth 1 -maxdepth 1 \
+            -type d -print | sort -V | tail -n 1)"
+          test -n "$module_dir"
+          test -f "$module_dir/build/Makefile"
+          printf 'KDIR=%s/build\n' "$module_dir" >> "$GITHUB_ENV"
+          printf 'KERNELRELEASE=%s\n' "${module_dir##*/}" >> "$GITHUB_ENV"
+
+      - name: Build the default module target
+        run: |
+          make -j2 KDIR="$KDIR" KERNELRELEASE="$KERNELRELEASE"
+          test -f kernel/hermes-kms/hermes_kms.ko
+          test ! -e tools/hermes-kmsctl/hermes-kmsctl
+
+      - name: Clean module artifacts
+        run: |
+          make clean KDIR="$KDIR" KERNELRELEASE="$KERNELRELEASE"
+          test ! -e kernel/hermes-kms/hermes_kms.ko

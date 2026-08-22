@@ -11,16 +11,12 @@ _pkgbase=hermes-kms
 pkgver=0.4.0
 pkgrel=1
 pkgdesc="Hermes-KMS zero-copy virtual display DRM/KMS driver (DKMS)"
-arch=('x86_64')
+arch=('any')
 url="https://github.com/MrOz59/Hermes-KMS"
-license=('GPL2')
+license=('GPL2' 'MIT')
 depends=('dkms' 'seatd')
 makedepends=('git')
-install=hermes-kms.install
-optdepends=('libva: VAAPI import-check tool'
-            'libdrm: VAAPI import-check tool'
-            'kscreen: enable the virtual output on KDE/KWin'
-            'polkit: configure the private session pool from Hermes')
+optdepends=('polkit: authorize hermes-kms-setup through pkexec')
 provides=('hermes-kms')
 conflicts=('hermes-kms')
 # Reports a stale /etc/modprobe.d override that masks the shipped default.
@@ -48,27 +44,15 @@ package() {
   local _dest="$pkgdir/usr/src/${_pkgbase}-${pkgver}"
   install -dm755 "$_dest"
 
-  # Ship the whole source tree so DKMS can build the module (the module Makefile
-  # references ../../include/uapi, so the layout must be preserved).
-  cp -a Makefile dkms.conf include kernel packaging tools udev scripts "$_dest/"
+  # DKMS needs only the module build files. Do not copy generated/host-native
+  # tool binaries or unrelated packaging assets into the privileged source tree.
+  cp -a Makefile dkms.conf include kernel "$_dest/"
 
   # Make the DKMS package version match the directory DKMS expects.
   sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${pkgver}\"/" "$_dest/dkms.conf"
 
-  # Auto-load the module disconnected; Hermes enables each connector only
-  # while a streaming session owns it.
-  install -Dm644 packaging/modules-load.d/hermes-kms.conf \
-    "$pkgdir/usr/lib/modules-load.d/hermes-kms.conf"
-  install -Dm644 packaging/modprobe.d/hermes-kms.conf \
-    "$pkgdir/usr/lib/modprobe.d/hermes-kms.conf"
-  install -Dm644 udev/70-hermes-kms-session-seats.rules \
-    "$pkgdir/usr/lib/udev/rules.d/70-hermes-kms-session-seats.rules"
-  install -Dm755 scripts/hermes-kms-seatd-instance \
-    "$pkgdir/usr/lib/hermes-kms/hermes-kms-seatd-instance"
-  install -Dm755 scripts/hermes-kms-setup \
-    "$pkgdir/usr/lib/hermes-kms/hermes-kms-setup"
-  install -Dm644 packaging/systemd/hermes-kms-seatd@.service \
-    "$pkgdir/usr/lib/systemd/system/hermes-kms-seatd@.service"
-  install -Dm644 packaging/polkit/io.github.mroz59.hermes-kms.policy \
-    "$pkgdir/usr/share/polkit-1/actions/io.github.mroz59.hermes-kms.policy"
+  # Keep package and image-based installs on the same runtime manifest.
+  make DESTDIR="$pkgdir" \
+    HERMES_LICENSE_DIR="/usr/share/licenses/$pkgname" \
+    install-configs install-uapi
 }

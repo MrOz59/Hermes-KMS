@@ -12,10 +12,13 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KO="$REPO/kernel/hermes-kms/hermes_kms.ko"
 CTL="$REPO/tools/hermes-kmsctl/hermes-kmsctl"
 OLD_CTL="${1:-$REPO/tools/hermes-kmsctl/hermes-kmsctl-v0.1.2}"
+TEST_TMP="$(mktemp -d /tmp/hermes-uapi-compat.XXXXXX)"
 OLD_BUILD_DIR=""
 OLD_HOLD_PID=""
 NEW_HOLD_PID=""
+NEW_SESSION="$TEST_TMP/new-session.auth"
 FAIL=0
+LOADED_BY_TEST=0
 
 cleanup()
 {
@@ -29,10 +32,10 @@ cleanup()
 		[ -n "$pid" ] || continue
 		wait "$pid" 2>/dev/null || true
 	done
-	timeout -k 1s 5s rmmod hermes_kms 2>/dev/null || true
-	if [ -n "$OLD_BUILD_DIR" ]; then
-		rm -rf -- "$OLD_BUILD_DIR"
+	if [ "$LOADED_BY_TEST" -eq 1 ]; then
+		timeout -k 1s 5s rmmod hermes_kms 2>/dev/null || true
 	fi
+	rm -rf -- "$TEST_TMP"
 }
 trap cleanup EXIT
 
@@ -63,8 +66,12 @@ require_value()
 }
 [ -f "$KO" ] || { printf 'module not built: %s\n' "$KO" >&2; exit 1; }
 [ -x "$CTL" ] || { printf 'control tool not built: %s\n' "$CTL" >&2; exit 1; }
+[ ! -d /sys/module/hermes_kms ] || {
+	printf 'hermes_kms is already loaded; use a disposable VM or unload it first\n' >&2
+	exit 1
+}
 if [ ! -x "$OLD_CTL" ] && [ "$#" -eq 0 ]; then
-	OLD_BUILD_DIR="$(mktemp -d /tmp/hermes-kms-v0.1.2.XXXXXX)"
+	OLD_BUILD_DIR="$TEST_TMP/v0.1.2"
 	mkdir -p "$OLD_BUILD_DIR/include/drm"
 	git -c safe.directory="$REPO" -C "$REPO" \
 		show v0.1.2:tools/hermes-kmsctl/hermes_kmsctl.c \
@@ -81,31 +88,58 @@ fi
 	exit 1
 }
 
+# A stale development configuration can expose a connected output before any
+# controller owns it. Secure status intentionally hides that active framebuffer,
+# but an unowned legacy output must still be recoverable without first creating
+# a throwaway session.
+insmod "$KO" initial_enabled=1 hotplug_events=0 outputs=1
+LOADED_BY_TEST=1
+sleep 0.2
+"$CTL" disable >"$TEST_TMP/unowned-disable.log"
+require_value "$("$CTL" status)" enabled false
+rmmod hermes_kms
+LOADED_BY_TEST=0
+
 insmod "$KO" initial_enabled=0 hotplug_events=0 outputs=2
+LOADED_BY_TEST=1
 sleep 0.5
 
 # These ioctl numbers and struct sizes must remain compatible.
-require_value "$("$OLD_CTL" version)" uapi_version 10
+require_value "$("$OLD_CTL" version)" uapi_version 11
 require_value "$("$OLD_CTL" identity)" output HERMES-1
 "$OLD_CTL" caps >/dev/null
 "$OLD_CTL" status >/dev/null
 
-"$OLD_CTL" hold 1920x1080@60 >"/tmp/hermes-old-hold.log" 2>&1 &
+"$OLD_CTL" hold 1920x1080@60 >"$TEST_TMP/hermes-old-hold.log" 2>&1 &
 OLD_HOLD_PID=$!
 sleep 0.5
 
-STATUS_1="$("$CTL" --output 1 status)"
+if STATUS_1="$("$CTL" --output 1 status 2>/dev/null)"; then
+	printf 'FAIL: unbound v11 fd unexpectedly read the legacy-owned session\n' >&2
+	FAIL=1
+else
+	STATUS_1=""
+fi
 STATUS_2="$("$CTL" --output 2 status)"
-require_value "$STATUS_1" enabled true
 require_value "$STATUS_2" enabled false
+kill -0 "$OLD_HOLD_PID" 2>/dev/null || {
+	printf 'FAIL: legacy owner did not remain alive\n' >&2
+	exit 1
+}
+grep -q '^enabled=true$' "$TEST_TMP/hermes-old-hold.log" || {
+	printf 'FAIL: legacy owner did not enable HERMES-1\n' >&2
+	exit 1
+}
 
-"$CTL" --output 2 hold 1280x720@60 >"/tmp/hermes-new-hold.log" 2>&1 &
+"$CTL" --output 2 --session-file "$NEW_SESSION" hold 1280x720@60 >"$TEST_TMP/hermes-new-hold.log" 2>&1 &
 NEW_HOLD_PID=$!
-sleep 0.5
+for _ in {1..50}; do
+	[ -f "$NEW_SESSION" ] && break
+	sleep 0.02
+done
+[ -f "$NEW_SESSION" ] || { printf 'FAIL: v11 owner did not publish its session file\n' >&2; exit 1; }
 
-STATUS_1="$("$CTL" --output 1 status)"
-STATUS_2="$("$CTL" --output 2 status)"
-require_value "$STATUS_1" enabled true
+STATUS_2="$("$CTL" --session-file "$NEW_SESSION" status)"
 require_value "$STATUS_2" enabled true
 
 kill -TERM "$OLD_HOLD_PID"
@@ -114,7 +148,7 @@ OLD_HOLD_PID=""
 sleep 0.2
 
 STATUS_1="$("$CTL" --output 1 status)"
-STATUS_2="$("$CTL" --output 2 status)"
+STATUS_2="$("$CTL" --session-file "$NEW_SESSION" status)"
 require_value "$STATUS_1" enabled false
 require_value "$STATUS_2" enabled true
 
@@ -129,4 +163,4 @@ if [ "$FAIL" -ne 0 ]; then
 fi
 
 printf '%s\n' \
-	'PASS: unmodified v0.1.2 client remains bound to HERMES-1 under UAPI v10'
+	'PASS: unmodified v0.1.2 owner remains bound to HERMES-1 under secure UAPI v11'

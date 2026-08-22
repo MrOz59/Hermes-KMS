@@ -20,10 +20,10 @@ PRODUCER_CMD=""
 CHECK_VAAPI_IMPORT=0
 VA_DEVICE=""
 LOADED_BY_SCRIPT=0
-OUTPUT_READY_WITHOUT_OWNER=0
 OWNER_PID=""
 PRODUCER_PID=""
 WORK_DIR="$REPO_ROOT/build/hermes-kms-zero-copy-$UID"
+SESSION_FILE="$WORK_DIR/session.auth"
 
 usage()
 {
@@ -84,6 +84,7 @@ cleanup()
 		kill "$OWNER_PID" 2>/dev/null || true
 		wait "$OWNER_PID" 2>/dev/null || true
 	fi
+	rm -f -- "$SESSION_FILE"
 
 	if [ "$LOADED_BY_SCRIPT" -eq 1 ] && [ "$KEEP_LOADED" -eq 0 ]; then
 		log "unloading hermes_kms"
@@ -161,12 +162,16 @@ MODE_HZ="${BASH_REMATCH[3]}"
 
 run_ctl()
 {
+	local auth_args=()
+	if [ -f "$SESSION_FILE" ]; then
+		auth_args=(--session-file "$SESSION_FILE")
+	fi
 	if [ -n "$CONTROL_DEVICE" ]; then
-		"$CTL" --device "$CONTROL_DEVICE" "$@"
+		"$CTL" --device "$CONTROL_DEVICE" "${auth_args[@]}" "$@"
 	elif [ -n "$DEVICE" ]; then
-		"$CTL" --device "$DEVICE" "$@"
+		"$CTL" --device "$DEVICE" "${auth_args[@]}" "$@"
 	else
-		"$CTL" "$@"
+		"$CTL" "${auth_args[@]}" "$@"
 	fi
 }
 
@@ -359,7 +364,7 @@ run_vaapi_import_check()
 	[ "$CHECK_VAAPI_IMPORT" -eq 1 ] || return 0
 	[ -x "$IMPORT_CHECK" ] || fail "$IMPORT_CHECK is missing or not executable"
 
-	args=(--wait-ms 1000)
+	args=(--wait-ms 1000 --session-file "$SESSION_FILE")
 	if [ -n "$CONTROL_DEVICE" ]; then
 		args+=(--device "$CONTROL_DEVICE")
 	elif [ -n "$DEVICE" ]; then
@@ -375,26 +380,30 @@ run_vaapi_import_check()
 
 start_output_owner()
 {
-	if [ "$OUTPUT_READY_WITHOUT_OWNER" -eq 1 ]; then
-		log "using initial connected output; no control owner fd is needed"
-		return 0
-	fi
-
 	mkdir -p "$WORK_DIR"
+	rm -f -- "$SESSION_FILE"
 
 	log "starting Hermes-KMS output owner for $MODE"
 	if [ -n "$CONTROL_DEVICE" ]; then
-		"$CTL" --device "$CONTROL_DEVICE" hold "$MODE" >"$WORK_DIR/output-owner.log" 2>&1 &
+		"$CTL" --device "$CONTROL_DEVICE" --session-file "$SESSION_FILE" hold "$MODE" >"$WORK_DIR/output-owner.log" 2>&1 &
 	elif [ -n "$DEVICE" ]; then
-		"$CTL" --device "$DEVICE" hold "$MODE" >"$WORK_DIR/output-owner.log" 2>&1 &
+		"$CTL" --device "$DEVICE" --session-file "$SESSION_FILE" hold "$MODE" >"$WORK_DIR/output-owner.log" 2>&1 &
 	else
-		"$CTL" hold "$MODE" >"$WORK_DIR/output-owner.log" 2>&1 &
+		"$CTL" --session-file "$SESSION_FILE" hold "$MODE" >"$WORK_DIR/output-owner.log" 2>&1 &
 	fi
 	OWNER_PID=$!
-	sleep 1
+	for _ in $(seq 1 50); do
+		[ -f "$SESSION_FILE" ] && break
+		kill -0 "$OWNER_PID" 2>/dev/null || break
+		sleep 0.02
+	done
 
 	if ! kill -0 "$OWNER_PID" 2>/dev/null; then
 		log "output owner exited; see $WORK_DIR/output-owner.log"
+		return 1
+	fi
+	if [ ! -f "$SESSION_FILE" ]; then
+		log "output owner did not publish its session capability"
 		return 1
 	fi
 
@@ -560,11 +569,18 @@ start_modetest_producer()
 }
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
-	log "building module and control tool"
-	make -C "$REPO_ROOT"
+	build_targets=(modules tools/hermes-kmsctl/hermes-kmsctl)
+	if [ "$CHECK_VAAPI_IMPORT" -eq 1 ]; then
+		build_targets+=(tools/hermes-kms-import-check/hermes-kms-import-check)
+	fi
+	log "building module and required diagnostic tools"
+	make -C "$REPO_ROOT" "${build_targets[@]}"
 else
 	[ -x "$CTL" ] || fail "$CTL is missing or not executable"
 	[ -f "$KO" ] || fail "$KO is missing"
+	if [ "$CHECK_VAAPI_IMPORT" -eq 1 ]; then
+		[ -x "$IMPORT_CHECK" ] || fail "$IMPORT_CHECK is missing or not executable"
+	fi
 fi
 
 load_isolated_module()
@@ -572,7 +588,6 @@ load_isolated_module()
 	log "loading hermes_kms for isolated testing (initial_enabled=1 hotplug_events=0)"
 	run_as_root insmod "$KO" initial_enabled=1 hotplug_events=0 initial_width="$MODE_WIDTH" initial_height="$MODE_HEIGHT" initial_refresh_hz="$MODE_HZ"
 	LOADED_BY_SCRIPT=1
-	OUTPUT_READY_WITHOUT_OWNER=1
 }
 
 unload_module()
@@ -643,6 +658,7 @@ require_cap "$caps_output" zero_copy_target
 require_cap "$caps_output" frame_wait
 require_cap "$caps_output" sync_file
 require_cap "$caps_output" metrics
+require_cap "$caps_output" session_token
 
 start_output_owner || fail "could not keep Hermes-KMS output session open"
 status_output="$(run_ctl status)"

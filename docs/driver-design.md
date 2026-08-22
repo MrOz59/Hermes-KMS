@@ -1,7 +1,9 @@
 # Hermes-KMS driver design
 
-Hermes-KMS is a Linux DRM/KMS virtual display driver that replaces EVDI for
-Hermes. It does not manage EVDI; EVDI remains a supported fallback.
+Hermes-KMS is a reusable Linux DRM/KMS virtual display driver. Hermes is its
+reference consumer, but neither the capture interface nor its authorization
+model depends on that application, Steam, or any process name. It does not
+manage EVDI; EVDI remains a supported fallback for consumers that choose it.
 
 ## Target architecture
 
@@ -14,7 +16,7 @@ GPU-backed framebuffer / GEM object
     ↓
 PRIME / DMA-BUF export
     ↓
-Hermes userspace
+Capture/streaming/recording consumer
     ↓
 VAAPI / future NVENC import
     ↓
@@ -33,29 +35,44 @@ A cursor plane lets the compositor offload pointer motion without recompositing
 the whole output, and `FB_DAMAGE_CLIPS` on the primary plane lets the driver
 forward the changed region to the capture consumer.
 
+DRM's `mode_config.min_width/min_height` limit every framebuffer, including a
+cursor, rather than only connector modes. Hermes therefore advertises a 1x1
+framebuffer minimum while separately enforcing its 640x480 minimum display mode
+in mode validation and `SET_OUTPUT`; the cursor plane itself remains capped at
+256x256.
+
 ## Multi-output prototype
 
 UAPI v8 can expose 1–8 independent virtual outputs on a single DRM device
 (`outputs=`, default 1 for compatibility). Multiple outputs are opt-in until
-the Hermes host integration can manage every connector. Every output owns a
+the consuming host integration can manage every connector. Every output owns a
 separate connector, encoder, CRTC, primary/cursor planes, software-vblank
 timer, owner session, scanout reference, frame waitqueue, metrics, and DMA-BUF
 cache. This keeps one compositor-facing DRM card while preventing two capture
 sessions from reading the same output state.
 
-Output selection is scoped to a DRM file descriptor:
+Output selection and authorization are scoped to a DRM file descriptor:
 
-1. open the Hermes-KMS render node;
-2. call `DRM_IOCTL_HERMES_KMS_SELECT_OUTPUT` with a 0-based output index;
-3. use that same fd for `SET_OUTPUT`, `WAIT_FRAME`, `ACQUIRE_FRAME`, status, and
-   metrics;
-4. open a separate fd for every simultaneous output.
+1. open the Hermes-KMS render node for a prospective owner;
+2. call `DRM_IOCTL_HERMES_KMS_SELECT_OUTPUT` with an available 0-based output
+   index, then claim it with `SET_OUTPUT`;
+3. use that owner fd directly, or obtain its session capability for a separate
+   capture fd;
+4. on a separate capture fd, call `SESSION_ACCESS(BIND)` with the output index,
+   session ID and token. This selects and authorizes the active output
+   atomically; do not precede it with `SELECT_OUTPUT`;
+5. use the authorized fd for `WAIT_FRAME`, `ACQUIRE_FRAME`, `WAIT_UPDATE`,
+   `ACQUIRE_CURSOR`, status and metrics, with one fd for every simultaneous
+   output.
 
-A newly opened fd defaults to output 0, preserving UAPI v7 behavior for current
-Hermes builds. Rebinding an fd that owns an enabled output is rejected. The
-friendly identities are `HERMES-1`, `HERMES-2`, and so on; each connector also
-has a distinct EDID serial for compositor layout persistence. Compatibility was
-smoke-tested with the unmodified v0.1.2 control client against the v8 module.
+A newly opened fd defaults to output 0, preserving UAPI v7 output-selection
+behavior for older clients. UAPI v11 authorization is still required for
+protected operations. `SELECT_OUTPUT` cannot move a foreign fd onto an active,
+owned output; `SESSION_ACCESS(BIND)` is the atomic authorized path for that
+case. Rebinding an fd that owns an enabled output is also rejected. The friendly
+identities are `HERMES-1`, `HERMES-2`, and so on; each connector has a distinct
+EDID serial for compositor layout persistence. Compatibility was smoke-tested
+with the unmodified v0.1.2 control client against the v8 module.
 
 Status: **Prototype**. A disposable virtme-ng test validates simultaneous
 atomic modesets, distinct owners/framebuffers, DMA-BUF + sync_file export,
@@ -97,6 +114,11 @@ creates one host-role card plus N session-role cards. The host card remains on
 seat0 for KWin/GNOME and normal shared-desktop streaming. Each session card
 reports a stable 1-based `session_index`; udev maps that index to
 `hermes-kms-N` and requests the matching private seat broker.
+Session-role primary nodes and unconfigured render nodes are root-only mode
+0600. The root broker opens the primary node and passes access over its
+per-session socket; global `video` membership and active-seat `uaccess` ACLs do
+not bypass that boundary. The setup helper grants only the configured consumer
+UID access to render nodes for capability-protected control and capture.
 
 The role and session metadata replace reserved identity words, so the ioctl
 struct size and all older fields remain unchanged. The new
@@ -106,12 +128,12 @@ fields. Old UAPI clients continue to see globally unique cards and outputs.
 The packaged default is `session_devices=4 outputs=1 initial_enabled=0`.
 Disconnected cards have KMS object state but no active scanout framebuffer, so
 the pool does not preallocate four display-sized buffers. A setup helper stores
-the Hermes service uid for broker socket ownership. If the loaded topology does
-not match, it requests a reboot instead of forcibly unloading a card held by a
-compositor. The packaged polkit action gives the authenticated setup request a
-Hermes-specific prompt and permits it only from an active local session. The
-helper also migrates legacy manually-enabled broker units to udev-managed
-activation and stops stale instances outside the selected pool.
+the configured service uid for broker socket ownership. If the loaded topology
+does not match, it requests a reboot instead of forcibly unloading a card held
+by a compositor. The packaged polkit action gives the authenticated setup
+request a Hermes-specific prompt and permits it only from an active local
+session. The helper also migrates legacy manually-enabled broker units to
+udev-managed activation and stops stale instances outside the selected pool.
 
 Status: **Prototype**. A disposable VM regression validates one host plus two
 private cards, role/index identity, udev seat mapping, and systemd broker wants.
@@ -120,40 +142,106 @@ broker restart scope, and reboot-required migration. The existing
 two-compositor regression validates direct configured-user socket ownership
 without requiring `seat` group membership.
 
-## Communication with Hermes
+## Public userspace UAPI
 
-Hermes-KMS should be controlled through explicit DRM ioctls, not by scraping logs or guessing connector names.
+Hermes-KMS is controlled through explicit DRM ioctls, not by scraping logs or
+guessing connector names. The UAPI is public and consumer-neutral.
 
-The first UAPI lives in `include/uapi/drm/hermes_kms_drm.h` and provides:
+The current UAPI is version 11 and lives in
+`include/uapi/drm/hermes_kms_drm.h`. It provides:
 
 - version discovery;
 - stable output identity discovery;
 - capability discovery;
 - current output status;
-- requested output enable/disable and preferred mode. Visible width is
+- requested output enable/disable and preferred mode;
+- generic session-capability handoff;
+- frame wait/acquire with DMA-BUF and explicit synchronization;
+- independently sequenced cursor wait/acquire with DMA-BUF and explicit
+  synchronization;
+- capture, output-lifecycle and vblank metrics. Visible width is
   preserved exactly even when it is not divisible by eight; framebuffer pitch
   alignment remains a separate allocation property.
 
-This is deliberately small. It can be safely extended with append-only structs and new ioctls for:
+The interface is deliberately small. Future extensions must use new ioctls or
+reserved fields without moving existing members. All 64-bit UAPI values use
+`__aligned_u64`, and v11 explicitly fills what used to be LP64-only padding in
+`GET_STATUS`. `tests/uapi-abi.c` asserts sizes, alignment-sensitive offsets and
+encoded ioctl values for native and ILP32 builds.
 
-- frame queue descriptors;
-- DMA-BUF export/acquire;
-- explicit sync fences;
-- latency counters;
-- a real DRM writeback connector.
+A consumer must first identify a candidate fd through the DRM core
+`DRM_IOCTL_VERSION` ioctl (or libdrm's `drmGetVersion()`) and require the exact
+name `hermes-kms`. Only then may it issue the driver-private ioctls. Private DRM
+command numbers are scoped to the identified driver and can collide with a
+different driver's command table, so a private `GET_VERSION` is not itself a
+safe device probe.
 
-The stable Hermes output names are `HERMES-1` through `HERMES-N`. DRM connector
-names can still be core-generated `Virtual-*`; Hermes should use
+The reuse boundary is also explicit: kernel/module code is GPL-2.0, the public
+UAPI header is `GPL-2.0 WITH Linux-syscall-note`, and the optional header-only
+session helper plus its userspace-only tests are MIT-licensed. The kernel ABI
+does not import Hermes application policy, and an independent program can use
+the documented ioctls or MIT helper without becoming a Hermes application.
+
+For example, a real DRM writeback connector would require a new, explicit UAPI
+extension; the driver does not advertise a placeholder capability for it.
+
+The stable driver output names are `HERMES-1` through `HERMES-N`. DRM connector
+names can still be core-generated `Virtual-*`; consumers should use
 `GET_IDENTITY`, `GET_CAPS.output_count`, and object IDs instead of scraping
-connector names.
+connector names. When `HERMES_KMS_CAP_CURSOR_CAPTURE` is advertised,
+`GET_IDENTITY.cursor_plane_id` identifies the associated cursor plane.
+
+### Generic session capability
+
+UAPI v11 advertises `HERMES_KMS_CAP_SESSION_TOKEN`. An fd that successfully
+claims an available output with `SET_OUTPUT` becomes that session's owner. The
+owner sends `SESSION_ACCESS(GET_TOKEN)` with only `operation` set and all other
+request fields zero; the response contains a random 128-bit opaque token, the
+session ID, output index and `RESULT_TOKEN_VALID`. A different fd passes all
+three values to `SESSION_ACCESS(BIND)`, which selects
+and authorizes the active output atomically before that fd uses status, capture,
+wait or metrics ioctls. Calling `SELECT_OUTPUT` first is unnecessary and is
+rejected for an output owned by another session. A successful bind returns
+`RESULT_BOUND` and clears the token fields in its response. `UNBIND` drops that
+fd's access.
+
+Version, capability and identity discovery remain public. `GET_STATUS` is also
+public while an output is fully idle so a controller can decide whether to
+claim it; once a session is active, status and all capture/metrics operations
+require the owner or a valid binding. Revoking a session wakes blocked waiters,
+which revalidate authorization and return an access error instead of consuming
+state from a replacement session.
+
+The driver stores no executable name, Steam application ID, UID or TGID policy.
+The owner can pass the capability through any application-defined trusted IPC
+channel, including to a sandboxed or separately supervised worker. Closing the
+owner fd or disabling the output invalidates the token and all bindings from
+that session, preventing subsequent protected ioctls and subsequent fd exports.
+Linux cannot recall a DMA-BUF fd that `ACQUIRE_FRAME` already installed: its
+holder retains access to that buffer until the fd is closed. A design that gives
+capture access to an untrusted process must therefore put a trusted broker/copy
+boundary in front of it or guarantee per-session BO isolation and no reuse
+across the trust boundary. Userspace must also treat the token like any other
+credential: do not log it or expose it in process arguments or world-readable
+storage. Device-node access remains a separate udev/logind policy decision.
+
+The command-line tools provide `--session-file` as a diagnostic convenience:
+`hermes-kmsctl hold` publishes a no-replace, mode-0600 file owned by the current
+UID, and capture tools read, bind and promptly erase their in-memory copy. This
+file format is not part of the kernel UAPI and is not the recommended transport
+for applications; production integrations should normally keep the token in
+memory and use their existing trusted IPC.
 
 ## Frame and scanout tracking
 
-The driver tracks the current scanout framebuffer on every enable/update/flush callback and exposes the metadata through `GET_STATUS` and `ACQUIRE_FRAME`.
+The driver latches the current primary scanout framebuffer and its metadata as
+one coherent snapshot during atomic flush, and exposes it through `GET_STATUS`
+and `ACQUIRE_FRAME`.
 
 Tracked fields include:
 
-- monotonically increasing frame sequence;
+- monotonically increasing primary-frame sequence (cursor-only commits do not
+  advance it);
 - update/enable/disable timestamps from `ktime_get_ns()`;
 - framebuffer object ID;
 - framebuffer size;
@@ -166,28 +254,31 @@ export, latest-frame waits, and status/debug metadata.
 
 ## Frame acquire contract
 
-`DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME` is the initial userspace-facing frame contract.
+`DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME` is the userspace-facing frame contract.
 
 Current behavior:
 
 - without flags, returns the latest tracked frame metadata;
 - returns `-ENODATA` if no frame has been tracked yet;
-- exports DMA-BUF fds for the tracked framebuffer if userspace requests `HERMES_KMS_FRAME_REQUEST_DMABUF`;
-- sets `HERMES_KMS_FRAME_DMABUF_VALID` only after all requested plane fds were exported successfully;
-- returns the merged damage rectangle (`damage_x1..y2`, flagged by `HERMES_KMS_FRAME_DAMAGE_VALID`) when the compositor supplied `FB_DAMAGE_CLIPS`, so the consumer can encode only the dirty region.
+- exports DMA-BUF fds for the tracked framebuffer if userspace requests
+  `HERMES_KMS_FRAME_REQUEST_DMABUF`;
+- sets `HERMES_KMS_FRAME_DMABUF_VALID` only after all requested plane fds were
+  exported successfully;
+- returns the compositor's merged, half-open damage rectangle
+  (`damage_x1..y2`, flagged by `HERMES_KMS_FRAME_DAMAGE_VALID`) for a consecutive
+  new sequence. Re-acquiring the same sequence returns a valid empty rectangle,
+  meaning no additional primary-plane change. On a first acquire, a sequence
+  gap, or a commit without valid damage, userspace must process the whole frame.
 
-Future behavior:
-
-- preserve pitch, offset, modifier, format, and sequence metadata;
-- validate/import the exported fds through the Hermes encoder path.
-
-This avoids a compatibility trap: Hermes can start using one ioctl shape now, while the driver remains honest that DMA-BUF export is only the first stage. Real zero-copy still depends on whether the encoder can import the exported buffer format/modifier without an implicit copy.
+Real zero-copy still depends on whether the chosen encoder can import the
+exported format, modifier and layout without an implicit copy. That is a
+userspace/backend property rather than an application-specific kernel path.
 
 `HERMES_KMS_FRAME_REQUEST_SYNC_FILE` returns a sync_file fd for the tracked
-frame. Hermes-KMS creates this as a signaled frame-availability fence after the
-atomic update path has accepted the framebuffer. It is correct for coordinating
-Hermes consumption of the exported frame, but it is not a substitute for encoder
-import validation.
+framebuffer's implicit write fence from `dma_resv`. If there is no pending
+writer, the returned fence is already signalled. The consumer must wait before
+sampling the DMA-BUF; synchronization does not replace encoder import
+validation.
 
 ## Low-latency frame wait
 
@@ -196,7 +287,7 @@ passes the last consumed `frame_sequence` and a timeout in milliseconds. The
 driver sleeps on a waitqueue and wakes when the primary plane update path, pipe
 enable path, or pipe disable path advances `frame_sequence`.
 
-Expected Hermes loop:
+Expected capture loop (after `SESSION_ACCESS(BIND)`):
 
 ```text
 last_sequence = 0
@@ -208,17 +299,77 @@ while streaming:
     last_sequence = acquired.sequence
 ```
 
-This avoids busy polling and gives Hermes a clean place to drop stale frames:
-if multiple compositor commits happen before the encoder is ready, Hermes can
-wait for the newest sequence and acquire only the latest framebuffer.
+This avoids busy polling and gives a consumer a clean place to drop stale
+frames: if multiple compositor commits happen before the encoder is ready, it
+can wait for the newest sequence and acquire only the latest framebuffer. A
+sequence gap deliberately disables partial-damage validity for that acquire.
+
+## Separate cursor stream
+
+The primary framebuffer deliberately remains stable when a compositor performs
+a cursor-plane-only commit. Consumers that need the hardware cursor check
+`HERMES_KMS_CAP_CURSOR_CAPTURE` and use
+`DRM_IOCTL_HERMES_KMS_WAIT_UPDATE` instead of relying only on `WAIT_FRAME`.
+`WAIT_UPDATE` takes the last consumed primary and cursor sequences and reports
+which stream advanced. It returns the current sequence numbers, timestamps and
+output status from one coherent state-lock snapshot. The response uses
+`HERMES_KMS_WAIT_UPDATE_FRAME_READY` and
+`HERMES_KMS_WAIT_UPDATE_CURSOR_READY`; a zero-timeout poll with no update
+returns `-EAGAIN`, a blocking timeout returns `-ETIMEDOUT`, and revocation takes
+precedence as `-EACCES`.
+
+Primary `frame_sequence` and cursor `cursor_sequence` are nevertheless
+independent streams, not the halves of a transaction ID. A coherent
+`WAIT_UPDATE` response does not promise that the two values originated in the
+same atomic compositor commit. Both may advance before userspace runs, and a
+subsequent latest-state acquire may already see a newer value. Consumers retain
+the newest complete state for each stream, interpret each READY bit relative to
+its matching input sequence, and tolerate gaps.
+
+`DRM_IOCTL_HERMES_KMS_ACQUIRE_CURSOR` returns a coherent cursor-state snapshot.
+Without request flags it is metadata-only;
+`HERMES_KMS_CURSOR_REQUEST_DMABUF` and
+`HERMES_KMS_CURSOR_REQUEST_SYNC_FILE` request the current image fds and its
+implicit write fence. Consumers must wait on that fence before sampling the
+image. The cursor plane is `DRM_FORMAT_ARGB8888` with premultiplied RGB and
+per-pixel alpha at full plane opacity. Software composition therefore uses
+premultiplied-alpha blending and must not multiply the source RGB by alpha
+again.
+
+The geometry distinguishes the nominal image from its on-screen clipping:
+
+- `position_x/y` is the unclipped top-left of the full cursor image in CRTC
+  coordinates;
+- when `HOTSPOT_VALID` is set, `hotspot_x/y` is relative to that full image,
+  making the logical pointer location `position + hotspot`; Hermes uses a
+  universal cursor plane, so ordinary compositors instead pre-adjust
+  `position_x/y` and leave this optional validity bit clear;
+- `crtc_x/y/w/h` is the clipped integer destination rectangle;
+- `src_x/y/w/h` is the corresponding clipped source rectangle in DRM 16.16
+  fixed-point pixels.
+
+The consumer uses the validity flags before reading each metadata group and
+composes only the clipped rectangles. `VISIBLE` is separate from
+`BUFFER_VALID`, so a hidden or fully clipped cursor can keep a reusable image.
+`cursor_sequence` covers position, visibility and image-state updates;
+`image_sequence` advances conservatively whenever the current buffer may need
+to be sampled again, including possible in-place pixel changes.
+
+Framebuffer replacement can race the work required to install DMA-BUF or
+sync_file fds. In that case `ACQUIRE_FRAME` or `ACQUIRE_CURSOR` returns
+`-ESTALE` instead of mixing stale metadata with a new fd. A consumer discards
+that attempt and retries the latest-state acquire with a small bounded loop.
+The interface is a latest-state channel, not a queue, so skipped intermediate
+cursor positions are expected when the consumer is slower than the compositor.
 
 ## Metrics
 
-`DRM_IOCTL_HERMES_KMS_GET_METRICS` exposes counters and timestamps that Hermes
-can sample during streaming:
+`DRM_IOCTL_HERMES_KMS_GET_METRICS` exposes counters and timestamps that an
+authorized consumer can sample during streaming:
 
 - frame update count and current frame sequence;
-- vblank count and vblank-overrun count (dropped page-flip slots);
+- vblank callback count and vblank-overrun count (timer intervals missed when
+  a callback runs late, not rejected capture frames);
 - acquire count and no-frame acquire count;
 - DMA-BUF and sync_file export success/failure counts;
 - wait success, timeout, and interruption counts;
@@ -226,9 +377,11 @@ can sample during streaming:
 - owner-fd cleanup count;
 - last update/acquire/wait/export timestamps.
 
-These metrics are intentionally driver-local and monotonic for the module
-lifetime. Hermes should use them for diagnostics and latency telemetry, not as a
-stable persisted session log. The same counters are also readable as text at
+UAPI v11 assigns the two vblank counters from previously reserved words, so the
+metrics struct size is unchanged. Metrics are intentionally driver-local and
+monotonic for the module lifetime. Consumers should use them for diagnostics
+and latency telemetry, not as a stable persisted session log. The same counters
+are also readable as text at
 `/sys/kernel/debug/dri/<n>/hermes_kms_stats`.
 
 ## Encoder Import Preflight
@@ -240,47 +393,67 @@ and sync_file flags, then tries to import the DMA-BUF into VAAPI as a
 
 This is intentionally narrower than a full stream encoder. It answers whether
 the VA driver accepts the current scanout buffer format, pitch, modifier, and
-DMA-BUF fd. If this fails for `XR24`/linear scanout, Hermes should treat that as
-an integration decision point: request a different compositor format, add a GPU
-conversion step to NV12/P010, or choose a backend-specific encoder path.
+DMA-BUF fd. If this fails for `XR24`/linear scanout, the consumer should treat
+that as an integration decision point: request a different compositor format,
+add a GPU conversion step to NV12/P010, or choose a backend-specific encoder
+path.
 
 ## Initial load configuration
 
-The module supports simple load-time parameters for test safety:
+The module supports these topology and initial-state parameters:
 
 - `initial_enabled`
 - `initial_width`
 - `initial_height`
 - `initial_refresh_hz`
 - `outputs` (1–8, default 1, fixed until the module is reloaded)
+- `devices` (1–8, legacy multi-device topology)
+- `session_devices` (0 disables the pool; 1–8 creates that many private cards
+  plus a host card, mutually exclusive with an explicit `devices` topology)
+- `hotplug_events`
+- `non_desktop`
+
+Topology, initial mode/state and `non_desktop` are read-only after module load.
+`hotplug_events` remains a runtime diagnostic switch. The root-only
+`insecure_legacy_unbound_access=1` escape hatch restores pre-v11 unbound
+status/capture/wait/metrics access for old diagnostic clients; it weakens local
+capture isolation and must not be enabled in a normal installation.
 
 The default is `initial_enabled=0`, so the DRM device exists but the connector
 starts disconnected. This prevents the desktop compositor from immediately
-taking ownership of the virtual display during development or before Hermes has
-started a stream.
+taking ownership of the virtual display during development or before a
+controller has started a stream.
 
-`DRM_IOCTL_HERMES_KMS_SET_OUTPUT` connects the fd-selected output and records the calling
-`drm_file` as the session owner. Only that owner can update or disable the
-output while it is active. If the owner fd closes, including process crash, the
-driver marks the connector disconnected, clears the tracked frame, and emits a
-hotplug event. `GET_STATUS` reports whether a session owns the output, plus the
-current session ID and owner pid for diagnostics.
+`DRM_IOCTL_HERMES_KMS_SET_OUTPUT` connects the fd-selected output and records
+the calling `drm_file` as the session owner. Only that owner can update or
+disable the output while it is active. If the owner fd closes, including
+process crash, the driver marks the connector disconnected, clears the tracked
+frame, and emits a hotplug event. `GET_STATUS` reports whether a session owns
+the output, plus the current session ID and owner pid for diagnostics.
 
 `SET_OUTPUT` is bidirectional. The request supplies the desired enable state and
 mode; the response returns the applied mode, result flags, and session ID. This
-lets Hermes start a stream with one ioctl, keep the returned session ID in its
-stream state, and avoid an immediate status round-trip just to discover the
-owner session.
+lets any controller start a stream with one ioctl, keep the returned session ID
+in its state, and avoid an immediate status round-trip just to discover the
+owner session. Under UAPI v11 the owner then retrieves the generic session token
+for any separate capture fd that it chooses to authorize.
+
+Real output changes are limited to a burst of ten per output per second to
+bound hotplug/reprobe work from a faulty controller. Exact idempotent requests
+and an already-idle disable do not consume the limit. A controller that receives
+`EAGAIN` should retry with bounded backoff; no state was changed by the rejected
+request.
 
 For debug sessions, `tools/hermes-kmsctl/hermes-kmsctl hold 1920x1080@60`
 enables the output and keeps the owner fd open until interrupted. The connector
-starts disconnected; Hermes connects it when a stream starts, and the compositor
-owns the real modeset path after the hotplug event.
+starts disconnected; a controller connects it when a stream starts, and the
+compositor owns the real modeset path after the hotplug event.
 
-The driver exposes a **render node** (`DRIVER_RENDER`), and all Hermes ioctls are
-`DRM_RENDER_ALLOW`. Hermes opens the render node — never the primary node, which
-would steal DRM master and EBUSY-block the compositor — so the compositor keeps
-master and drives the modeset while Hermes pulls frames through the side channel.
+The driver exposes a **render node** (`DRIVER_RENDER`), and all private ioctls
+are `DRM_RENDER_ALLOW`. A controller/capture consumer opens the render node —
+never the primary node, which would steal DRM master and EBUSY-block the
+compositor — so the compositor keeps master and drives the modeset while the
+consumer pulls frames through the side channel.
 `non_desktop` is a load-time parameter (default off) for cases where a compositor
 should treat the output as non-desktop.
 
@@ -293,19 +466,20 @@ Seat assignment is deliberately handled outside the kernel driver. Tags such as
 `seat` and `master-of-seat`, plus `ID_SEAT` and `ID_AUTOSEAT`, are udev/logind
 policy, not DRM driver state. Development and packaging install
 `udev/99-hermes-kms-ignore-seat.rules` after the standard seat rules so local
-test cards are not offered to the active desktop session until Hermes owns the
-stream lifecycle. The same rule sets `GROUP="video"`, `MODE="0660"`, and
-`TAG+="uaccess"` so Hermes can open the primary DRM node without running as
-root when the local user has normal device access.
+test cards are not offered to the active desktop session until a test controller
+owns the stream lifecycle. The rule controls local device-node permissions so
+tests can run without making application identity part of the kernel UAPI.
 
 ## Current status
 
-Implemented and validated for the original single-output path: explicit CRTC/encoder/plane modeset with a software
-vblank timer (60/120/144 Hz, lockdep-clean, deterministic pacing), cursor plane,
-damage tracking, render node for masterless zero-copy consumption, scanout
-tracking, owner-fd lifecycle, stable output identity, DMA-BUF + sync_file export,
-strict atomic check, and debugfs telemetry. End-to-end zero-copy is validated on
-VAAPI (XRGB8888, linear).
+Implemented and validated for the original single-output path: explicit
+CRTC/encoder/plane modeset with a software vblank timer (60/120/144 Hz,
+lockdep-clean, deterministic pacing), cursor plane, damage tracking, render node
+for masterless zero-copy consumption, scanout tracking, owner-fd lifecycle,
+stable output identity, DMA-BUF + sync_file export, strict atomic check, and
+debugfs telemetry. End-to-end zero-copy is validated on VAAPI (XRGB8888,
+linear). Generic UAPI v11 session-capability binding, separate cursor capture,
+and native/ILP32 ABI checks are also implemented.
 
 Implemented and VM-validated as a prototype: multiple independent KMS
 pipelines on one DRM device and per-fd output selection. This is not yet

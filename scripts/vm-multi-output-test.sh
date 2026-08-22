@@ -14,12 +14,18 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KO="$REPO/kernel/hermes-kms/hermes_kms.ko"
 CTL="$REPO/tools/hermes-kmsctl/hermes-kmsctl"
+TEST_TMP="$(mktemp -d /tmp/hermes-multi-output.XXXXXX)"
+MODETEST_LOG="$TEST_TMP/modetest.log"
+SESSION_1="$TEST_TMP/session-1.auth"
+SESSION_2="$TEST_TMP/session-2.auth"
+STALE_SESSION_1="$TEST_TMP/stale-session-1.auth"
 HOLD_1_PID=""
 HOLD_2_PID=""
 MODETEST_PID=""
 STATUS_1=""
 STATUS_2=""
 FAIL=0
+LOADED_BY_TEST=0
 
 cleanup()
 {
@@ -36,7 +42,10 @@ cleanup()
 		wait "$pid" 2>/dev/null || true
 	done
 
-	timeout -k 1s 5s rmmod hermes_kms 2>/dev/null || true
+	if [ "$LOADED_BY_TEST" -eq 1 ]; then
+		timeout -k 1s 5s rmmod hermes_kms 2>/dev/null || true
+	fi
+	rm -rf -- "$TEST_TMP"
 }
 trap cleanup EXIT
 
@@ -64,7 +73,7 @@ require_value()
 dump_diagnostics()
 {
 	printf '%s\n' '--- modetest log ---' >&2
-	sed -n '1,240p' "/tmp/hermes-modetest.log" >&2 || true
+	sed -n '1,240p' "$MODETEST_LOG" >&2 || true
 	if [ -n "$MODETEST_PID" ] && [ -r "/proc/$MODETEST_PID/stack" ]; then
 		printf '%s\n' '--- modetest kernel stack ---' >&2
 		cat "/proc/$MODETEST_PID/stack" >&2 || true
@@ -83,8 +92,13 @@ command -v modetest >/dev/null || {
 	printf 'modetest is required\n' >&2
 	exit 1
 }
+[ ! -d /sys/module/hermes_kms ] || {
+	printf 'hermes_kms is already loaded; use a disposable VM or unload it first\n' >&2
+	exit 1
+}
 
 insmod "$KO" initial_enabled=0 hotplug_events=0 outputs=2
+LOADED_BY_TEST=1
 sleep 0.5
 
 [ -d /sys/devices/platform/hermes-kms ] &&
@@ -95,22 +109,30 @@ sleep 0.5
 
 VERSION="$("$CTL" version)"
 CAPS="$("$CTL" caps)"
-require_value "$VERSION" uapi_version 10
+require_value "$VERSION" uapi_version 11
 require_value "$CAPS" output_count 2
 require_value "$CAPS" multi_output true
 
-"$CTL" --output 1 hold 1920x1080@60 >"/tmp/hermes-hold-1.log" 2>&1 &
+"$CTL" --output 1 --session-file "$SESSION_1" hold 1920x1080@60 >"$TEST_TMP/hermes-hold-1.log" 2>&1 &
 HOLD_1_PID=$!
-"$CTL" --output 2 hold 1280x720@60 >"/tmp/hermes-hold-2.log" 2>&1 &
+"$CTL" --output 2 --session-file "$SESSION_2" hold 1280x720@60 >"$TEST_TMP/hermes-hold-2.log" 2>&1 &
 HOLD_2_PID=$!
-sleep 1
+for _ in {1..100}; do
+	[ -f "$SESSION_1" ] && [ -f "$SESSION_2" ] && break
+	sleep 0.02
+done
+[ -f "$SESSION_1" ] && [ -f "$SESSION_2" ] || {
+	printf 'FAIL: owners did not publish both session files\n' >&2
+	exit 1
+}
 
-OUTPUTS="$("$CTL" outputs)"
-require_value "$OUTPUTS" output_1_enabled true
-require_value "$OUTPUTS" output_2_enabled true
+STATUS_1="$("$CTL" --session-file "$SESSION_1" status)"
+STATUS_2="$("$CTL" --session-file "$SESSION_2" status)"
+require_value "$STATUS_1" enabled true
+require_value "$STATUS_2" enabled true
 
-IDENTITY_1="$("$CTL" --output 1 identity)"
-IDENTITY_2="$("$CTL" --output 2 identity)"
+IDENTITY_1="$("$CTL" --session-file "$SESSION_1" identity)"
+IDENTITY_2="$("$CTL" --session-file "$SESSION_2" identity)"
 CONNECTOR_1="$(printf '%s\n' "$IDENTITY_1" | value connector_id)"
 CRTC_1="$(printf '%s\n' "$IDENTITY_1" | value crtc_id)"
 PLANE_1="$(printf '%s\n' "$IDENTITY_1" | value plane_id)"
@@ -123,15 +145,15 @@ timeout -k 1s 20s modetest -M hermes-kms -a \
 	-P "$PLANE_1@$CRTC_1:1920x1080@XR24" \
 	-s "$CONNECTOR_2@$CRTC_2:1280x720@XR24" \
 	-P "$PLANE_2@$CRTC_2:1280x720@XR24" \
-	-v >"/tmp/hermes-modetest.log" 2>&1 &
+	-v >"$MODETEST_LOG" 2>&1 &
 MODETEST_PID=$!
 
 for _ in {1..100}; do
 	if ! kill -0 "$MODETEST_PID" 2>/dev/null; then
 		break
 	fi
-	STATUS_1="$("$CTL" --output 1 status)"
-	STATUS_2="$("$CTL" --output 2 status)"
+	STATUS_1="$("$CTL" --session-file "$SESSION_1" status)"
+	STATUS_2="$("$CTL" --session-file "$SESSION_2" status)"
 	if [ "$(printf '%s\n' "$STATUS_1" | value scanout_active)" = true ] &&
 	   [ "$(printf '%s\n' "$STATUS_2" | value scanout_active)" = true ]; then
 		break
@@ -148,13 +170,13 @@ if ! kill -0 "$MODETEST_PID" 2>/dev/null ||
 	exit 1
 fi
 
-if ! FRAME_1="$("$CTL" --output 1 frame --require-dmabuf --sync-file 2>&1)"; then
+if ! FRAME_1="$("$CTL" --session-file "$SESSION_1" frame --require-dmabuf --sync-file 2>&1)"; then
 	printf 'FAIL: output 1 frame acquisition failed: %s\n' "$FRAME_1" >&2
 	printf '%s\n' "$STATUS_1" >&2
 	dump_diagnostics
 	exit 1
 fi
-if ! FRAME_2="$("$CTL" --output 2 frame --require-dmabuf --sync-file 2>&1)"; then
+if ! FRAME_2="$("$CTL" --session-file "$SESSION_2" frame --require-dmabuf --sync-file 2>&1)"; then
 	printf 'FAIL: output 2 frame acquisition failed: %s\n' "$FRAME_2" >&2
 	printf '%s\n' "$STATUS_2" >&2
 	dump_diagnostics
@@ -179,13 +201,20 @@ if [ -z "$FRAMEBUFFER_1" ] || [ -z "$FRAMEBUFFER_2" ] ||
 	FAIL=1
 fi
 
+cp -- "$SESSION_1" "$STALE_SESSION_1"
+chmod 0600 "$STALE_SESSION_1"
 kill -TERM "$HOLD_1_PID"
 wait "$HOLD_1_PID"
 HOLD_1_PID=""
 sleep 0.5
-OUTPUTS="$("$CTL" outputs)"
-require_value "$OUTPUTS" output_1_enabled false
-require_value "$OUTPUTS" output_2_enabled true
+if "$CTL" --session-file "$STALE_SESSION_1" status >/dev/null 2>&1; then
+	printf 'FAIL: a revoked session capability still bound successfully\n' >&2
+	FAIL=1
+fi
+STATUS_1="$("$CTL" --output 1 status)"
+STATUS_2="$("$CTL" --session-file "$SESSION_2" status)"
+require_value "$STATUS_1" enabled false
+require_value "$STATUS_2" enabled true
 
 if dmesg | grep -iE \
 	'BUG:|WARNING:|RIP:|use-after-free|general protection|null pointer'; then

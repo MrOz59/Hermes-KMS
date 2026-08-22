@@ -9,10 +9,14 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KO="$REPO/kernel/hermes-kms/hermes_kms.ko"
 CTL="$REPO/tools/hermes-kmsctl/hermes-kmsctl"
+TEST_TMP="$(mktemp -d /tmp/hermes-multi-device.XXXXXX)"
 HOLD_PIDS=()
 MODETEST_PIDS=()
 CARDS=()
+HIDDEN_CARDS=()
+SESSION_FILES=("$TEST_TMP/session-1.auth" "$TEST_TMP/session-2.auth")
 FAIL=0
+LOADED_BY_TEST=0
 
 cleanup()
 {
@@ -27,11 +31,14 @@ cleanup()
 		[ -n "$pid" ] || continue
 		wait "$pid" 2>/dev/null || true
 	done
-	for hidden in /dev/dri/card*.hermes-hidden; do
+	for hidden in "${HIDDEN_CARDS[@]}"; do
 		[ -e "$hidden" ] || continue
 		mv "$hidden" "${hidden%.hermes-hidden}"
 	done
-	timeout -k 1s 5s rmmod hermes_kms 2>/dev/null || true
+	if [ "$LOADED_BY_TEST" -eq 1 ]; then
+		timeout -k 1s 5s rmmod hermes_kms 2>/dev/null || true
+	fi
+	rm -rf -- "$TEST_TMP"
 }
 trap cleanup EXIT
 
@@ -66,8 +73,13 @@ command -v modetest >/dev/null || {
 	printf 'modetest is required\n' >&2
 	exit 1
 }
+[ ! -d /sys/module/hermes_kms ] || {
+	printf 'hermes_kms is already loaded; use a disposable VM or unload it first\n' >&2
+	exit 1
+}
 
 insmod "$KO" initial_enabled=0 hotplug_events=0 devices=2 outputs=1
+LOADED_BY_TEST=1
 sleep 0.5
 
 [ -d /sys/devices/platform/hermes-kms.0 ] &&
@@ -109,17 +121,25 @@ for index in 0 1; do
 	require_value "$CAPS" session_device_pool false
 done
 
-"$CTL" --device "${CARDS[0]}" hold 854x480@60 \
-	>"/tmp/hermes-device-hold-1.log" 2>&1 &
+"$CTL" --device "${CARDS[0]}" --session-file "${SESSION_FILES[0]}" hold 854x480@60 \
+	>"$TEST_TMP/hermes-device-hold-1.log" 2>&1 &
 HOLD_PIDS+=("$!")
-"$CTL" --device "${CARDS[1]}" hold 1920x1080@60 \
-	>"/tmp/hermes-device-hold-2.log" 2>&1 &
+"$CTL" --device "${CARDS[1]}" --session-file "${SESSION_FILES[1]}" hold 1920x1080@60 \
+	>"$TEST_TMP/hermes-device-hold-2.log" 2>&1 &
 HOLD_PIDS+=("$!")
-sleep 0.5
+for _ in {1..100}; do
+	[ -f "${SESSION_FILES[0]}" ] && [ -f "${SESSION_FILES[1]}" ] && break
+	sleep 0.02
+done
+[ -f "${SESSION_FILES[0]}" ] && [ -f "${SESSION_FILES[1]}" ] || {
+	printf 'FAIL: owners did not publish both session files\n' >&2
+	exit 1
+}
 
 for index in 0 1; do
 	for other in "${CARDS[@]}"; do
 		[ "$other" = "${CARDS[$index]}" ] && continue
+		HIDDEN_CARDS+=("$other.hermes-hidden")
 		mv "$other" "$other.hermes-hidden"
 	done
 
@@ -140,18 +160,19 @@ for index in 0 1; do
 	timeout -k 1s 15s modetest -M hermes-kms -a \
 		-s "$CONNECTOR@$CRTC:$MODE@XR24" \
 		-P "$PLANE@$CRTC:$MODE@XR24" \
-		-v >"/tmp/hermes-device-modetest-$((index + 1)).log" 2>&1 &
+		-v >"$TEST_TMP/hermes-device-modetest-$((index + 1)).log" 2>&1 &
 	MODETEST_PIDS+=("$!")
 	sleep 0.2
-	for other in /dev/dri/card*.hermes-hidden; do
+	for other in "${HIDDEN_CARDS[@]}"; do
 		[ -e "$other" ] || continue
 		mv "$other" "${other%.hermes-hidden}"
 	done
+	HIDDEN_CARDS=()
 done
 
 for _ in {1..100}; do
-	STATUS_1="$("$CTL" --device "${CARDS[0]}" status)"
-	STATUS_2="$("$CTL" --device "${CARDS[1]}" status)"
+	STATUS_1="$("$CTL" --device "${CARDS[0]}" --session-file "${SESSION_FILES[0]}" status)"
+	STATUS_2="$("$CTL" --device "${CARDS[1]}" --session-file "${SESSION_FILES[1]}" status)"
 	if [ "$(printf '%s\n' "$STATUS_1" | value scanout_active)" = true ] &&
 	   [ "$(printf '%s\n' "$STATUS_2" | value scanout_active)" = true ]; then
 		break
@@ -170,15 +191,15 @@ require_value "$STATUS_2" active 1920x1080@60
 if [ "$FAIL" -ne 0 ]; then
 	for index in 1 2; do
 		printf '%s\n' "--- modetest device $index ---" >&2
-		sed -n '1,240p' "/tmp/hermes-device-modetest-$index.log" >&2 || true
+		sed -n '1,240p' "$TEST_TMP/hermes-device-modetest-$index.log" >&2 || true
 	done
 	printf '%s\n' '--- recent kernel log ---' >&2
 	dmesg | tail -n 200 >&2 || true
 	exit "$FAIL"
 fi
 
-FRAME_1="$("$CTL" --device "${CARDS[0]}" frame --require-dmabuf --sync-file)"
-FRAME_2="$("$CTL" --device "${CARDS[1]}" frame --require-dmabuf --sync-file)"
+FRAME_1="$("$CTL" --device "${CARDS[0]}" --session-file "${SESSION_FILES[0]}" frame --require-dmabuf --sync-file)"
+FRAME_2="$("$CTL" --device "${CARDS[1]}" --session-file "${SESSION_FILES[1]}" frame --require-dmabuf --sync-file)"
 require_value "$FRAME_1" dmabuf_valid true
 require_value "$FRAME_1" sync_file_valid true
 require_value "$FRAME_1" size 854x480

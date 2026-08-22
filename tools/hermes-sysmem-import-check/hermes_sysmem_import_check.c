@@ -32,7 +32,9 @@
 // you confirm the tool can see the failure it is looking for.
 
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,9 +65,25 @@
 #endif
 #define FOURCC_XR24 0x34325258u
 
+static bool parse_positive_uint(const char *text, unsigned int *value)
+{
+	char *end = NULL;
+	unsigned long parsed;
+
+	if (!text || !*text || *text == '-')
+		return false;
+	errno = 0;
+	parsed = strtoul(text, &end, 10);
+	if (errno || !end || *end || !parsed || parsed > UINT_MAX)
+		return false;
+	*value = (unsigned int)parsed;
+	return true;
+}
+
 static int open_real_gpu(char *name, size_t n)
 {
-	for (int i = 128; i < 140; i++) {
+	/* Cover the complete render-node minor range, not just the first 12. */
+	for (int i = 128; i <= 255; i++) {
 		char p[64];
 		snprintf(p, sizeof p, "/dev/dri/renderD%d", i);
 		int fd = open(p, O_RDWR | O_CLOEXEC);
@@ -87,11 +105,42 @@ static int open_real_gpu(char *name, size_t n)
 
 int main(int argc, char **argv)
 {
-	unsigned width  = argc > 1 ? (unsigned) atoi(argv[1]) : 1600;
-	unsigned height = argc > 2 ? (unsigned) atoi(argv[2]) : 1068;
-	unsigned pitch  = argc > 3 ? (unsigned) atoi(argv[3]) : width * 4;
-	size_t page = (size_t) sysconf(_SC_PAGESIZE);
-	size_t size = ((size_t) pitch * height + page - 1) & ~(page - 1);
+	int import_succeeded = 0;
+	unsigned int width = 1600;
+	unsigned int height = 1068;
+	unsigned int pitch;
+	long page_value;
+	size_t page;
+	size_t unrounded_size;
+	size_t size;
+
+	if (argc > 4 || (argc > 1 && !parse_positive_uint(argv[1], &width)) ||
+	    (argc > 2 && !parse_positive_uint(argv[2], &height)) ||
+	    width > UINT_MAX / 4U) {
+		fprintf(stderr, "Usage: %s [WIDTH HEIGHT [PITCH_BYTES]]\n", argv[0]);
+		return 2;
+	}
+	pitch = width * 4U;
+	if (argc > 3 && !parse_positive_uint(argv[3], &pitch)) {
+		fprintf(stderr, "Usage: %s [WIDTH HEIGHT [PITCH_BYTES]]\n", argv[0]);
+		return 2;
+	}
+	if (pitch < width * 4U || (size_t)height > SIZE_MAX / (size_t)pitch) {
+		fprintf(stderr, "invalid or overflowing framebuffer layout\n");
+		return 2;
+	}
+	unrounded_size = (size_t)pitch * (size_t)height;
+	page_value = sysconf(_SC_PAGESIZE);
+	if (page_value <= 0 || (size_t)page_value > SIZE_MAX - unrounded_size) {
+		fprintf(stderr, "could not safely determine the DMA-BUF allocation size\n");
+		return 1;
+	}
+	page = (size_t)page_value;
+	size = ((unrounded_size + page - 1U) / page) * page;
+	if ((off_t)size < 0 || (size_t)(off_t)size != size) {
+		fprintf(stderr, "DMA-BUF allocation exceeds off_t\n");
+		return 2;
+	}
 
 	printf("geometry : %ux%u  XR24  pitch=%u (%u px, %%64=%u)  size=%zu (pitch*h=%zu)\n",
 	       width, height, pitch, pitch / 4, (pitch / 4) % 64, size,
@@ -157,10 +206,23 @@ int main(int argc, char **argv)
 			       label, eglGetError());
 		} else {
 			printf("PASS     : eglCreateImage %s\n", label);
+			import_succeeded = 1;
 			eglDestroyImage(dpy, img);
 		}
 		if (!has_mod)
 			break;
 	}
+	eglTerminate(dpy);
+	gbm_device_destroy(gbm);
+	close(gpu_fd);
+	close(dbuf);
+	close(udev);
+	close(mfd);
+
+	if (!import_succeeded) {
+		fprintf(stderr, "FAIL: the GPU rejected every DMA-BUF import variant\n");
+		return 1;
+	}
+
 	return 0;
 }

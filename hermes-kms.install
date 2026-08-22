@@ -1,45 +1,27 @@
 # Warn about a stale /etc/modprobe.d override that masks the shipped default.
-#
-# The package installs its default to /usr/lib/modprobe.d/hermes-kms.conf, but
-# /etc/modprobe.d takes precedence over /usr/lib/modprobe.d. Older packages -
-# and older setup instructions - wrote initial_enabled=1 to
-# /etc/modprobe.d/hermes-kms.conf, which connects a virtual output at boot,
-# before Hermes owns it. Compositors adopt that connector and extend the desktop
-# onto a monitor nobody streams to, which the user sees as a black screen.
-#
-# Upgrading cannot fix this by itself: the package does not own the file in
-# /etc, so it can only report it.
 
 _hermes_kms_stale_override() {
-	local conf=/etc/modprobe.d/hermes-kms.conf
+  local conf=/etc/modprobe.d/hermes-kms.conf
 
-	[ -f "$conf" ] || return 0
-	grep -Eq '^[[:space:]]*options[[:space:]]+hermes_kms\b.*\binitial_enabled=1\b' "$conf" || return 0
+  [ -f "$conf" ] || return 0
+  grep -Eq '^[[:space:]]*options[[:space:]]+hermes_kms\b.*\binitial_enabled=1\b' "$conf" || return 0
 
-	cat >&2 <<-EOF
+  cat >&2 <<-EOF
 
-	==> WARNING: $conf sets initial_enabled=1
-	    This file overrides the default shipped in
-	    /usr/lib/modprobe.d/hermes-kms.conf and connects a virtual output at
-	    boot, before Hermes owns it. GNOME and KDE will extend the desktop
-	    onto a black monitor that no client is streaming.
+  ==> WARNING: $conf sets initial_enabled=1
+      This file overrides the default shipped in
+      /usr/lib/modprobe.d/hermes-kms.conf and connects a virtual output at
+      boot, before a consumer owns it. GNOME and KDE may extend the desktop onto
+      a monitor that no client is streaming.
 
-	    Fix it with either of:
-	      rm $conf
-	      sed -i 's/initial_enabled=1/initial_enabled=0/' $conf
+      Fix it with either of:
+        sudo rm $conf
+        sudo sed -i 's/initial_enabled=1/initial_enabled=0/' $conf
 
-	    Then reload the module:
-	      modprobe -r hermes_kms && modprobe hermes_kms
+      Then reload the module or reboot.
 
 	EOF
 }
-
-post_install() {
-	_hermes_kms_stale_override
-}
-
-post_upgrade() {
-	_hermes_kms_stale_override
 
 _runtime_reload() {
   if command -v systemctl >/dev/null 2>&1; then
@@ -51,39 +33,74 @@ _runtime_reload() {
   fi
 }
 
-post_install() {
-  local dkms_version="${1%-*}"
-
-  _hermes_kms_stale_override
-
-  # Install immediately as well as through Arch's generic post-transaction
-  # DKMS hook, so a first package install can load the module without a reboot.
-  dkms install -m hermes-kms -v "${dkms_version}" || return 1
-  depmod -a
-  _runtime_reload
-  modprobe hermes_kms || true
-  printf '%s\n' \
-    'Hermes-KMS installed with a four-session pool.' \
-    'Hermes can configure broker access from its Audio/Video page.' \
-    'Manual equivalent: sudo /usr/lib/hermes-kms/hermes-kms-setup configure --user auto'
-}
-
-post_upgrade() {
-  local dkms_version="${1%-*}"
-
-  _hermes_kms_stale_override
-
-  dkms install -m hermes-kms -v "${dkms_version}" || return 1
-  depmod -a
-  _runtime_reload
-  if ! grep -q '^hermes_kms ' /proc/modules 2>/dev/null; then
-    modprobe hermes_kms || true
-  else
-    printf '%s\n' \
-      'Hermes-KMS was upgraded while loaded; reboot before testing the new driver.'
+_stop_brokers() {
+  if command -v systemctl >/dev/null 2>&1; then
+    # Keep the glob quoted for systemctl; the shell must not expand it.
+    systemctl stop 'hermes-kms-seatd@*.service' 2>/dev/null || true
   fi
 }
 
+_remove_managed_access_rule() {
+  local rule=/etc/udev/rules.d/90-hermes-kms-user.rules
+
+  [ -f "$rule" ] || return 0
+  grep -qx '# Managed by hermes-kms-setup. Grants one configured UID render-node access.' "$rule" || return 0
+  rm -f -- "$rule"
+}
+
+_remove_managed_setup_state() {
+  local modprobe=/etc/modprobe.d/hermes-kms.conf
+  local modules=/etc/modules-load.d/hermes-kms.conf
+  local session_user=/etc/hermes-kms/session-user
+
+  _remove_managed_access_rule
+  if [ -f "$modprobe" ] &&
+     grep -qx '# Managed by hermes-kms-setup. Connectors stay disabled until owned.' "$modprobe"; then
+    rm -f -- "$modprobe"
+  fi
+  if [ -f "$modules" ] && [ "$(cat "$modules")" = hermes_kms ]; then
+    rm -f -- "$modules"
+  fi
+  if [ -f "$session_user" ] &&
+     grep -Eq '^[0-9]+$' "$session_user" &&
+     [ "$(wc -l <"$session_user")" -eq 1 ]; then
+    rm -f -- "$session_user"
+  fi
+  rmdir /etc/hermes-kms 2>/dev/null || true
+}
+
+post_install() {
+  _hermes_kms_stale_override
+  _runtime_reload
+
+  printf '%s\n' \
+    'The Arch DKMS post-transaction hook will build Hermes-KMS for installed kernels.' \
+    'After this transaction completes, load it with: sudo modprobe hermes_kms' \
+    'Then configure broker/render-node ownership for the intended consumer:' \
+    '  sudo /usr/lib/hermes-kms/hermes-kms-setup configure --user auto'
+}
+
+post_upgrade() {
+  _hermes_kms_stale_override
+  _runtime_reload
+
+  if grep -q '^hermes_kms ' /proc/modules 2>/dev/null; then
+    printf '%s\n' \
+      'Hermes-KMS was upgraded while loaded; reboot before testing the new driver.'
+  else
+    printf '%s\n' \
+      'The Arch DKMS post-transaction hook will finish the kernel builds.' \
+      'After this transaction completes, load it with: sudo modprobe hermes_kms'
+  fi
+}
+
+pre_remove() {
+  _stop_brokers
+  _remove_managed_setup_state
+  rm -rf -- /run/hermes-kms-seatd
+}
+
 post_remove() {
+  _stop_brokers
   _runtime_reload
 }

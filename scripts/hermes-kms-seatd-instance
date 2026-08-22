@@ -5,7 +5,7 @@ set -euo pipefail
 
 INSTANCE="${1:-}"
 SOCKET_OWNER="${2:-auto}"
-SOCKET_GROUP="${3:-seat}"
+SOCKET_GROUP="${3:-root}"
 RUNTIME_ROOT="${HERMES_SEATD_RUNTIME_ROOT:-/run/hermes-kms-seatd}"
 SESSION_USER_FILE="${HERMES_SESSION_USER_FILE:-/etc/hermes-kms/session-user}"
 
@@ -25,12 +25,31 @@ command -v chown >/dev/null || {
 	printf 'chown is required\n' >&2
 	exit 1
 }
+command -v readlink >/dev/null || {
+	printf 'readlink is required\n' >&2
+	exit 1
+}
 command -v seatd >/dev/null || {
 	printf 'seatd is required\n' >&2
 	exit 1
 }
 
-# The one-click Hermes setup stores the service user's numeric uid. Resolve it
+# Binding the instance directory over /run is safe only inside a private mount
+# namespace. Refuse a direct root invocation, which would otherwise hide the
+# host's /run and break systemd, udev and other runtime services.
+if ! SELF_MOUNT_NS="$(readlink /proc/self/ns/mnt)" ||
+   ! INIT_MOUNT_NS="$(readlink /proc/1/ns/mnt)"; then
+	printf 'unable to verify the private mount namespace\n' >&2
+	exit 1
+fi
+if [ "$SELF_MOUNT_NS" = "$INIT_MOUNT_NS" ]; then
+	printf '%s\n' \
+		'refusing to run in the host mount namespace' \
+		'use the packaged systemd unit or invoke this helper through unshare --mount' >&2
+	exit 1
+fi
+
+# The packaged setup helper stores the consumer's numeric uid. Resolve it
 # at service start so the broker socket is immediately accessible without a
 # logout/login cycle or a permanent supplementary-group change.
 if [ "$SOCKET_OWNER" = auto ]; then
@@ -53,9 +72,35 @@ if [ "$SOCKET_OWNER" = auto ]; then
 fi
 
 SESSION_RUN="$RUNTIME_ROOT/$INSTANCE"
-install -d -m 0750 "$RUNTIME_ROOT" "$SESSION_RUN"
-chown "$SOCKET_OWNER:$SOCKET_GROUP" "$RUNTIME_ROOT" "$SESSION_RUN"
-install -d -m 0755 "$SESSION_RUN/udev"
+
+# Never give the session user write access to a directory later traversed by
+# this root process. Older versions chowned RUNTIME_ROOT to the socket owner,
+# allowing that user to replace SESSION_RUN with a symlink between install(1)
+# and chown(1). In particular, a symlink to a device node could transfer raw
+# device ownership to an unprivileged user on service restart.
+#
+# /run itself is root-owned, so after rejecting a legacy symlink it is safe to
+# repair/create RUNTIME_ROOT. Once that directory is root-owned, SESSION_RUN
+# cannot be swapped by the configured user. Mode 0711 permits the socket owner
+# to traverse the known path without permitting directory mutation or listing.
+if [ -L "$RUNTIME_ROOT" ]; then
+	printf 'refusing symlink runtime root: %s\n' "$RUNTIME_ROOT" >&2
+	exit 1
+fi
+install -d -o root -g root -m 0711 -- "$RUNTIME_ROOT"
+
+if [ -L "$SESSION_RUN" ]; then
+	printf 'refusing symlink session directory: %s\n' "$SESSION_RUN" >&2
+	exit 1
+fi
+install -d -o root -g root -m 0711 -- "$SESSION_RUN"
+
+# A stale entry here can only predate the root-owned directory layout. Remove
+# it without following symlinks, then create the private udev mountpoint.
+if [ -L "$SESSION_RUN/udev" ] || { [ -e "$SESSION_RUN/udev" ] && [ ! -d "$SESSION_RUN/udev" ]; }; then
+	rm -f -- "$SESSION_RUN/udev"
+fi
+install -d -o root -g root -m 0755 -- "$SESSION_RUN/udev"
 
 # The caller must provide a private mount namespace (the packaged systemd unit
 # uses PrivateMounts=yes). Preserve udev's runtime database inside the private
@@ -64,10 +109,13 @@ mount --make-rprivate /
 if [ -d /run/udev ]; then
 	mount --rbind /run/udev "$SESSION_RUN/udev"
 fi
-mount --bind "$SESSION_RUN" /run
+# Preserve the udev submount when exposing the complete per-instance tree.
+# A plain bind of SESSION_RUN would omit nested mounts on kernels following
+# the standard non-recursive bind semantics and leave seatd without udev data.
+mount --rbind "$SESSION_RUN" /run
 
 # seatd's daemon socket location is compiled in and has no CLI override.
 # Because /run is the per-instance bind mount here, the resulting socket is
-# visible to Hermes outside the namespace as:
+# visible to the configured consumer outside the namespace as:
 #   $RUNTIME_ROOT/$INSTANCE/seatd.sock
 exec seatd -u "$SOCKET_OWNER" -g "$SOCKET_GROUP"

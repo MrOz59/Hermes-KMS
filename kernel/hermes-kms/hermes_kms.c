@@ -1,27 +1,34 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Hermes-KMS - experimental DRM/KMS virtual display driver for Hermes.
+ * Hermes-KMS - reusable DRM/KMS virtual display and capture driver.
  *
- * This module is intentionally not an EVDI wrapper.  The first milestone is a
- * safe DRM device/connector skeleton; DMA-BUF export and low-latency capture
- * will be built on top of this once the KMS object lifecycle is stable.
+ * Policy and application identity intentionally stay in userspace. The kernel
+ * interface exposes generic virtual outputs, fd-scoped ownership and opaque
+ * session capabilities for trusted capture handoff.
  */
 
 #include <linux/module.h>
+#include <linux/build_bug.h>
+#include <linux/compat.h>
+#include <crypto/algapi.h>
 #include <linux/mutex.h>
 #include <linux/ktime.h>
-#include <linux/hrtimer.h>
 #include <linux/jiffies.h>
+#include <linux/math64.h>
+#include <linux/overflow.h>
 #include <linux/platform_device.h>
+#include <linux/ratelimit.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-resv.h>
 #include <linux/fdtable.h>
 #include <linux/fcntl.h>
 #include <linux/file.h>
+#include <linux/random.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/sync_file.h>
+#include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/wait.h>
 
@@ -36,7 +43,6 @@
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_debugfs.h>
 #include <drm/drm_drv.h>
-#include <drm/drm_dumb_buffers.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_encoder.h>
 #include <drm/drm_file.h>
@@ -55,6 +61,7 @@
 #include <drm/drm_print.h>
 #include <drm/drm_prime.h>
 #include <drm/drm_vblank.h>
+#include <drm/drm_vblank_helper.h>
 
 /*
  * Linux 7.2 renamed struct drm_atomic_state to struct drm_atomic_commit -- the
@@ -100,16 +107,21 @@
 
 #define HERMES_KMS_MIN_WIDTH 640
 #define HERMES_KMS_MIN_HEIGHT 480
+#define HERMES_KMS_MIN_FRAMEBUFFER_WIDTH 1
+#define HERMES_KMS_MIN_FRAMEBUFFER_HEIGHT 1
 #define HERMES_KMS_MAX_WIDTH 3840
 #define HERMES_KMS_MAX_HEIGHT 2160
 #define HERMES_KMS_DEFAULT_WIDTH 1920
 #define HERMES_KMS_DEFAULT_HEIGHT 1080
 #define HERMES_KMS_DEFAULT_REFRESH_HZ 60
 #define HERMES_KMS_MAX_REFRESH_HZ 240
+#define HERMES_KMS_OUTPUT_CHANGE_INTERVAL HZ
+#define HERMES_KMS_OUTPUT_CHANGE_BURST 10
 
 static bool initial_enabled;
 static bool hotplug_events = true;
 static bool non_desktop;
+static bool insecure_legacy_unbound_access;
 static unsigned int initial_width = HERMES_KMS_DEFAULT_WIDTH;
 static unsigned int initial_height = HERMES_KMS_DEFAULT_HEIGHT;
 static unsigned int initial_refresh_hz = HERMES_KMS_DEFAULT_REFRESH_HZ;
@@ -118,17 +130,20 @@ static unsigned int devices = HERMES_KMS_DEFAULT_DEVICES;
 static unsigned int session_devices = HERMES_KMS_DEFAULT_SESSION_DEVICES;
 static unsigned int registered_device_count;
 
-module_param(initial_enabled, bool, 0644);
+module_param(initial_enabled, bool, 0444);
 MODULE_PARM_DESC(initial_enabled, "Initial virtual output state");
 module_param(hotplug_events, bool, 0644);
 MODULE_PARM_DESC(hotplug_events, "Emit DRM hotplug events when output state changes");
-module_param(non_desktop, bool, 0644);
+module_param(non_desktop, bool, 0444);
 MODULE_PARM_DESC(non_desktop, "Mark connector as non-desktop. Default false so compositors can manage Hermes as a normal virtual monitor when connected");
-module_param(initial_width, uint, 0644);
+module_param(insecure_legacy_unbound_access, bool, 0600);
+MODULE_PARM_DESC(insecure_legacy_unbound_access,
+		 "Allow pre-v11 unbound status/capture/wait/metrics access (unsafe, default false)");
+module_param(initial_width, uint, 0444);
 MODULE_PARM_DESC(initial_width, "Initial virtual output width");
-module_param(initial_height, uint, 0644);
+module_param(initial_height, uint, 0444);
 MODULE_PARM_DESC(initial_height, "Initial virtual output height");
-module_param(initial_refresh_hz, uint, 0644);
+module_param(initial_refresh_hz, uint, 0444);
 MODULE_PARM_DESC(initial_refresh_hz, "Initial virtual output refresh rate");
 module_param(outputs, uint, 0444);
 MODULE_PARM_DESC(outputs, "Number of virtual outputs on the DRM device (1-8, default 1)");
@@ -138,6 +153,11 @@ module_param(session_devices, uint, 0444);
 MODULE_PARM_DESC(session_devices, "Number of private session devices (0-8). When non-zero, also creates one seat0 host device");
 
 struct hermes_kms_device;
+
+struct hermes_kms_export_cache {
+	struct drm_gem_object *obj[4];
+	struct dma_buf *dmabuf[4];
+};
 
 struct hermes_kms_output {
 	struct hermes_kms_device *hdev;
@@ -159,36 +179,36 @@ struct hermes_kms_output {
 	struct mutex state_lock;
 	wait_queue_head_t frame_wait;
 	struct drm_framebuffer *framebuffer;
+	struct drm_framebuffer *cursor_framebuffer;
 	struct drm_file *owner_file;
-	/*
-	 * Software vblank timer. A virtual display has no hardware vblank, so the
-	 * compositor (KWin/GNOME) gets no periodic "present now" tick and ends up
-	 * composing at the speed of its commit/ack loop (~40fps) instead of the
-	 * mode's refresh rate. This hrtimer fires at the requested refresh so the
-	 * compositor composes at the full rate (60/120/144Hz). Modelled on vkms.
-	 */
-	struct hrtimer vblank_timer;
-	ktime_t vblank_period;  /* nanoseconds between vblanks for the active mode */
 	/*
 	 * Per-plane dma-buf export cache. drm_gem_prime_export() always
 	 * allocates a fresh dma_buf, so re-exporting the same scanout BO every
 	 * ACQUIRE_FRAME (60+ times per second) would force the consumer to
 	 * re-import and re-map on every frame, defeating zero-copy. Cache the
 	 * exported dma_buf keyed by the GEM object pointer and hand out a fresh
-	 * fd referencing the cached dma_buf while the BO is unchanged. Protected
-	 * by export_lock.
+	 * fd referencing the cached dma_buf while the BO is unchanged. The cache
+	 * holds a GEM reference as well as a dma-buf reference so pointer equality
+	 * cannot suffer an ABA reuse after an imported GEM wrapper is destroyed.
+	 * Protected by export_lock.
 	 */
 	struct mutex export_lock;
-	struct drm_gem_object *export_obj[4];
-	struct dma_buf *export_dmabuf[4];
+	struct hermes_kms_export_cache frame_export_cache;
+	struct hermes_kms_export_cache cursor_export_cache;
+	u64 access_token[2];
+	atomic64_t authorization_generation;
+	struct ratelimit_state output_change_ratelimit;
 	u64 session_id;
 	u64 next_session_id;
+	/* Diagnostic status/debugfs value; never part of authorization. */
 	pid_t owner_pid;
 	bool output_enabled;
+	bool output_transitioning;
 	u32 requested_width;
 	u32 requested_height;
 	u32 requested_refresh_hz;
-	u64 frame_sequence;
+	atomic64_t frame_sequence;
+	u64 framebuffer_generation;
 	u64 last_update_ns;
 	u64 last_enable_ns;
 	u64 last_disable_ns;
@@ -200,11 +220,41 @@ struct hermes_kms_output {
 	u32 framebuffer_pitch[4];
 	u32 framebuffer_offset[4];
 	u64 framebuffer_modifier;
+	atomic64_t cursor_sequence;
+	u64 cursor_image_sequence;
+	u64 cursor_generation;
+	u64 cursor_last_update_ns;
+	s32 cursor_position_x;
+	s32 cursor_position_y;
+	s32 cursor_crtc_x;
+	s32 cursor_crtc_y;
+	u32 cursor_crtc_w;
+	u32 cursor_crtc_h;
+	u32 cursor_src_x;
+	u32 cursor_src_y;
+	u32 cursor_src_w;
+	u32 cursor_src_h;
+	s32 cursor_hotspot_x;
+	s32 cursor_hotspot_y;
+	bool cursor_position_valid;
+	bool cursor_hotspot_valid;
+	bool cursor_visible;
+	u32 cursor_framebuffer_id;
+	u32 cursor_width;
+	u32 cursor_height;
+	u32 cursor_format;
+	u32 cursor_plane_count;
+	u32 cursor_pitch[4];
+	u32 cursor_offset[4];
+	u64 cursor_modifier;
+	u64 cursor_update_count;
+	u64 cursor_acquire_count;
+	u64 cursor_wait_count;
 	/*
-	 * Damage region accumulated for the in-progress frame, set by the plane
-	 * atomic_update from FB_DAMAGE_CLIPS and latched into the frame at flush.
-	 * damage_valid is cleared when the compositor provides no damage (treat
-	 * the whole frame as dirty). Protected by state_lock.
+	 * Damage region computed from FB_DAMAGE_CLIPS and latched with the primary
+	 * framebuffer at atomic_flush. damage_valid is cleared when the compositor
+	 * provides no damage (treat the whole frame as dirty). Protected by
+	 * state_lock.
 	 */
 	bool framebuffer_damage_valid;
 	u32 framebuffer_damage_x1;
@@ -212,8 +262,9 @@ struct hermes_kms_output {
 	u32 framebuffer_damage_x2;
 	u32 framebuffer_damage_y2;
 	u64 frame_update_count;
-	u64 vblank_count;	   /* vblanks the software timer has fired */
-	u64 vblank_overrun_count;  /* timer ticks that fell behind (dropped flips) */
+	atomic64_t vblank_count;	   /* vblanks the software timer has fired */
+	atomic64_t vblank_overrun_count;  /* timer ticks that fell behind */
+	u64 last_vblank_callback_ns;
 	u64 acquire_count;
 	u64 acquire_no_frame_count;
 	u64 dmabuf_export_count;
@@ -250,8 +301,27 @@ struct hermes_kms_device {
 };
 
 struct hermes_kms_file {
+	struct mutex lock;
 	unsigned int output_index;
+	struct hermes_kms_output *bound_output;
+	u64 bound_session_id;
+	u64 bound_authorization_generation;
+	atomic64_t binding_generation;
+	struct hermes_kms_output *last_acquire_output;
+	u64 last_acquire_session_id;
+	u64 last_acquire_sequence;
 };
+
+/* Keep ioctl numbers/layouts identical on LP64 and newly compiled ILP32. */
+static_assert(sizeof(struct drm_hermes_kms_status) == 208);
+static_assert(offsetof(struct drm_hermes_kms_status, framebuffer_modifier) == 136);
+static_assert(sizeof(struct drm_hermes_kms_acquire_frame) == 176);
+static_assert(offsetof(struct drm_hermes_kms_acquire_frame, reserved) == 128);
+static_assert(sizeof(struct drm_hermes_kms_metrics) == 312);
+static_assert(sizeof(struct drm_hermes_kms_session_access) == 72);
+static_assert(sizeof(struct drm_hermes_kms_acquire_cursor) == 224);
+static_assert(offsetof(struct drm_hermes_kms_acquire_cursor, reserved) == 176);
+static_assert(sizeof(struct drm_hermes_kms_wait_update) == 112);
 
 static inline struct hermes_kms_device *to_hermes_kms(struct drm_device *drm)
 {
@@ -259,29 +329,96 @@ static inline struct hermes_kms_device *to_hermes_kms(struct drm_device *drm)
 }
 
 static inline struct hermes_kms_output *
-hermes_kms_output_for_file(struct hermes_kms_device *hdev,
-			   struct drm_file *file)
+hermes_kms_output_for_context(struct hermes_kms_device *hdev,
+			      struct hermes_kms_file *context)
 {
-	struct hermes_kms_file *context = file->driver_priv;
-
 	if (!context || context->output_index >= hdev->output_count)
 		return &hdev->outputs[0];
 
 	return &hdev->outputs[context->output_index];
 }
 
+static void
+hermes_kms_reset_acquire_history_locked(struct hermes_kms_file *context)
+{
+	context->last_acquire_output = NULL;
+	context->last_acquire_session_id = 0;
+	context->last_acquire_sequence = 0;
+}
+
+/* Caller holds both context->lock and output->state_lock. */
+static bool
+hermes_kms_file_has_access_locked(struct hermes_kms_output *output,
+				  struct drm_file *file,
+				  struct hermes_kms_file *context)
+{
+	if (output->owner_file == file)
+		return true;
+
+	if (insecure_legacy_unbound_access)
+		return true;
+
+	return output->owner_file && context->bound_output == output &&
+	       context->bound_session_id &&
+	       context->bound_session_id == output->session_id &&
+	       context->bound_authorization_generation ==
+		atomic64_read(&output->authorization_generation);
+}
+
+/* Return with both locks held, in context -> output order. */
+static int
+hermes_kms_lock_scoped_output(struct hermes_kms_device *hdev,
+			      struct drm_file *file, bool allow_public_idle,
+			      struct hermes_kms_file **context_out,
+			      struct hermes_kms_output **output_out)
+{
+	struct hermes_kms_file *context = file->driver_priv;
+	struct hermes_kms_output *output;
+	bool public_idle;
+
+	if (!context)
+		return -EINVAL;
+
+	mutex_lock(&context->lock);
+	output = hermes_kms_output_for_context(hdev, context);
+	mutex_lock(&output->state_lock);
+	public_idle = allow_public_idle && !output->owner_file &&
+		      !output->output_enabled && !output->framebuffer;
+	if (!public_idle &&
+	    !hermes_kms_file_has_access_locked(output, file, context)) {
+		mutex_unlock(&output->state_lock);
+		mutex_unlock(&context->lock);
+		return -EACCES;
+	}
+
+	*context_out = context;
+	*output_out = output;
+	return 0;
+}
+
+static void
+hermes_kms_unlock_scoped_output(struct hermes_kms_file *context,
+				struct hermes_kms_output *output)
+{
+	mutex_unlock(&output->state_lock);
+	mutex_unlock(&context->lock);
+}
+
 /* Drop every cached dma-buf export. Caller must hold export_lock. */
 static void
-hermes_kms_drop_export_cache_locked(struct hermes_kms_output *output)
+hermes_kms_drop_export_cache_locked(struct hermes_kms_export_cache *cache)
 {
 	unsigned int i;
 
-	for (i = 0; i < ARRAY_SIZE(output->export_dmabuf); i++) {
-		if (output->export_dmabuf[i]) {
-			dma_buf_put(output->export_dmabuf[i]);
-			output->export_dmabuf[i] = NULL;
+	for (i = 0; i < ARRAY_SIZE(cache->dmabuf); i++) {
+		if (cache->dmabuf[i]) {
+			dma_buf_put(cache->dmabuf[i]);
+			cache->dmabuf[i] = NULL;
 		}
-		output->export_obj[i] = NULL;
+		if (cache->obj[i]) {
+			drm_gem_object_put(cache->obj[i]);
+			cache->obj[i] = NULL;
+		}
 	}
 }
 
@@ -378,9 +515,32 @@ hermes_kms_next_session_id_locked(struct hermes_kms_output *output)
 
 static void hermes_kms_clear_owner_locked(struct hermes_kms_output *output)
 {
+	bool had_authorization = output->owner_file || output->session_id ||
+				 output->access_token[0] || output->access_token[1];
+
 	output->owner_file = NULL;
 	output->owner_pid = 0;
 	output->session_id = 0;
+	memzero_explicit(output->access_token, sizeof(output->access_token));
+	if (had_authorization) {
+		atomic64_inc(&output->authorization_generation);
+		wake_up_interruptible(&output->frame_wait);
+	}
+}
+
+/* Caller holds output->state_lock. */
+static void hermes_kms_start_session_locked(struct hermes_kms_output *output,
+					    struct drm_file *file)
+{
+	do {
+		get_random_bytes(output->access_token,
+				 sizeof(output->access_token));
+	} while (!output->access_token[0] && !output->access_token[1]);
+
+	output->owner_file = file;
+	output->owner_pid = task_tgid_nr(current);
+	output->session_id = hermes_kms_next_session_id_locked(output);
+	atomic64_inc(&output->authorization_generation);
 }
 
 static void hermes_kms_clear_frame_locked(struct hermes_kms_output *output)
@@ -428,7 +588,9 @@ static void hermes_kms_set_frame_metadata_locked(struct hermes_kms_output *outpu
 }
 
 static void hermes_kms_track_frame(struct hermes_kms_output *output,
-				   struct drm_framebuffer *fb)
+				   struct drm_framebuffer *fb,
+				   const struct drm_rect *damage,
+				   bool notify)
 {
 	struct drm_device *drm = &output->hdev->drm;
 	struct drm_framebuffer *old_fb;
@@ -441,14 +603,45 @@ static void hermes_kms_track_frame(struct hermes_kms_output *output,
 		drm_framebuffer_get(fb);
 
 	mutex_lock(&output->state_lock);
+	/* Ignore late scanout commits while the connector is being handed over. */
+	if (fb && (!output->output_enabled || output->output_transitioning)) {
+		mutex_unlock(&output->state_lock);
+		drm_framebuffer_put(fb);
+		return;
+	}
 	old_fb = output->framebuffer;
+	if (!fb && !old_fb) {
+		mutex_unlock(&output->state_lock);
+		/* Session handoff must invalidate exports even without a frame. */
+		mutex_lock(&output->export_lock);
+		hermes_kms_drop_export_cache_locked(&output->frame_export_cache);
+		mutex_unlock(&output->export_lock);
+		return;
+	}
 	old_fb_id = old_fb ? old_fb->base.id : 0;
 	output->framebuffer = fb;
-	output->frame_sequence++;
+	if (old_fb != fb) {
+		output->framebuffer_generation++;
+		if (!output->framebuffer_generation)
+			output->framebuffer_generation++;
+	}
+	sequence = atomic64_inc_return(&output->frame_sequence);
 	output->frame_update_count++;
 	output->last_update_ns = ktime_get_ns();
-	sequence = output->frame_sequence;
 	hermes_kms_set_frame_metadata_locked(output, fb);
+	if (fb && damage) {
+		output->framebuffer_damage_valid = true;
+		output->framebuffer_damage_x1 = max(damage->x1, 0);
+		output->framebuffer_damage_y1 = max(damage->y1, 0);
+		output->framebuffer_damage_x2 = max(damage->x2, 0);
+		output->framebuffer_damage_y2 = max(damage->y2, 0);
+	} else {
+		output->framebuffer_damage_valid = false;
+		output->framebuffer_damage_x1 = 0;
+		output->framebuffer_damage_y1 = 0;
+		output->framebuffer_damage_x2 = 0;
+		output->framebuffer_damage_y2 = 0;
+	}
 	if (fb && !old_fb_id) {
 		output->last_logged_framebuffer_id = fb->base.id;
 		log_frame_connected = true;
@@ -463,9 +656,9 @@ static void hermes_kms_track_frame(struct hermes_kms_output *output,
 			    output->framebuffer_width,
 			    output->framebuffer_height,
 			    output->framebuffer_format,
-			    (unsigned long long)output->framebuffer_modifier,
-			    output->framebuffer_plane_count,
-			    (unsigned long long)output->frame_sequence);
+				    (unsigned long long)output->framebuffer_modifier,
+				    output->framebuffer_plane_count,
+				    (unsigned long long)sequence);
 	}
 	mutex_unlock(&output->state_lock);
 
@@ -478,7 +671,7 @@ static void hermes_kms_track_frame(struct hermes_kms_output *output,
 	 */
 	if (!fb) {
 		mutex_lock(&output->export_lock);
-		hermes_kms_drop_export_cache_locked(output);
+		hermes_kms_drop_export_cache_locked(&output->frame_export_cache);
 		mutex_unlock(&output->export_lock);
 	}
 
@@ -496,7 +689,186 @@ static void hermes_kms_track_frame(struct hermes_kms_output *output,
 		drm_info(drm, "%s cleared active scanout framebuffer\n",
 			 output->output_name);
 
-	wake_up_interruptible(&output->frame_wait);
+	if (notify)
+		wake_up_interruptible(&output->frame_wait);
+}
+
+static void hermes_kms_clear_cursor_metadata_locked(
+	struct hermes_kms_output *output)
+{
+	output->cursor_position_x = 0;
+	output->cursor_position_y = 0;
+	output->cursor_crtc_x = 0;
+	output->cursor_crtc_y = 0;
+	output->cursor_crtc_w = 0;
+	output->cursor_crtc_h = 0;
+	output->cursor_src_x = 0;
+	output->cursor_src_y = 0;
+	output->cursor_src_w = 0;
+	output->cursor_src_h = 0;
+	output->cursor_hotspot_x = 0;
+	output->cursor_hotspot_y = 0;
+	output->cursor_position_valid = false;
+	output->cursor_hotspot_valid = false;
+	output->cursor_visible = false;
+	output->cursor_framebuffer_id = 0;
+	output->cursor_width = 0;
+	output->cursor_height = 0;
+	output->cursor_format = 0;
+	output->cursor_plane_count = 0;
+	memset(output->cursor_pitch, 0, sizeof(output->cursor_pitch));
+	memset(output->cursor_offset, 0, sizeof(output->cursor_offset));
+	output->cursor_modifier = 0;
+}
+
+static u32 hermes_kms_cursor_rect_coord(s32 coordinate)
+{
+	return coordinate > 0 ? (u32)coordinate : 0;
+}
+
+static u32 hermes_kms_cursor_rect_extent(s32 start, s32 end)
+{
+	s64 extent = (s64)end - (s64)start;
+
+	return extent > 0 ? (u32)extent : 0;
+}
+
+/*
+ * Latch one cursor-plane commit as an independent capture stream. @state is
+ * NULL for an explicit session teardown. The stored framebuffer reference
+ * keeps both metadata and later DMA-BUF export valid after atomic state cleanup.
+ */
+static void hermes_kms_track_cursor(struct hermes_kms_output *output,
+				    const struct drm_plane_state *state,
+				    bool notify)
+{
+	struct drm_framebuffer *fb = state ? state->fb : NULL;
+	struct drm_framebuffer *old_fb;
+	u64 sequence;
+	u64 image_sequence;
+	unsigned int plane_count = 0;
+	unsigned int i;
+	bool shape_changed;
+	bool visible;
+
+	if (fb)
+		drm_framebuffer_get(fb);
+
+	mutex_lock(&output->state_lock);
+	if (fb && (!output->output_enabled || output->output_transitioning)) {
+		mutex_unlock(&output->state_lock);
+		drm_framebuffer_put(fb);
+		return;
+	}
+
+	old_fb = output->cursor_framebuffer;
+	if (!state && !old_fb && !output->cursor_position_valid) {
+		mutex_unlock(&output->state_lock);
+		mutex_lock(&output->export_lock);
+		hermes_kms_drop_export_cache_locked(&output->cursor_export_cache);
+		mutex_unlock(&output->export_lock);
+		return;
+	}
+
+	if (fb)
+		plane_count = min_t(unsigned int, fb->format->num_planes,
+				    ARRAY_SIZE(output->cursor_pitch));
+	shape_changed = old_fb != fb ||
+			output->cursor_framebuffer_id != (fb ? fb->base.id : 0) ||
+			output->cursor_width != (fb ? fb->width : 0) ||
+			output->cursor_height != (fb ? fb->height : 0) ||
+			output->cursor_format != (fb ? fb->format->format : 0) ||
+			output->cursor_plane_count != plane_count ||
+			output->cursor_modifier != (fb ? fb->modifier : 0);
+
+	output->cursor_framebuffer = fb;
+	if (shape_changed) {
+		output->cursor_generation++;
+		if (!output->cursor_generation)
+			output->cursor_generation++;
+	}
+	sequence = atomic64_inc_return(&output->cursor_sequence);
+	output->cursor_update_count++;
+	output->cursor_last_update_ns = ktime_get_ns();
+
+	/*
+	 * GEM contents can be updated in place without changing the framebuffer
+	 * identity or layout.  Conservatively make every committed cursor buffer
+	 * a new image; consumers may still reuse the export cache underneath.
+	 */
+	if (shape_changed || (state && fb)) {
+		output->cursor_image_sequence++;
+		if (!output->cursor_image_sequence)
+			output->cursor_image_sequence++;
+	}
+
+	if (!state) {
+		hermes_kms_clear_cursor_metadata_locked(output);
+	} else {
+		output->cursor_position_valid = !!state->crtc;
+		/*
+		 * This is a universal KMS cursor plane, not a paravirtualized mouse
+		 * device that requires DRIVER_CURSOR_HOTSPOT.  Compositors already
+		 * account for their logical hotspot when positioning the plane, so its
+		 * CRTC coordinates remain sufficient for capture.  Do not claim that
+		 * the optional logical-pointer metadata was supplied by userspace.
+		 */
+		output->cursor_hotspot_valid = false;
+		output->cursor_visible = fb && state->crtc && state->visible;
+		output->cursor_position_x = state->crtc_x;
+		output->cursor_position_y = state->crtc_y;
+		output->cursor_crtc_x = state->dst.x1;
+		output->cursor_crtc_y = state->dst.y1;
+		output->cursor_crtc_w = hermes_kms_cursor_rect_extent(
+			state->dst.x1, state->dst.x2);
+		output->cursor_crtc_h = hermes_kms_cursor_rect_extent(
+			state->dst.y1, state->dst.y2);
+		output->cursor_src_x = hermes_kms_cursor_rect_coord(
+			state->src.x1);
+		output->cursor_src_y = hermes_kms_cursor_rect_coord(
+			state->src.y1);
+		output->cursor_src_w = hermes_kms_cursor_rect_extent(
+			state->src.x1, state->src.x2);
+		output->cursor_src_h = hermes_kms_cursor_rect_extent(
+			state->src.y1, state->src.y2);
+		output->cursor_hotspot_x = 0;
+		output->cursor_hotspot_y = 0;
+		output->cursor_framebuffer_id = fb ? fb->base.id : 0;
+		output->cursor_width = fb ? fb->width : 0;
+		output->cursor_height = fb ? fb->height : 0;
+		output->cursor_format = fb ? fb->format->format : 0;
+		output->cursor_plane_count = plane_count;
+		memset(output->cursor_pitch, 0, sizeof(output->cursor_pitch));
+		memset(output->cursor_offset, 0, sizeof(output->cursor_offset));
+		for (i = 0; i < plane_count; i++) {
+			output->cursor_pitch[i] = fb->pitches[i];
+			output->cursor_offset[i] = fb->offsets[i];
+		}
+		output->cursor_modifier = fb ? fb->modifier : 0;
+	}
+	image_sequence = output->cursor_image_sequence;
+	visible = output->cursor_visible;
+	mutex_unlock(&output->state_lock);
+
+	/*
+	 * A different cursor image must not leave stale planes pinned in the
+	 * export cache (notably when the new framebuffer has fewer planes).
+	 * Export revalidation makes dropping after state_lock race-safe.
+	 */
+	if (shape_changed) {
+		mutex_lock(&output->export_lock);
+		hermes_kms_drop_export_cache_locked(&output->cursor_export_cache);
+		mutex_unlock(&output->export_lock);
+	}
+	if (old_fb)
+		drm_framebuffer_put(old_fb);
+
+	drm_dbg_kms(&output->hdev->drm,
+		    "%s cursor update sequence=%llu image=%llu visible=%d\n",
+		    output->output_name, (unsigned long long)sequence,
+		    (unsigned long long)image_sequence, visible);
+	if (notify)
+		wake_up_interruptible(&output->frame_wait);
 }
 
 static enum drm_connector_status
@@ -644,116 +1016,39 @@ crtc_to_hermes_kms_output(struct drm_crtc *crtc)
 	return container_of(crtc, struct hermes_kms_output, crtc);
 }
 
-static inline struct hermes_kms_output *
-primary_to_hermes_kms_output(struct drm_plane *plane)
-{
-	return container_of(plane, struct hermes_kms_output, primary);
-}
-
 /*
- * Software vblank timer callback. Mirrors vkms: roll the timer forward, then
- * signal the vblank to DRM (which delivers any armed page-flip event and lets
- * the compositor schedule the next frame at the mode's refresh rate).
+ * The DRM core owns and cancels the hrtimer without waiting for its callback
+ * under vblank_time_lock. This hook only augments the core timer with metrics.
  */
-static enum hrtimer_restart hermes_kms_vblank_timer(struct hrtimer *timer)
-{
-	struct hermes_kms_output *output =
-		container_of(timer, struct hermes_kms_output, vblank_timer);
-	struct drm_crtc *crtc = &output->crtc;
-	u64 ret_overrun;
-	bool ret;
-
-	ret_overrun = hrtimer_forward_now(&output->vblank_timer,
-					  output->vblank_period);
-	if (ret_overrun != 1) {
-		/*
-		 * More than one period elapsed since the last tick: the timer
-		 * fell behind and at least one vblank (page-flip slot) was
-		 * missed. Track it so the pacing self-test can assert that a
-		 * steady stream produces zero overruns. ret_overrun counts the
-		 * periods skipped over (>=2 here, or 0 if called late-but-once).
-		 */
-		WRITE_ONCE(output->vblank_overrun_count,
-			   output->vblank_overrun_count +
-				   (ret_overrun > 1 ? ret_overrun - 1 : 1));
-		drm_dbg_kms(&output->hdev->drm,
-			    "%s vblank timer overrun (skipped=%llu)\n",
-			    output->output_name,
-			    (unsigned long long)ret_overrun);
-	}
-	WRITE_ONCE(output->vblank_count, output->vblank_count + 1);
-
-	ret = drm_crtc_handle_vblank(crtc);
-	if (!ret)
-		drm_err(&output->hdev->drm,
-			"%s failure handling vblank\n", output->output_name);
-
-	return HRTIMER_RESTART;
-}
-
-static int hermes_kms_enable_vblank(struct drm_crtc *crtc)
+static bool hermes_kms_handle_vblank_timeout(struct drm_crtc *crtc)
 {
 	struct hermes_kms_output *output =
 		crtc_to_hermes_kms_output(crtc);
 	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
-	unsigned int refresh = drm_mode_vrefresh(&crtc->mode);
+	u64 last_ns = READ_ONCE(output->last_vblank_callback_ns);
+	u64 now_ns = ktime_get_ns();
+	u64 elapsed_ns;
+	u64 periods;
+	u32 period_ns = READ_ONCE(vblank->framedur_ns);
+	bool handled;
 
-	if (!refresh)
-		refresh = HERMES_KMS_DEFAULT_REFRESH_HZ;
-
-	/*
-	 * Prefer the DRM-calculated per-frame duration (set up by
-	 * drm_calc_timestamping_constants() in the modeset path); fall back to a
-	 * direct computation if it is not available. This honours the active
-	 * mode's refresh, so 60/120/144Hz all work.
-	 */
-	if (vblank && vblank->framedur_ns)
-		output->vblank_period = ns_to_ktime(vblank->framedur_ns);
-	else
-		output->vblank_period = ns_to_ktime(NSEC_PER_SEC / refresh);
-
-	hrtimer_start(&output->vblank_timer, output->vblank_period,
-		      HRTIMER_MODE_REL);
-
-	return 0;
-}
-
-static void hermes_kms_disable_vblank(struct drm_crtc *crtc)
-{
-	struct hermes_kms_output *output =
-		crtc_to_hermes_kms_output(crtc);
-
-	hrtimer_cancel(&output->vblank_timer);
-}
-
-/*
- * Provide a vblank timestamp from the timer. Without this hook DRM cannot
- * timestamp timer-driven vblanks and drm_crtc_handle_vblank() misbehaves.
- * Mirrors vkms.
- */
-static bool hermes_kms_get_vblank_timestamp(struct drm_crtc *crtc,
-					    int *max_error,
-					    ktime_t *vblank_time,
-					    bool in_vblank_irq)
-{
-	struct hermes_kms_output *output =
-		crtc_to_hermes_kms_output(crtc);
-	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
-
-	if (!READ_ONCE(vblank->enabled)) {
-		*vblank_time = ktime_get();
-		return true;
+	if (last_ns && period_ns && now_ns > last_ns) {
+		elapsed_ns = now_ns - last_ns;
+		periods = div_u64(elapsed_ns, period_ns);
+		if (periods > 1)
+			atomic64_add(periods - 1,
+				     &output->vblank_overrun_count);
 	}
+	WRITE_ONCE(output->last_vblank_callback_ns, now_ns);
+	atomic64_inc(&output->vblank_count);
 
-	*vblank_time = READ_ONCE(output->vblank_timer.node.expires);
+	handled = drm_crtc_handle_vblank(crtc);
+	if (!handled)
+		drm_err_ratelimited(&output->hdev->drm,
+				    "%s failure handling vblank\n",
+				    output->output_name);
 
-	if (WARN_ON(*vblank_time == vblank->time))
-		return true;
-
-	/* The timer was rolled forward before processing, so correct by one. */
-	*vblank_time -= output->vblank_period;
-
-	return true;
+	return handled;
 }
 
 static const struct drm_crtc_funcs hermes_kms_crtc_funcs = {
@@ -762,9 +1057,7 @@ static const struct drm_crtc_funcs hermes_kms_crtc_funcs = {
 	.reset = drm_atomic_helper_crtc_reset,
 	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
-	.enable_vblank = hermes_kms_enable_vblank,
-	.disable_vblank = hermes_kms_disable_vblank,
-	.get_vblank_timestamp = hermes_kms_get_vblank_timestamp,
+	DRM_CRTC_VBLANK_TIMER_FUNCS,
 };
 
 static enum drm_mode_status
@@ -819,6 +1112,7 @@ static void hermes_kms_crtc_atomic_enable(struct drm_crtc *crtc,
 
 	mutex_lock(&output->state_lock);
 	output->last_enable_ns = ktime_get_ns();
+	WRITE_ONCE(output->last_vblank_callback_ns, 0);
 	mutex_unlock(&output->state_lock);
 
 	/*
@@ -850,7 +1144,9 @@ static void hermes_kms_crtc_atomic_disable(struct drm_crtc *crtc,
 	mutex_lock(&output->state_lock);
 	output->last_disable_ns = ktime_get_ns();
 	mutex_unlock(&output->state_lock);
-	hermes_kms_track_frame(output, NULL);
+	hermes_kms_track_frame(output, NULL, NULL, false);
+	hermes_kms_track_cursor(output, NULL, false);
+	wake_up_interruptible(&output->frame_wait);
 
 	drm_info(&output->hdev->drm, "%s disabled virtual display\n",
 		 output->output_name);
@@ -862,9 +1158,32 @@ static void hermes_kms_crtc_atomic_flush(struct drm_crtc *crtc,
 	struct hermes_kms_output *output =
 		crtc_to_hermes_kms_output(crtc);
 	struct drm_plane *plane = &output->primary;
-	struct drm_framebuffer *fb = plane->state ? plane->state->fb : NULL;
+	struct drm_plane_state *cursor_state;
+	struct drm_plane_state *old_plane_state;
+	struct drm_plane_state *new_plane_state;
+	struct drm_rect damage;
+	bool have_damage = false;
 
-	hermes_kms_track_frame(output, fb);
+	new_plane_state = drm_atomic_get_new_plane_state(state, plane);
+	if (new_plane_state) {
+		old_plane_state = drm_atomic_get_old_plane_state(state, plane);
+		if (new_plane_state->fb && new_plane_state->crtc)
+			have_damage = drm_atomic_helper_damage_merged(
+				old_plane_state, new_plane_state, &damage);
+
+		/*
+		 * Latch framebuffer, damage and sequence together. A cursor-only
+		 * commit has no new primary state and deliberately does not advance
+		 * the capture sequence.
+		 */
+		hermes_kms_track_frame(output, new_plane_state->fb,
+				       have_damage ? &damage : NULL, false);
+	}
+	cursor_state = drm_atomic_get_new_plane_state(state, &output->cursor);
+	if (cursor_state)
+		hermes_kms_track_cursor(output, cursor_state, false);
+	if (new_plane_state || cursor_state)
+		wake_up_interruptible(&output->frame_wait);
 
 	if (crtc->state->event) {
 		spin_lock_irq(&crtc->dev->event_lock);
@@ -888,6 +1207,7 @@ static const struct drm_crtc_helper_funcs hermes_kms_crtc_helper_funcs = {
 	.atomic_enable = hermes_kms_crtc_atomic_enable,
 	.atomic_disable = hermes_kms_crtc_atomic_disable,
 	.atomic_flush = hermes_kms_crtc_atomic_flush,
+	.handle_vblank_timeout = hermes_kms_handle_vblank_timeout,
 };
 
 static enum drm_mode_status
@@ -938,47 +1258,24 @@ static int hermes_kms_plane_atomic_check(struct drm_plane *plane,
 	return 0;
 }
 
-static void hermes_kms_plane_atomic_update(struct drm_plane *plane,
-					   struct drm_atomic_commit *state)
+/*
+ * The virtual planes have no hardware registers to program. Their coherent
+ * framebuffer/cursor snapshots are latched together from the completed atomic
+ * state in the CRTC's atomic_flush callback. drm_atomic_helper_commit_planes()
+ * still invokes the plane update hook for every active plane, so provide an
+ * explicit no-op instead of leaving a callable helper slot NULL.
+ */
+static void hermes_kms_plane_atomic_noop(struct drm_plane *plane,
+					 struct drm_atomic_commit *state)
 {
-	struct hermes_kms_output *output =
-		primary_to_hermes_kms_output(plane);
-	struct drm_plane_state *old_state =
-		drm_atomic_get_old_plane_state(state, plane);
-	struct drm_plane_state *new_state =
-		drm_atomic_get_new_plane_state(state, plane);
-	struct drm_rect damage;
-	bool have_damage = false;
-
-	/*
-	 * Capture the compositor's FB_DAMAGE_CLIPS for this commit and latch it
-	 * so ACQUIRE_FRAME can hand the consumer a single merged dirty rect
-	 * (the consumer encodes only the changed region). If no damage was
-	 * supplied, fall back to "whole frame dirty" so correctness never
-	 * depends on a compositor providing damage. Actual scanout bookkeeping
-	 * still happens in the CRTC atomic_flush.
-	 */
-	if (new_state && new_state->fb && new_state->crtc)
-		have_damage = drm_atomic_helper_damage_merged(old_state,
-							      new_state,
-							      &damage);
-
-	mutex_lock(&output->state_lock);
-	if (have_damage) {
-		output->framebuffer_damage_valid = true;
-		output->framebuffer_damage_x1 = max(damage.x1, 0);
-		output->framebuffer_damage_y1 = max(damage.y1, 0);
-		output->framebuffer_damage_x2 = max(damage.x2, 0);
-		output->framebuffer_damage_y2 = max(damage.y2, 0);
-	} else {
-		output->framebuffer_damage_valid = false;
-	}
-	mutex_unlock(&output->state_lock);
+	(void)plane;
+	(void)state;
 }
 
 static const struct drm_plane_helper_funcs hermes_kms_plane_helper_funcs = {
 	.atomic_check = hermes_kms_plane_atomic_check,
-	.atomic_update = hermes_kms_plane_atomic_update,
+	.atomic_update = hermes_kms_plane_atomic_noop,
+	.atomic_disable = hermes_kms_plane_atomic_noop,
 };
 
 static const struct drm_plane_funcs hermes_kms_plane_funcs = {
@@ -994,9 +1291,8 @@ static const struct drm_plane_funcs hermes_kms_plane_funcs = {
  * Cursor plane. Exposing a cursor plane lets the compositor (KWin/GNOME) move
  * the pointer without recompositing the whole output every frame, which keeps
  * the captured primary framebuffer stable on cursor-only motion. The capture
- * consumer (Apollo) detects the cursor plane separately and renders it
- * client-side (Moonlight overlays the cursor), so the cursor does not need to
- * be blended into the streamed primary plane here.
+ * consumer can detect the cursor plane separately and render it client-side,
+ * so the cursor does not need to be blended into the captured primary plane.
  */
 static int hermes_kms_cursor_atomic_check(struct drm_plane *plane,
 					  struct drm_atomic_commit *state)
@@ -1007,29 +1303,24 @@ static int hermes_kms_cursor_atomic_check(struct drm_plane *plane,
 
 	if (!new_state->crtc)
 		return 0;
+	if (new_state->fb &&
+	    (new_state->fb->width > plane->dev->mode_config.cursor_width ||
+	     new_state->fb->height > plane->dev->mode_config.cursor_height))
+		return -EINVAL;
 
 	crtc_state = drm_atomic_get_new_crtc_state(state, new_state->crtc);
 
-	/* Cursor may sit partly off-screen and is never scaled or clipped. */
+	/* Cursor may sit partly off-screen; the helper clips it without scaling. */
 	return drm_atomic_helper_check_plane_state(new_state, crtc_state,
 						   DRM_PLANE_NO_SCALING,
 						   DRM_PLANE_NO_SCALING,
 						   true, true);
 }
 
-static void hermes_kms_cursor_atomic_update(struct drm_plane *plane,
-					    struct drm_atomic_commit *state)
-{
-	/*
-	 * Nothing to scan out: the cursor is consumed client-side. The update
-	 * exists so the compositor's cursor commits succeed and stay off the
-	 * primary plane's damage path.
-	 */
-}
-
 static const struct drm_plane_helper_funcs hermes_kms_cursor_helper_funcs = {
 	.atomic_check = hermes_kms_cursor_atomic_check,
-	.atomic_update = hermes_kms_cursor_atomic_update,
+	.atomic_update = hermes_kms_plane_atomic_noop,
+	.atomic_disable = hermes_kms_plane_atomic_noop,
 };
 
 static const struct drm_plane_funcs hermes_kms_cursor_funcs = {
@@ -1081,12 +1372,14 @@ static int hermes_kms_ioctl_get_caps(struct drm_device *drm, void *data,
 		      HERMES_KMS_CAP_FRAME_METADATA |
 		      HERMES_KMS_CAP_FRAME_ACQUIRE |
 		      HERMES_KMS_CAP_DMABUF_EXPORT |
-		      HERMES_KMS_CAP_OUTPUT_IDENTITY |
-		      HERMES_KMS_CAP_SESSION_OWNER |
-		      HERMES_KMS_CAP_FRAME_WAIT |
-		      HERMES_KMS_CAP_METRICS |
-		      HERMES_KMS_CAP_MULTI_OUTPUT |
-		      HERMES_KMS_CAP_ZERO_COPY_TARGET |
+			      HERMES_KMS_CAP_OUTPUT_IDENTITY |
+			      HERMES_KMS_CAP_SESSION_OWNER |
+			      HERMES_KMS_CAP_FRAME_WAIT |
+			      HERMES_KMS_CAP_METRICS |
+			      HERMES_KMS_CAP_MULTI_OUTPUT |
+			      HERMES_KMS_CAP_SESSION_TOKEN |
+			      HERMES_KMS_CAP_CURSOR_CAPTURE |
+			      HERMES_KMS_CAP_ZERO_COPY_TARGET |
 		      HERMES_KMS_CAP_SYNC_FILE;
 	if (hdev->device_count > 1)
 		caps->flags |= HERMES_KMS_CAP_MULTI_DEVICE;
@@ -1111,47 +1404,114 @@ static int hermes_kms_ioctl_select_output(struct drm_device *drm, void *data,
 	struct hermes_kms_file *context = file->driver_priv;
 	struct drm_hermes_kms_select_output *request = data;
 	struct hermes_kms_output *current_output;
+	struct hermes_kms_output *old_bound;
 	struct hermes_kms_output *selected;
 	unsigned int output_index = request->output_index;
+	int ret = 0;
 
 	if (!context)
 		return -EINVAL;
-	if (request->flags || output_index >= hdev->output_count)
+	if (request->flags ||
+	    memchr_inv(request->reserved, 0, sizeof(request->reserved)) ||
+	    output_index >= hdev->output_count)
 		return -EINVAL;
 
-	current_output = hermes_kms_output_for_file(hdev, file);
+	mutex_lock(&context->lock);
+	current_output = hermes_kms_output_for_context(hdev, context);
+	selected = &hdev->outputs[output_index];
+	if (current_output == selected) {
+		mutex_lock(&selected->state_lock);
+		if (selected->owner_file &&
+		    !hermes_kms_file_has_access_locked(selected, file, context))
+			ret = -EACCES;
+		mutex_unlock(&selected->state_lock);
+		if (ret)
+			goto unlock_context;
+		goto fill_response;
+	}
+
 	mutex_lock(&current_output->state_lock);
 	if (current_output->owner_file == file) {
-		mutex_unlock(&current_output->state_lock);
-		return -EBUSY;
+		ret = -EBUSY;
+		goto unlock_current;
 	}
 	mutex_unlock(&current_output->state_lock);
 
-	context->output_index = output_index;
-	selected = &hdev->outputs[output_index];
+	/* BIND, rather than SELECT_OUTPUT, authorizes an active foreign session. */
+	mutex_lock(&selected->state_lock);
+	if (selected->owner_file && !insecure_legacy_unbound_access)
+		ret = -EACCES;
+	mutex_unlock(&selected->state_lock);
+	if (ret)
+		goto unlock_context;
 
+	old_bound = context->bound_output;
+	context->output_index = output_index;
+	context->bound_output = NULL;
+	context->bound_session_id = 0;
+	context->bound_authorization_generation = 0;
+	hermes_kms_reset_acquire_history_locked(context);
+	atomic64_inc(&context->binding_generation);
+	/* A waiter may be authorized as the owner without bound_output set. */
+	wake_up_interruptible(&current_output->frame_wait);
+	if (old_bound && old_bound != current_output)
+		wake_up_interruptible(&old_bound->frame_wait);
+
+fill_response:
 	memset(request, 0, sizeof(*request));
 	request->output_index = output_index;
 	request->selected_output_index = output_index;
 	request->output_count = hdev->output_count;
 	strscpy(request->output_name, selected->output_name,
 		sizeof(request->output_name));
-
+	mutex_unlock(&context->lock);
 	return 0;
+
+unlock_current:
+	mutex_unlock(&current_output->state_lock);
+unlock_context:
+	mutex_unlock(&context->lock);
+	return ret;
 }
 
 static int hermes_kms_ioctl_get_status(struct drm_device *drm, void *data,
 				       struct drm_file *file)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
-	struct hermes_kms_output *output =
-		hermes_kms_output_for_file(hdev, file);
+	struct hermes_kms_file *context = file->driver_priv;
+	struct hermes_kms_output *output;
 	struct drm_hermes_kms_status *status = data;
 	struct drm_crtc_state *crtc_state;
+	bool public_idle;
+	int ret;
 
 	memset(status, 0, sizeof(*status));
 
+	if (!context)
+		return -EINVAL;
+
+	/*
+	 * Keep selection, authorization and CRTC state in one linearizable
+	 * snapshot. In particular, an idle/public status call must not pass its
+	 * access check and then observe a replacement session's active mode.
+	 * The CRTC -> state_lock order matches the atomic modeset callbacks.
+	 */
+	mutex_lock(&context->lock);
+	output = hermes_kms_output_for_context(hdev, context);
+	ret = drm_modeset_lock(&output->crtc.mutex, NULL);
+	if (ret) {
+		mutex_unlock(&context->lock);
+		return ret;
+	}
 	mutex_lock(&output->state_lock);
+	public_idle = !output->owner_file && !output->output_enabled &&
+		      !output->framebuffer;
+	if (!public_idle &&
+	    !hermes_kms_file_has_access_locked(output, file, context)) {
+		ret = -EACCES;
+		goto unlock_status;
+	}
+
 	if (output->output_enabled)
 		status->flags |= HERMES_KMS_STATUS_OUTPUT_ENABLED |
 				 HERMES_KMS_STATUS_CONNECTED;
@@ -1163,7 +1523,7 @@ static int hermes_kms_ioctl_get_status(struct drm_device *drm, void *data,
 	status->requested_width = output->requested_width;
 	status->requested_height = output->requested_height;
 	status->requested_refresh_hz = output->requested_refresh_hz;
-	status->frame_sequence = output->frame_sequence;
+	status->frame_sequence = atomic64_read(&output->frame_sequence);
 	status->last_update_ns = output->last_update_ns;
 	status->last_enable_ns = output->last_enable_ns;
 	status->last_disable_ns = output->last_disable_ns;
@@ -1183,19 +1543,12 @@ static int hermes_kms_ioctl_get_status(struct drm_device *drm, void *data,
 		status->flags |= HERMES_KMS_STATUS_FRAME_VALID;
 	if (output->framebuffer)
 		status->flags |= HERMES_KMS_STATUS_DMABUF_EXPORT_READY;
-	mutex_unlock(&output->state_lock);
 
 	status->connector_id = output->connector.base.id;
 	status->crtc_id = output->crtc.base.id;
 	status->plane_id = output->primary.base.id;
 	status->encoder_id = output->encoder.base.id;
 
-	/*
-	 * crtc->state is swapped under the CRTC modeset lock during an atomic
-	 * commit; take it so we never dereference a state being freed. This is
-	 * a diagnostic path, so blocking briefly on a concurrent commit is fine.
-	 */
-	drm_modeset_lock(&output->crtc.mutex, NULL);
 	crtc_state = output->crtc.state;
 	if (crtc_state && crtc_state->enable) {
 		status->flags |= HERMES_KMS_STATUS_SCANOUT_ACTIVE;
@@ -1203,23 +1556,31 @@ static int hermes_kms_ioctl_get_status(struct drm_device *drm, void *data,
 		status->active_height = crtc_state->mode.vdisplay;
 		status->active_refresh_hz = drm_mode_vrefresh(&crtc_state->mode);
 	}
-	drm_modeset_unlock(&output->crtc.mutex);
 
-	return 0;
+unlock_status:
+	mutex_unlock(&output->state_lock);
+	drm_modeset_unlock(&output->crtc.mutex);
+	mutex_unlock(&context->lock);
+
+	return ret;
 }
 
 static int hermes_kms_ioctl_get_metrics(struct drm_device *drm, void *data,
 					struct drm_file *file)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
-	struct hermes_kms_output *output =
-		hermes_kms_output_for_file(hdev, file);
+	struct hermes_kms_file *context;
+	struct hermes_kms_output *output;
 	struct drm_hermes_kms_metrics *metrics = data;
+	int ret;
 
 	memset(metrics, 0, sizeof(*metrics));
 
-	mutex_lock(&output->state_lock);
-	metrics->frame_sequence = output->frame_sequence;
+	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+					    &context, &output);
+	if (ret)
+		return ret;
+	metrics->frame_sequence = atomic64_read(&output->frame_sequence);
 	metrics->frame_update_count = output->frame_update_count;
 	metrics->acquire_count = output->acquire_count;
 	metrics->acquire_no_frame_count = output->acquire_no_frame_count;
@@ -1243,7 +1604,10 @@ static int hermes_kms_ioctl_get_metrics(struct drm_device *drm, void *data,
 	metrics->last_wait_duration_ns = output->last_wait_duration_ns;
 	metrics->last_dmabuf_export_ns = output->last_dmabuf_export_ns;
 	metrics->last_sync_file_export_ns = output->last_sync_file_export_ns;
-	mutex_unlock(&output->state_lock);
+	metrics->vblank_count = atomic64_read(&output->vblank_count);
+	metrics->vblank_overrun_count =
+		atomic64_read(&output->vblank_overrun_count);
+	hermes_kms_unlock_scoped_output(context, output);
 
 	return 0;
 }
@@ -1252,10 +1616,17 @@ static int hermes_kms_ioctl_get_identity(struct drm_device *drm, void *data,
 					 struct drm_file *file)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
-	struct hermes_kms_output *output =
-		hermes_kms_output_for_file(hdev, file);
+	struct hermes_kms_file *context = file->driver_priv;
+	struct hermes_kms_output *output;
 	struct drm_hermes_kms_identity *identity = data;
-	const char *connector_name = output->connector.name;
+	const char *connector_name;
+
+	if (!context)
+		return -EINVAL;
+
+	mutex_lock(&context->lock);
+	output = hermes_kms_output_for_context(hdev, context);
+	connector_name = output->connector.name;
 
 	memset(identity, 0, sizeof(*identity));
 	strscpy(identity->driver_name, HERMES_KMS_DRIVER_NAME,
@@ -1277,64 +1648,116 @@ static int hermes_kms_ioctl_get_identity(struct drm_device *drm, void *data,
 	identity->device_role = hdev->device_role;
 	identity->session_index = hdev->session_index;
 	identity->session_device_count = hdev->session_device_count;
+	identity->cursor_plane_id = output->cursor.base.id;
+	mutex_unlock(&context->lock);
 
 	return 0;
+}
+
+static u64 hermes_kms_status_flags_locked(struct hermes_kms_output *output)
+{
+	u64 flags = 0;
+
+	if (output->output_enabled)
+		flags |= HERMES_KMS_STATUS_OUTPUT_ENABLED |
+			 HERMES_KMS_STATUS_CONNECTED;
+	if (hotplug_events)
+		flags |= HERMES_KMS_STATUS_HOTPLUG_EVENTS_ENABLED;
+	if (output->owner_file)
+		flags |= HERMES_KMS_STATUS_SESSION_OWNED;
+	if (output->framebuffer_id)
+		flags |= HERMES_KMS_STATUS_FRAME_VALID;
+	if (output->framebuffer)
+		flags |= HERMES_KMS_STATUS_DMABUF_EXPORT_READY;
+
+	return flags;
 }
 
 static void hermes_kms_fill_wait_frame_locked(struct hermes_kms_output *output,
 					      struct drm_hermes_kms_wait_frame *wait)
 {
-	wait->sequence = output->frame_sequence;
+	wait->sequence = atomic64_read(&output->frame_sequence);
 	wait->timestamp_ns = output->last_update_ns;
-	wait->status_flags = 0;
-
-	if (output->output_enabled)
-		wait->status_flags |= HERMES_KMS_STATUS_OUTPUT_ENABLED |
-				      HERMES_KMS_STATUS_CONNECTED;
-	if (hotplug_events)
-		wait->status_flags |= HERMES_KMS_STATUS_HOTPLUG_EVENTS_ENABLED;
-	if (output->owner_file)
-		wait->status_flags |= HERMES_KMS_STATUS_SESSION_OWNED;
-	if (output->framebuffer_id)
-		wait->status_flags |= HERMES_KMS_STATUS_FRAME_VALID;
-	if (output->framebuffer) {
+	wait->status_flags = hermes_kms_status_flags_locked(output);
+	if (output->framebuffer)
 		wait->flags |= HERMES_KMS_WAIT_FRAME_READY;
-		wait->status_flags |= HERMES_KMS_STATUS_DMABUF_EXPORT_READY;
+}
+
+static int hermes_kms_finish_wait_timeout(
+	struct hermes_kms_device *hdev, struct drm_file *file,
+	struct hermes_kms_output *expected_output, u64 binding_generation,
+	u64 authorization_generation, u64 start_ns, int timeout_error)
+{
+	struct hermes_kms_file *context;
+	struct hermes_kms_output *selected;
+	u64 end_ns = ktime_get_ns();
+	int ret;
+
+	/* Revocation wins over a timeout, as promised by the public UAPI. */
+	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+					    &context, &selected);
+	if (ret)
+		return ret;
+	if (selected != expected_output ||
+	    atomic64_read(&context->binding_generation) != binding_generation ||
+	    atomic64_read(&expected_output->authorization_generation) !=
+		authorization_generation) {
+		hermes_kms_unlock_scoped_output(context, selected);
+		return -EACCES;
 	}
+
+	expected_output->wait_timeout_count++;
+	expected_output->last_wait_end_ns = end_ns;
+	expected_output->last_wait_duration_ns = end_ns - start_ns;
+	hermes_kms_unlock_scoped_output(context, expected_output);
+	return timeout_error;
 }
 
 static int hermes_kms_ioctl_wait_frame(struct drm_device *drm, void *data,
 				       struct drm_file *file)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
-	struct hermes_kms_output *output =
-		hermes_kms_output_for_file(hdev, file);
+	struct hermes_kms_file *context;
+	struct hermes_kms_output *output;
+	struct hermes_kms_output *selected;
 	struct drm_hermes_kms_wait_frame *wait = data;
 	u64 after_sequence = wait->after_sequence;
+	u64 binding_generation;
+	u64 authorization_generation;
 	u32 timeout_ms = wait->timeout_ms;
 	u64 start_ns = ktime_get_ns();
 	u64 end_ns;
 	long timeout;
+	int ret;
 
-	mutex_lock(&output->state_lock);
+	if (wait->flags || wait->reserved0 ||
+	    memchr_inv(wait->reserved, 0, sizeof(wait->reserved)))
+		return -EINVAL;
+
+	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+					    &context, &output);
+	if (ret)
+		return ret;
 	output->wait_count++;
 	output->last_wait_start_ns = start_ns;
-	mutex_unlock(&output->state_lock);
+	binding_generation = atomic64_read(&context->binding_generation);
+	authorization_generation =
+		atomic64_read(&output->authorization_generation);
+	hermes_kms_unlock_scoped_output(context, output);
 
-	if (READ_ONCE(output->frame_sequence) <= after_sequence) {
-		if (!timeout_ms) {
-			mutex_lock(&output->state_lock);
-			output->wait_timeout_count++;
-			output->last_wait_end_ns = ktime_get_ns();
-			output->last_wait_duration_ns =
-				output->last_wait_end_ns - start_ns;
-			mutex_unlock(&output->state_lock);
-			return -EAGAIN;
-		}
+	if (atomic64_read(&output->frame_sequence) <= after_sequence) {
+		if (!timeout_ms)
+			return hermes_kms_finish_wait_timeout(
+				hdev, file, output, binding_generation,
+				authorization_generation, start_ns, -EAGAIN);
 
 		timeout = wait_event_interruptible_timeout(
 			output->frame_wait,
-			READ_ONCE(output->frame_sequence) > after_sequence,
+			atomic64_read(&output->frame_sequence) > after_sequence ||
+			atomic64_read(&context->binding_generation) !=
+				binding_generation ||
+			atomic64_read(&output->authorization_generation) !=
+				authorization_generation,
 			msecs_to_jiffies(timeout_ms));
 		if (timeout < 0) {
 			mutex_lock(&output->state_lock);
@@ -1345,26 +1768,138 @@ static int hermes_kms_ioctl_wait_frame(struct drm_device *drm, void *data,
 			mutex_unlock(&output->state_lock);
 			return timeout;
 		}
-		if (!timeout) {
-			mutex_lock(&output->state_lock);
-			output->wait_timeout_count++;
-			output->last_wait_end_ns = ktime_get_ns();
-			output->last_wait_duration_ns =
-				output->last_wait_end_ns - start_ns;
-			mutex_unlock(&output->state_lock);
-			return -ETIMEDOUT;
-		}
+		if (!timeout)
+			return hermes_kms_finish_wait_timeout(
+				hdev, file, output, binding_generation,
+				authorization_generation, start_ns, -ETIMEDOUT);
+	}
+
+	end_ns = ktime_get_ns();
+	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+					    &context, &selected);
+	if (ret)
+		return ret;
+	if (selected != output ||
+	    atomic64_read(&context->binding_generation) != binding_generation ||
+	    atomic64_read(&output->authorization_generation) !=
+		authorization_generation) {
+		hermes_kms_unlock_scoped_output(context, selected);
+		return -EACCES;
 	}
 
 	memset(wait, 0, sizeof(*wait));
-
-	end_ns = ktime_get_ns();
-	mutex_lock(&output->state_lock);
 	output->wait_ready_count++;
 	output->last_wait_end_ns = end_ns;
 	output->last_wait_duration_ns = end_ns - start_ns;
 	hermes_kms_fill_wait_frame_locked(output, wait);
-	mutex_unlock(&output->state_lock);
+	hermes_kms_unlock_scoped_output(context, output);
+
+	return 0;
+}
+
+static void hermes_kms_fill_wait_update_locked(
+	struct hermes_kms_output *output,
+	struct drm_hermes_kms_wait_update *wait,
+	u64 after_frame_sequence, u64 after_cursor_sequence)
+{
+	wait->frame_sequence = atomic64_read(&output->frame_sequence);
+	wait->cursor_sequence = atomic64_read(&output->cursor_sequence);
+	wait->frame_timestamp_ns = output->last_update_ns;
+	wait->cursor_timestamp_ns = output->cursor_last_update_ns;
+	wait->status_flags = hermes_kms_status_flags_locked(output);
+	if (wait->frame_sequence > after_frame_sequence)
+		wait->flags |= HERMES_KMS_WAIT_UPDATE_FRAME_READY;
+	if (wait->cursor_sequence > after_cursor_sequence)
+		wait->flags |= HERMES_KMS_WAIT_UPDATE_CURSOR_READY;
+}
+
+static int hermes_kms_ioctl_wait_update(struct drm_device *drm, void *data,
+					struct drm_file *file)
+{
+	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct hermes_kms_file *context;
+	struct hermes_kms_output *output;
+	struct hermes_kms_output *selected;
+	struct drm_hermes_kms_wait_update *wait = data;
+	u64 after_frame_sequence = wait->after_frame_sequence;
+	u64 after_cursor_sequence = wait->after_cursor_sequence;
+	u64 binding_generation;
+	u64 authorization_generation;
+	u32 timeout_ms = wait->timeout_ms;
+	u64 start_ns = ktime_get_ns();
+	u64 end_ns;
+	long timeout;
+	int ret;
+
+	if (wait->flags || wait->reserved0 ||
+	    memchr_inv(wait->reserved, 0, sizeof(wait->reserved)))
+		return -EINVAL;
+
+	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+					    &context, &output);
+	if (ret)
+		return ret;
+	output->wait_count++;
+	output->cursor_wait_count++;
+	output->last_wait_start_ns = start_ns;
+	binding_generation = atomic64_read(&context->binding_generation);
+	authorization_generation =
+		atomic64_read(&output->authorization_generation);
+	hermes_kms_unlock_scoped_output(context, output);
+
+	if (atomic64_read(&output->frame_sequence) <= after_frame_sequence &&
+	    atomic64_read(&output->cursor_sequence) <= after_cursor_sequence) {
+		if (!timeout_ms)
+			return hermes_kms_finish_wait_timeout(
+				hdev, file, output, binding_generation,
+				authorization_generation, start_ns, -EAGAIN);
+
+		timeout = wait_event_interruptible_timeout(
+			output->frame_wait,
+			atomic64_read(&output->frame_sequence) >
+				after_frame_sequence ||
+			atomic64_read(&output->cursor_sequence) >
+				after_cursor_sequence ||
+			atomic64_read(&context->binding_generation) !=
+				binding_generation ||
+			atomic64_read(&output->authorization_generation) !=
+				authorization_generation,
+			msecs_to_jiffies(timeout_ms));
+		if (timeout < 0) {
+			mutex_lock(&output->state_lock);
+			output->wait_interrupted_count++;
+			output->last_wait_end_ns = ktime_get_ns();
+			output->last_wait_duration_ns =
+				output->last_wait_end_ns - start_ns;
+			mutex_unlock(&output->state_lock);
+			return timeout;
+		}
+		if (!timeout)
+			return hermes_kms_finish_wait_timeout(
+				hdev, file, output, binding_generation,
+				authorization_generation, start_ns, -ETIMEDOUT);
+	}
+
+	end_ns = ktime_get_ns();
+	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+					    &context, &selected);
+	if (ret)
+		return ret;
+	if (selected != output ||
+	    atomic64_read(&context->binding_generation) != binding_generation ||
+	    atomic64_read(&output->authorization_generation) !=
+		authorization_generation) {
+		hermes_kms_unlock_scoped_output(context, selected);
+		return -EACCES;
+	}
+
+	memset(wait, 0, sizeof(*wait));
+	output->wait_ready_count++;
+	output->last_wait_end_ns = end_ns;
+	output->last_wait_duration_ns = end_ns - start_ns;
+	hermes_kms_fill_wait_update_locked(output, wait, after_frame_sequence,
+					   after_cursor_sequence);
+	hermes_kms_unlock_scoped_output(context, output);
 
 	return 0;
 }
@@ -1403,7 +1938,7 @@ static void hermes_kms_close_frame_fds(struct drm_hermes_kms_acquire_frame *fram
  * the installed fd). Caller must hold export_lock.
  */
 static struct dma_buf *
-hermes_kms_get_plane_dmabuf_locked(struct hermes_kms_output *output,
+hermes_kms_get_plane_dmabuf_locked(struct hermes_kms_export_cache *cache,
 				   struct drm_framebuffer *fb,
 				   unsigned int index)
 {
@@ -1414,9 +1949,9 @@ hermes_kms_get_plane_dmabuf_locked(struct hermes_kms_output *output,
 	if (!obj)
 		return ERR_PTR(-EINVAL);
 
-	if (output->export_obj[index] == obj && output->export_dmabuf[index]) {
-		get_dma_buf(output->export_dmabuf[index]);
-		return output->export_dmabuf[index];
+	if (cache->obj[index] == obj && cache->dmabuf[index]) {
+		get_dma_buf(cache->dmabuf[index]);
+		return cache->dmabuf[index];
 	}
 
 	/*
@@ -1446,29 +1981,54 @@ hermes_kms_get_plane_dmabuf_locked(struct hermes_kms_output *output,
 			return dmabuf;
 	}
 
-	/* Replace the cache entry; the cache holds one reference. */
-	if (output->export_dmabuf[index])
-		dma_buf_put(output->export_dmabuf[index]);
+	/* Replace the cache entry; the cache holds one reference to each object. */
+	if (cache->dmabuf[index])
+		dma_buf_put(cache->dmabuf[index]);
+	if (cache->obj[index])
+		drm_gem_object_put(cache->obj[index]);
 	get_dma_buf(dmabuf);
-	output->export_dmabuf[index] = dmabuf;
-	output->export_obj[index] = obj;
+	drm_gem_object_get(obj);
+	cache->dmabuf[index] = dmabuf;
+	cache->obj[index] = obj;
 
 	return dmabuf;
 }
 
 static int hermes_kms_export_frame_dmabufs(struct hermes_kms_output *output,
 					   struct drm_framebuffer *fb,
+					   u64 framebuffer_generation,
+					   u64 authorization_generation,
+					   u64 frame_sequence,
 					   struct drm_hermes_kms_acquire_frame *frame)
 {
 	unsigned int i;
 	int ret = 0;
 
+	/*
+	 * Hold the state lock through cache lookup and fd installation. Otherwise
+	 * an acquire of an old framebuffer can repopulate the cache after a newer
+	 * flip/disconnect dropped it. The generation also catches an ABA where the
+	 * same framebuffer pointer is presented again by a later commit.
+	 */
+	mutex_lock(&output->state_lock);
+	if (atomic64_read(&output->authorization_generation) !=
+	    authorization_generation) {
+		mutex_unlock(&output->state_lock);
+		return -EACCES;
+	}
+	if (output->framebuffer != fb ||
+	    output->framebuffer_generation != framebuffer_generation ||
+	    atomic64_read(&output->frame_sequence) != frame_sequence) {
+		mutex_unlock(&output->state_lock);
+		return -ESTALE;
+	}
 	mutex_lock(&output->export_lock);
 	for (i = 0; i < frame->plane_count; i++) {
 		struct dma_buf *dmabuf;
 		int fd;
 
-		dmabuf = hermes_kms_get_plane_dmabuf_locked(output, fb, i);
+		dmabuf = hermes_kms_get_plane_dmabuf_locked(
+			&output->frame_export_cache, fb, i);
 		if (IS_ERR(dmabuf)) {
 			ret = PTR_ERR(dmabuf);
 			break;
@@ -1485,6 +2045,7 @@ static int hermes_kms_export_frame_dmabufs(struct hermes_kms_output *output,
 		frame->dma_buf_fd[i] = fd;
 	}
 	mutex_unlock(&output->export_lock);
+	mutex_unlock(&output->state_lock);
 
 	if (ret)
 		return ret;
@@ -1503,8 +2064,7 @@ static int hermes_kms_export_frame_dmabufs(struct hermes_kms_output *output,
  * case for this driver's synchronous update path.
  */
 static struct dma_fence *
-hermes_kms_frame_fence(struct drm_framebuffer *fb,
-		       const struct drm_hermes_kms_acquire_frame *frame)
+hermes_kms_frame_fence(struct drm_framebuffer *fb, u64 timestamp_ns)
 {
 	struct drm_gem_object *obj;
 	struct dma_fence *fence = NULL;
@@ -1516,59 +2076,118 @@ hermes_kms_frame_fence(struct drm_framebuffer *fb,
 		ret = dma_resv_get_singleton(obj->resv, DMA_RESV_USAGE_WRITE,
 					     &fence);
 		if (ret)
-			fence = NULL;
+			return ERR_PTR(ret);
 	}
 
 	if (!fence)
 		fence = dma_fence_allocate_private_stub(
-			ns_to_ktime(frame->timestamp_ns));
+			ns_to_ktime(timestamp_ns));
 
 	return fence;
 }
 
-static int hermes_kms_export_sync_file(struct drm_framebuffer *fb,
-				       struct drm_hermes_kms_acquire_frame *frame)
+static int hermes_kms_export_sync_file(struct hermes_kms_output *output,
+				       struct drm_framebuffer *fb,
+				       u64 buffer_generation,
+				       u64 authorization_generation,
+				       bool cursor_buffer,
+				       u64 sequence,
+				       u64 image_sequence,
+				       u64 timestamp_ns, int *sync_file_fd)
 {
 	struct dma_fence *fence;
 	struct sync_file *sync_file;
 	int fd;
+	int ret = 0;
 
-	fence = hermes_kms_frame_fence(fb, frame);
-	if (!fence)
-		return -ENOMEM;
+	/*
+	 * Keep revocation and buffer replacement from racing fd installation.
+	 * Without this check a caller could pass the DMA-BUF revalidation, lose
+	 * its session, and still receive a new sync_file for the old buffer.
+	 */
+	mutex_lock(&output->state_lock);
+	if (atomic64_read(&output->authorization_generation) !=
+	    authorization_generation) {
+		ret = -EACCES;
+		goto out_unlock;
+	}
+	if (cursor_buffer) {
+		if (output->cursor_framebuffer != fb ||
+		    output->cursor_generation != buffer_generation ||
+		    atomic64_read(&output->cursor_sequence) != sequence ||
+		    output->cursor_image_sequence != image_sequence) {
+			ret = -ESTALE;
+			goto out_unlock;
+		}
+	} else if (output->framebuffer != fb ||
+		   output->framebuffer_generation != buffer_generation ||
+		   atomic64_read(&output->frame_sequence) != sequence) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
+
+	fence = hermes_kms_frame_fence(fb, timestamp_ns);
+	if (IS_ERR(fence)) {
+		ret = PTR_ERR(fence);
+		goto out_unlock;
+	}
+	if (!fence) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
 
 	sync_file = sync_file_create(fence);
 	dma_fence_put(fence);
-	if (!sync_file)
-		return -ENOMEM;
+	if (!sync_file) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
 
 	fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fd < 0) {
 		fput(sync_file->file);
-		return fd;
+		ret = fd;
+		goto out_unlock;
 	}
 
 	fd_install(fd, sync_file->file);
-	frame->sync_file_fd = fd;
-	frame->flags |= HERMES_KMS_FRAME_SYNC_FILE_VALID;
-	return 0;
+	*sync_file_fd = fd;
+
+out_unlock:
+	mutex_unlock(&output->state_lock);
+	return ret;
 }
 
 static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 					  struct drm_file *file)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
-	struct hermes_kms_output *output =
-		hermes_kms_output_for_file(hdev, file);
+	struct hermes_kms_file *context;
+	struct hermes_kms_output *output;
 	struct drm_hermes_kms_acquire_frame *frame = data;
 	struct drm_framebuffer *fb;
 	u64 requested_flags = frame->flags;
+	u64 framebuffer_generation;
+	u64 authorization_generation;
+	u64 sequence;
+	u64 session_id;
+	bool damage_valid = false;
 	int ret = 0;
+
+	if (requested_flags & ~(HERMES_KMS_FRAME_REQUEST_DMABUF |
+				HERMES_KMS_FRAME_REQUEST_SYNC_FILE))
+		return -EINVAL;
+	if (frame->reserved0 ||
+	    memchr_inv(frame->reserved, 0, sizeof(frame->reserved)))
+		return -EINVAL;
 
 	memset(frame, 0, sizeof(*frame));
 	hermes_kms_init_invalid_frame_fds(frame);
 
-	mutex_lock(&output->state_lock);
+	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+					    &context, &output);
+	if (ret)
+		return ret;
 	output->acquire_count++;
 	output->last_acquire_ns = ktime_get_ns();
 	if (!output->framebuffer) {
@@ -1578,9 +2197,10 @@ static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 			drm_info(drm,
 				 "%s ACQUIRE_FRAME has no framebuffer yet: output_enabled=%d owner_pid=%d session=%llu sequence=%llu\n",
 				 output->output_name, output->output_enabled,
-				 output->owner_pid ? output->owner_pid : -1,
-				 (unsigned long long)output->session_id,
-				 (unsigned long long)output->frame_sequence);
+					 output->owner_pid ? output->owner_pid : -1,
+					 (unsigned long long)output->session_id,
+					 (unsigned long long)atomic64_read(
+						 &output->frame_sequence));
 		} else {
 			drm_dbg_kms_ratelimited(drm,
 						"%s ACQUIRE_FRAME has no framebuffer yet: output_enabled=%d owner_pid=%d session=%llu sequence=%llu\n",
@@ -1588,16 +2208,22 @@ static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 						output->output_enabled,
 						output->owner_pid ? output->owner_pid : -1,
 						(unsigned long long)output->session_id,
-						(unsigned long long)output->frame_sequence);
+						(unsigned long long)atomic64_read(
+							&output->frame_sequence));
 		}
-		mutex_unlock(&output->state_lock);
+		hermes_kms_unlock_scoped_output(context, output);
 		return -ENODATA;
 	}
 
 	fb = output->framebuffer;
 	drm_framebuffer_get(fb);
+	framebuffer_generation = output->framebuffer_generation;
+	authorization_generation =
+		atomic64_read(&output->authorization_generation);
+	sequence = atomic64_read(&output->frame_sequence);
+	session_id = output->session_id;
 	frame->flags = HERMES_KMS_FRAME_METADATA_VALID;
-	frame->sequence = output->frame_sequence;
+	frame->sequence = sequence;
 	frame->timestamp_ns = output->last_update_ns;
 	frame->modifier = output->framebuffer_modifier;
 	frame->framebuffer_id = output->framebuffer_id;
@@ -1607,17 +2233,35 @@ static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 	frame->plane_count = output->framebuffer_plane_count;
 	memcpy(frame->pitch, output->framebuffer_pitch, sizeof(frame->pitch));
 	memcpy(frame->offset, output->framebuffer_offset, sizeof(frame->offset));
-	if (output->framebuffer_damage_valid) {
-		frame->flags |= HERMES_KMS_FRAME_DAMAGE_VALID;
-		frame->damage_x1 = output->framebuffer_damage_x1;
-		frame->damage_y1 = output->framebuffer_damage_y1;
-		frame->damage_x2 = output->framebuffer_damage_x2;
-		frame->damage_y2 = output->framebuffer_damage_y2;
+	/*
+	 * Damage describes one transition only. A repeated acquire is an empty
+	 * change; a consecutive new sequence may use the latched clip. The first
+	 * acquire, a session/output change, or any sequence gap is full-frame.
+	 */
+	if (context->last_acquire_output == output &&
+	    context->last_acquire_session_id == session_id) {
+		if (context->last_acquire_sequence == sequence) {
+			damage_valid = true;
+		} else if (sequence > context->last_acquire_sequence &&
+			   sequence - context->last_acquire_sequence == 1 &&
+			   output->framebuffer_damage_valid) {
+			damage_valid = true;
+			frame->damage_x1 = output->framebuffer_damage_x1;
+			frame->damage_y1 = output->framebuffer_damage_y1;
+			frame->damage_x2 = output->framebuffer_damage_x2;
+			frame->damage_y2 = output->framebuffer_damage_y2;
+		}
 	}
+	if (damage_valid)
+		frame->flags |= HERMES_KMS_FRAME_DAMAGE_VALID;
 	mutex_unlock(&output->state_lock);
 
 	if (requested_flags & HERMES_KMS_FRAME_REQUEST_DMABUF) {
-		ret = hermes_kms_export_frame_dmabufs(output, fb, frame);
+		ret = hermes_kms_export_frame_dmabufs(output, fb,
+						     framebuffer_generation,
+						     authorization_generation,
+						     sequence,
+						     frame);
 		mutex_lock(&output->state_lock);
 		if (ret) {
 			output->dmabuf_export_fail_count++;
@@ -1635,7 +2279,11 @@ static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 	}
 
 	if (requested_flags & HERMES_KMS_FRAME_REQUEST_SYNC_FILE) {
-		ret = hermes_kms_export_sync_file(fb, frame);
+		ret = hermes_kms_export_sync_file(
+			output, fb, framebuffer_generation,
+			authorization_generation, false, sequence, 0,
+			frame->timestamp_ns,
+			&frame->sync_file_fd);
 		mutex_lock(&output->state_lock);
 		if (ret) {
 			output->sync_file_export_fail_count++;
@@ -1644,12 +2292,212 @@ static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 		} else {
 			output->sync_file_export_count++;
 			output->last_sync_file_export_ns = ktime_get_ns();
+			frame->flags |= HERMES_KMS_FRAME_SYNC_FILE_VALID;
 			mutex_unlock(&output->state_lock);
 		}
+	}
+	if (!ret) {
+		context->last_acquire_output = output;
+		context->last_acquire_session_id = session_id;
+		context->last_acquire_sequence = sequence;
 	}
 
 out_put_fb:
 	drm_framebuffer_put(fb);
+	mutex_unlock(&context->lock);
+	return ret;
+}
+
+static void hermes_kms_init_invalid_cursor_fds(
+	struct drm_hermes_kms_acquire_cursor *cursor)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cursor->dma_buf_fd); i++)
+		cursor->dma_buf_fd[i] = -1;
+	cursor->sync_file_fd = -1;
+}
+
+static void hermes_kms_close_cursor_fds(
+	struct drm_hermes_kms_acquire_cursor *cursor)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cursor->dma_buf_fd); i++) {
+		if (cursor->dma_buf_fd[i] >= 0) {
+			close_fd(cursor->dma_buf_fd[i]);
+			cursor->dma_buf_fd[i] = -1;
+		}
+	}
+	if (cursor->sync_file_fd >= 0) {
+		close_fd(cursor->sync_file_fd);
+		cursor->sync_file_fd = -1;
+	}
+}
+
+static int hermes_kms_export_cursor_dmabufs(
+	struct hermes_kms_output *output, struct drm_framebuffer *fb,
+	u64 cursor_generation, u64 authorization_generation,
+	u64 cursor_sequence, u64 cursor_image_sequence,
+	struct drm_hermes_kms_acquire_cursor *cursor)
+{
+	unsigned int i;
+	int ret = 0;
+
+	mutex_lock(&output->state_lock);
+	if (atomic64_read(&output->authorization_generation) !=
+	    authorization_generation) {
+		mutex_unlock(&output->state_lock);
+		return -EACCES;
+	}
+	if (output->cursor_framebuffer != fb ||
+	    output->cursor_generation != cursor_generation ||
+	    atomic64_read(&output->cursor_sequence) != cursor_sequence ||
+	    output->cursor_image_sequence != cursor_image_sequence) {
+		mutex_unlock(&output->state_lock);
+		return -ESTALE;
+	}
+
+	mutex_lock(&output->export_lock);
+	for (i = 0; i < cursor->plane_count; i++) {
+		struct dma_buf *dmabuf;
+		int fd;
+
+		dmabuf = hermes_kms_get_plane_dmabuf_locked(
+			&output->cursor_export_cache, fb, i);
+		if (IS_ERR(dmabuf)) {
+			ret = PTR_ERR(dmabuf);
+			break;
+		}
+		fd = dma_buf_fd(dmabuf, O_CLOEXEC);
+		if (fd < 0) {
+			dma_buf_put(dmabuf);
+			ret = fd;
+			break;
+		}
+		cursor->dma_buf_fd[i] = fd;
+	}
+	mutex_unlock(&output->export_lock);
+	mutex_unlock(&output->state_lock);
+
+	if (!ret)
+		cursor->flags |= HERMES_KMS_CURSOR_DMABUF_VALID;
+	return ret;
+}
+
+static int hermes_kms_ioctl_acquire_cursor(struct drm_device *drm, void *data,
+					   struct drm_file *file)
+{
+	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct hermes_kms_file *context;
+	struct hermes_kms_output *output;
+	struct drm_hermes_kms_acquire_cursor *cursor = data;
+	struct drm_framebuffer *fb = NULL;
+	u64 requested_flags = cursor->flags;
+	u64 cursor_generation = 0;
+	u64 authorization_generation = 0;
+	int ret;
+
+	if (requested_flags & ~(HERMES_KMS_CURSOR_REQUEST_DMABUF |
+				HERMES_KMS_CURSOR_REQUEST_SYNC_FILE))
+		return -EINVAL;
+	if (cursor->reserved0 || cursor->reserved_alignment ||
+	    memchr_inv(cursor->reserved, 0, sizeof(cursor->reserved)))
+		return -EINVAL;
+
+	memset(cursor, 0, sizeof(*cursor));
+	hermes_kms_init_invalid_cursor_fds(cursor);
+
+	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+					    &context, &output);
+	if (ret)
+		return ret;
+	output->cursor_acquire_count++;
+	cursor->flags = HERMES_KMS_CURSOR_METADATA_VALID;
+	cursor->sequence = atomic64_read(&output->cursor_sequence);
+	cursor->image_sequence = output->cursor_image_sequence;
+	cursor->timestamp_ns = output->cursor_last_update_ns;
+	cursor->session_id = output->session_id;
+	cursor->position_x = output->cursor_position_x;
+	cursor->position_y = output->cursor_position_y;
+	cursor->crtc_x = output->cursor_crtc_x;
+	cursor->crtc_y = output->cursor_crtc_y;
+	cursor->crtc_w = output->cursor_crtc_w;
+	cursor->crtc_h = output->cursor_crtc_h;
+	cursor->src_x = output->cursor_src_x;
+	cursor->src_y = output->cursor_src_y;
+	cursor->src_w = output->cursor_src_w;
+	cursor->src_h = output->cursor_src_h;
+	cursor->hotspot_x = output->cursor_hotspot_x;
+	cursor->hotspot_y = output->cursor_hotspot_y;
+	if (output->cursor_position_valid)
+		cursor->flags |= HERMES_KMS_CURSOR_POSITION_VALID |
+				 HERMES_KMS_CURSOR_GEOMETRY_VALID;
+	if (output->cursor_hotspot_valid)
+		cursor->flags |= HERMES_KMS_CURSOR_HOTSPOT_VALID;
+	if (output->cursor_visible)
+		cursor->flags |= HERMES_KMS_CURSOR_VISIBLE;
+	if (output->cursor_framebuffer) {
+		fb = output->cursor_framebuffer;
+		drm_framebuffer_get(fb);
+		cursor_generation = output->cursor_generation;
+		authorization_generation =
+			atomic64_read(&output->authorization_generation);
+		cursor->flags |= HERMES_KMS_CURSOR_BUFFER_VALID;
+		cursor->modifier = output->cursor_modifier;
+		cursor->framebuffer_id = output->cursor_framebuffer_id;
+		cursor->width = output->cursor_width;
+		cursor->height = output->cursor_height;
+		cursor->format = output->cursor_format;
+		cursor->plane_count = output->cursor_plane_count;
+		memcpy(cursor->pitch, output->cursor_pitch,
+		       sizeof(cursor->pitch));
+		memcpy(cursor->offset, output->cursor_offset,
+		       sizeof(cursor->offset));
+	}
+	mutex_unlock(&output->state_lock);
+
+	if (!fb)
+		goto out_unlock_context;
+
+	if (requested_flags & HERMES_KMS_CURSOR_REQUEST_DMABUF) {
+		ret = hermes_kms_export_cursor_dmabufs(
+			output, fb, cursor_generation, authorization_generation,
+			cursor->sequence, cursor->image_sequence,
+			cursor);
+		mutex_lock(&output->state_lock);
+		if (ret) {
+			output->dmabuf_export_fail_count++;
+			mutex_unlock(&output->state_lock);
+			hermes_kms_close_cursor_fds(cursor);
+			goto out_put_fb;
+		}
+		output->dmabuf_export_count++;
+		output->last_dmabuf_export_ns = ktime_get_ns();
+		mutex_unlock(&output->state_lock);
+	}
+	if (requested_flags & HERMES_KMS_CURSOR_REQUEST_SYNC_FILE) {
+		ret = hermes_kms_export_sync_file(
+			output, fb, cursor_generation, authorization_generation,
+			true, cursor->sequence, cursor->image_sequence,
+			cursor->timestamp_ns, &cursor->sync_file_fd);
+		mutex_lock(&output->state_lock);
+		if (ret) {
+			output->sync_file_export_fail_count++;
+			mutex_unlock(&output->state_lock);
+			hermes_kms_close_cursor_fds(cursor);
+			goto out_put_fb;
+		}
+		output->sync_file_export_count++;
+		output->last_sync_file_export_ns = ktime_get_ns();
+		cursor->flags |= HERMES_KMS_CURSOR_SYNC_FILE_VALID;
+		mutex_unlock(&output->state_lock);
+	}
+
+out_put_fb:
+	drm_framebuffer_put(fb);
+out_unlock_context:
+	mutex_unlock(&context->lock);
 	return ret;
 }
 
@@ -1693,47 +2541,91 @@ static int hermes_kms_ioctl_set_output(struct drm_device *drm, void *data,
 				       struct drm_file *file)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
-	struct hermes_kms_output *output =
-		hermes_kms_output_for_file(hdev, file);
+	struct hermes_kms_file *context = file->driver_priv;
+	struct hermes_kms_output *output;
 	struct drm_hermes_kms_set_output *request = data;
 	u32 width = request->width;
 	u32 height = request->height;
 	u32 refresh_hz = request->refresh_hz;
 	pid_t owner_pid;
-	bool hotplug_sent;
+	bool hotplug_sent = false;
+	bool mode_changed;
+	bool owner_assigned;
+	bool session_transition = false;
+	bool state_changed;
+	bool was_enabled;
 
-	if (request->flags)
+	if (!context)
+		return -EINVAL;
+	if (request->flags || request->enabled > 1)
 		return -EINVAL;
 
 	request->result_flags = 0;
 	request->session_id = 0;
+	mutex_lock(&context->lock);
+	output = hermes_kms_output_for_context(hdev, context);
 
 	if (!request->enabled) {
 		u64 session_id;
 
 		mutex_lock(&output->state_lock);
+		if (output->output_transitioning) {
+			mutex_unlock(&output->state_lock);
+			mutex_unlock(&context->lock);
+			return -EAGAIN;
+		}
+		if (!output->owner_file && !output->output_enabled) {
+			/* A disconnected output is already in the requested state. */
+			request->width = output->requested_width;
+			request->height = output->requested_height;
+			request->refresh_hz = output->requested_refresh_hz;
+			mutex_unlock(&output->state_lock);
+			mutex_unlock(&context->lock);
+			return 0;
+		}
+		/*
+		 * An output exposed by initial_enabled=1 has no owner or session.
+		 * Let an ordinary control fd disconnect that legacy state; a live
+		 * session remains protected by the owner_file check below.
+		 */
 		if (output->owner_file && output->owner_file != file) {
 			mutex_unlock(&output->state_lock);
-			return -EPERM;
+			mutex_unlock(&context->lock);
+			return -EACCES;
 		}
 
 		session_id = output->session_id;
 		owner_pid = output->owner_pid;
+		was_enabled = output->output_enabled;
+		if (was_enabled &&
+		    !__ratelimit(&output->output_change_ratelimit)) {
+			mutex_unlock(&output->state_lock);
+			mutex_unlock(&context->lock);
+			return -EAGAIN;
+		}
+		output->output_transitioning = true;
 		output->output_enabled = false;
 		hermes_kms_clear_owner_locked(output);
 		output->last_disable_ns = ktime_get_ns();
-		output->output_disable_count++;
+		if (was_enabled)
+			output->output_disable_count++;
 		mutex_unlock(&output->state_lock);
-		hermes_kms_track_frame(output, NULL);
-		hotplug_sent = hermes_kms_hotplug_event(output);
+		hermes_kms_track_frame(output, NULL, NULL, false);
+		hermes_kms_track_cursor(output, NULL, false);
+		wake_up_interruptible(&output->frame_wait);
+		if (was_enabled)
+			hotplug_sent = hermes_kms_hotplug_event(output);
+		mutex_lock(&output->state_lock);
+		output->output_transitioning = false;
+		mutex_unlock(&output->state_lock);
 		request->session_id = session_id;
 		if (hotplug_sent)
 			request->result_flags |= HERMES_KMS_SET_OUTPUT_RESULT_HOTPLUG_SENT;
-		drm_info(drm,
-			 "%s disconnected virtual output session=%llu owner_pid=%d hotplug_sent=%d\n",
-			 output->output_name, (unsigned long long)session_id,
-			 owner_pid ? owner_pid : -1,
-			 hotplug_sent);
+		drm_dbg_kms(drm,
+			    "%s disconnected virtual output session=%llu owner_pid=%d hotplug_sent=%d\n",
+			    output->output_name, (unsigned long long)session_id,
+			    owner_pid ? owner_pid : -1, hotplug_sent);
+		mutex_unlock(&context->lock);
 		return 0;
 	}
 
@@ -1744,27 +2636,51 @@ static int hermes_kms_ioctl_set_output(struct drm_device *drm, void *data,
 	if (!refresh_hz)
 		refresh_hz = HERMES_KMS_DEFAULT_REFRESH_HZ;
 
-	if (!hermes_kms_valid_requested_mode(width, height, refresh_hz))
+	if (!hermes_kms_valid_requested_mode(width, height, refresh_hz)) {
+		mutex_unlock(&context->lock);
 		return -EINVAL;
+	}
 
 	mutex_lock(&output->state_lock);
+	if (output->output_transitioning) {
+		mutex_unlock(&output->state_lock);
+		mutex_unlock(&context->lock);
+		return -EAGAIN;
+	}
 	if (output->owner_file && output->owner_file != file) {
 		mutex_unlock(&output->state_lock);
+		mutex_unlock(&context->lock);
 		return -EBUSY;
 	}
 
+	was_enabled = output->output_enabled;
+	mode_changed = output->requested_width != width ||
+		       output->requested_height != height ||
+		       output->requested_refresh_hz != refresh_hz;
+	owner_assigned = output->owner_file != file || !output->session_id;
+	state_changed = !was_enabled || mode_changed || owner_assigned;
+	if (state_changed &&
+	    !__ratelimit(&output->output_change_ratelimit)) {
+		mutex_unlock(&output->state_lock);
+		mutex_unlock(&context->lock);
+		return -EAGAIN;
+	}
+	if (owner_assigned) {
+		output->output_transitioning = true;
+		session_transition = true;
+	}
 	output->output_enabled = true;
-	if (output->owner_file != file || !output->session_id) {
-		output->owner_file = file;
-		output->owner_pid = task_pid_nr(current);
-		output->session_id =
-			hermes_kms_next_session_id_locked(output);
+	if (owner_assigned) {
+		hermes_kms_start_session_locked(output, file);
+		hermes_kms_reset_acquire_history_locked(context);
 	}
 	output->requested_width = width;
 	output->requested_height = height;
 	output->requested_refresh_hz = refresh_hz;
-	output->last_enable_ns = ktime_get_ns();
-	output->output_enable_count++;
+	if (state_changed)
+		output->last_enable_ns = ktime_get_ns();
+	if (!was_enabled)
+		output->output_enable_count++;
 	request->session_id = output->session_id;
 	owner_pid = output->owner_pid;
 	mutex_unlock(&output->state_lock);
@@ -1773,22 +2689,193 @@ static int hermes_kms_ioctl_set_output(struct drm_device *drm, void *data,
 	request->height = height;
 	request->refresh_hz = refresh_hz;
 	request->result_flags |= HERMES_KMS_SET_OUTPUT_RESULT_CONNECTED |
-				 HERMES_KMS_SET_OUTPUT_RESULT_OWNER_ASSIGNED;
+		HERMES_KMS_SET_OUTPUT_RESULT_OWNER_ASSIGNED;
+	if (session_transition) {
+		hermes_kms_track_frame(output, NULL, NULL, false);
+		hermes_kms_track_cursor(output, NULL, false);
+		wake_up_interruptible(&output->frame_wait);
+	}
+
+	/* Exact repeats are successful without reprobe, hotplug, counters or logs. */
+	if (!state_changed) {
+		if (session_transition) {
+			mutex_lock(&output->state_lock);
+			output->output_transitioning = false;
+			mutex_unlock(&output->state_lock);
+		}
+		mutex_unlock(&context->lock);
+		return 0;
+	}
 
 	/* Make the connector advertise the freshly requested mode. */
-	hermes_kms_reprobe_modes(output);
+	if (mode_changed)
+		hermes_kms_reprobe_modes(output);
 
 	hotplug_sent = hermes_kms_hotplug_event(output);
+	if (session_transition) {
+		mutex_lock(&output->state_lock);
+		output->output_transitioning = false;
+		mutex_unlock(&output->state_lock);
+	}
 	if (hotplug_sent)
 		request->result_flags |= HERMES_KMS_SET_OUTPUT_RESULT_HOTPLUG_SENT;
-	drm_info(drm,
-		 "%s connected virtual output %ux%u@%u session=%llu owner_pid=%d hotplug_sent=%d\n",
-		 output->output_name, width, height, refresh_hz,
-		 (unsigned long long)request->session_id,
-		 owner_pid ? owner_pid : -1,
-		 hotplug_sent);
+	drm_dbg_kms(drm,
+		    "%s connected virtual output %ux%u@%u session=%llu owner_pid=%d hotplug_sent=%d\n",
+		    output->output_name, width, height, refresh_hz,
+		    (unsigned long long)request->session_id,
+		    owner_pid ? owner_pid : -1, hotplug_sent);
+	mutex_unlock(&context->lock);
 
 	return 0;
+}
+
+static int hermes_kms_ioctl_session_access(struct drm_device *drm, void *data,
+					   struct drm_file *file)
+{
+	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct hermes_kms_file *context = file->driver_priv;
+	struct drm_hermes_kms_session_access *request = data;
+	struct hermes_kms_output *current_output;
+	struct hermes_kms_output *old_bound;
+	struct hermes_kms_output *output;
+	u64 token[2];
+	u64 session_id;
+	u32 operation = request->operation;
+	u32 output_index = request->output_index;
+	int ret = 0;
+
+	if (!context)
+		return -EINVAL;
+	if (request->flags || request->result_flags ||
+	    memchr_inv(request->reserved, 0, sizeof(request->reserved)))
+		return -EINVAL;
+
+	switch (operation) {
+	case HERMES_KMS_SESSION_ACCESS_GET_TOKEN:
+		if (request->token[0] || request->token[1] ||
+		    request->session_id || request->output_index)
+			return -EINVAL;
+
+		mutex_lock(&context->lock);
+		output = hermes_kms_output_for_context(hdev, context);
+		mutex_lock(&output->state_lock);
+		if (output->owner_file != file || !output->session_id) {
+			ret = -EACCES;
+			goto get_token_unlock;
+		}
+		token[0] = output->access_token[0];
+		token[1] = output->access_token[1];
+		session_id = output->session_id;
+		output_index = output->index;
+get_token_unlock:
+		mutex_unlock(&output->state_lock);
+		mutex_unlock(&context->lock);
+		if (ret)
+			return ret;
+
+		memset(request, 0, sizeof(*request));
+		request->token[0] = token[0];
+		request->token[1] = token[1];
+		request->session_id = session_id;
+		request->operation = operation;
+		request->output_index = output_index;
+		request->result_flags =
+			HERMES_KMS_SESSION_ACCESS_RESULT_TOKEN_VALID;
+		memzero_explicit(token, sizeof(token));
+		return 0;
+
+	case HERMES_KMS_SESSION_ACCESS_BIND:
+		if (!request->session_id ||
+		    (!request->token[0] && !request->token[1]) ||
+		    output_index >= hdev->output_count)
+			return -EINVAL;
+		token[0] = request->token[0];
+		token[1] = request->token[1];
+		session_id = request->session_id;
+
+		mutex_lock(&context->lock);
+		current_output = hermes_kms_output_for_context(hdev, context);
+		output = &hdev->outputs[output_index];
+		if (current_output != output) {
+			mutex_lock(&current_output->state_lock);
+			if (current_output->owner_file == file)
+				ret = -EBUSY;
+			mutex_unlock(&current_output->state_lock);
+			if (ret)
+				goto bind_unlock_context;
+		}
+
+		mutex_lock(&output->state_lock);
+		if (!output->owner_file || !output->output_enabled ||
+		    output->session_id != session_id ||
+		    crypto_memneq(token, output->access_token, sizeof(token))) {
+			ret = -EACCES;
+			goto bind_unlock_output;
+		}
+
+		/*
+		 * Publish selection and authorization while the verified session is
+		 * still locked. This is the BIND linearization point: revocation can
+		 * happen wholly before it (and fail) or after it (and invalidate the
+		 * recorded generation), never in between validation and publication.
+		 */
+		old_bound = context->bound_output;
+		context->output_index = output_index;
+		context->bound_output = output;
+		context->bound_session_id = session_id;
+		context->bound_authorization_generation =
+			atomic64_read(&output->authorization_generation);
+		hermes_kms_reset_acquire_history_locked(context);
+		atomic64_inc(&context->binding_generation);
+bind_unlock_output:
+		mutex_unlock(&output->state_lock);
+bind_unlock_context:
+		mutex_unlock(&context->lock);
+		if (ret) {
+			memzero_explicit(token, sizeof(token));
+			return ret;
+		}
+		/* Wake owner/unbound waiters too; they may have no old_bound. */
+		wake_up_interruptible(&current_output->frame_wait);
+		if (old_bound && old_bound != current_output)
+			wake_up_interruptible(&old_bound->frame_wait);
+
+		memset(request, 0, sizeof(*request));
+		request->session_id = session_id;
+		request->operation = operation;
+		request->output_index = output_index;
+		request->result_flags =
+			HERMES_KMS_SESSION_ACCESS_RESULT_BOUND;
+		memzero_explicit(token, sizeof(token));
+		return 0;
+
+	case HERMES_KMS_SESSION_ACCESS_UNBIND:
+		if (request->token[0] || request->token[1] ||
+		    request->session_id || request->output_index)
+			return -EINVAL;
+
+		mutex_lock(&context->lock);
+		current_output = hermes_kms_output_for_context(hdev, context);
+		old_bound = context->bound_output;
+		output_index = context->output_index;
+		context->bound_output = NULL;
+		context->bound_session_id = 0;
+		context->bound_authorization_generation = 0;
+		hermes_kms_reset_acquire_history_locked(context);
+		atomic64_inc(&context->binding_generation);
+		mutex_unlock(&context->lock);
+		/* The owner is authorized without bound_output, but may be waiting. */
+		wake_up_interruptible(&current_output->frame_wait);
+		if (old_bound && old_bound != current_output)
+			wake_up_interruptible(&old_bound->frame_wait);
+
+		memset(request, 0, sizeof(*request));
+		request->operation = operation;
+		request->output_index = output_index;
+		return 0;
+	default:
+		return -EINVAL;
+	}
 }
 
 static int hermes_kms_open(struct drm_device *drm, struct drm_file *file)
@@ -1800,6 +2887,8 @@ static int hermes_kms_open(struct drm_device *drm, struct drm_file *file)
 		return -ENOMEM;
 
 	/* UAPI <= 7 compatibility: an unselected fd controls HERMES-1. */
+	mutex_init(&context->lock);
+	atomic64_set(&context->binding_generation, 1);
 	context->output_index = 0;
 	file->driver_priv = context;
 	return 0;
@@ -1816,6 +2905,7 @@ static void hermes_kms_postclose(struct drm_device *drm, struct drm_file *file)
 
 		mutex_lock(&output->state_lock);
 		if (output->owner_file == file) {
+			output->output_transitioning = true;
 			output->output_enabled = false;
 			hermes_kms_clear_owner_locked(output);
 			output->last_disable_ns = ktime_get_ns();
@@ -1828,8 +2918,13 @@ static void hermes_kms_postclose(struct drm_device *drm, struct drm_file *file)
 		if (!disconnected)
 			continue;
 
-		hermes_kms_track_frame(output, NULL);
+		hermes_kms_track_frame(output, NULL, NULL, false);
+		hermes_kms_track_cursor(output, NULL, false);
+		wake_up_interruptible(&output->frame_wait);
 		hermes_kms_hotplug_event(output);
+		mutex_lock(&output->state_lock);
+		output->output_transitioning = false;
+		mutex_unlock(&output->state_lock);
 		drm_info(drm,
 			 "%s disconnected after owner fd closed\n",
 			 output->output_name);
@@ -1867,7 +2962,161 @@ static const struct drm_ioctl_desc hermes_kms_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(HERMES_KMS_SELECT_OUTPUT,
 			  hermes_kms_ioctl_select_output,
 			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(HERMES_KMS_SESSION_ACCESS,
+			  hermes_kms_ioctl_session_access,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(HERMES_KMS_ACQUIRE_CURSOR,
+			  hermes_kms_ioctl_acquire_cursor,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(HERMES_KMS_WAIT_UPDATE,
+			  hermes_kms_ioctl_wait_update,
+			  DRM_RENDER_ALLOW),
 };
+
+#ifdef CONFIG_COMPAT
+/*
+ * UAPI <= 10 used plain __u64. On i386 that gave these two structures a
+ * different size (and therefore a different ioctl command) from LP64. Keep
+ * accepting already-built 32-bit clients while UAPI 11's __aligned_u64 makes
+ * newly compiled ILP32 and LP64 layouts identical.
+ */
+struct drm_hermes_kms_status_v10_compat {
+	__u64 flags;
+	__u64 frame_sequence;
+	__u64 last_update_ns;
+	__u64 last_enable_ns;
+	__u64 last_disable_ns;
+	__u32 connector_id;
+	__u32 crtc_id;
+	__u32 plane_id;
+	__u32 encoder_id;
+	__u32 requested_width;
+	__u32 requested_height;
+	__u32 requested_refresh_hz;
+	__u32 active_width;
+	__u32 active_height;
+	__u32 active_refresh_hz;
+	__u32 framebuffer_id;
+	__u32 framebuffer_width;
+	__u32 framebuffer_height;
+	__u32 framebuffer_format;
+	__u32 framebuffer_plane_count;
+	__u32 framebuffer_pitch[4];
+	__u32 framebuffer_offset[4];
+	__u64 framebuffer_modifier;
+	__u64 session_id;
+	__s32 owner_pid;
+	__u32 reserved0;
+	__u64 reserved[6];
+} __packed;
+
+struct drm_hermes_kms_acquire_frame_v10_compat {
+	__u64 flags;
+	__u64 sequence;
+	__u64 timestamp_ns;
+	__u64 modifier;
+	__u32 framebuffer_id;
+	__u32 width;
+	__u32 height;
+	__u32 format;
+	__u32 plane_count;
+	__u32 pitch[4];
+	__u32 offset[4];
+	__s32 dma_buf_fd[4];
+	__s32 sync_file_fd;
+	__u32 reserved0;
+	__u32 damage_x1;
+	__u32 damage_y1;
+	__u32 damage_x2;
+	__u32 damage_y2;
+	__u64 reserved[6];
+} __packed;
+
+static_assert(sizeof(struct drm_hermes_kms_status_v10_compat) == 204);
+static_assert(offsetof(struct drm_hermes_kms_status_v10_compat,
+		       framebuffer_modifier) == 132);
+static_assert(sizeof(struct drm_hermes_kms_acquire_frame_v10_compat) == 172);
+static_assert(offsetof(struct drm_hermes_kms_acquire_frame_v10_compat,
+		       reserved) == 124);
+
+#define DRM_IOCTL_HERMES_KMS_GET_STATUS_V10_COMPAT \
+	DRM_IOR(DRM_COMMAND_BASE + DRM_HERMES_KMS_GET_STATUS, \
+		struct drm_hermes_kms_status_v10_compat)
+#define DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME_V10_COMPAT \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_HERMES_KMS_ACQUIRE_FRAME, \
+		 struct drm_hermes_kms_acquire_frame_v10_compat)
+
+static long hermes_kms_compat_get_status(struct file *filp, unsigned long arg)
+{
+	struct drm_hermes_kms_status_v10_compat status32 = { };
+	struct drm_hermes_kms_status status = { };
+	int ret;
+
+	ret = drm_ioctl_kernel(filp, hermes_kms_ioctl_get_status, &status,
+			       DRM_RENDER_ALLOW);
+	if (ret)
+		return ret;
+
+	/* Everything before LP64's old implicit pad has an identical layout. */
+	memcpy(&status32, &status,
+	       offsetof(struct drm_hermes_kms_status, reserved_alignment));
+	status32.framebuffer_modifier = status.framebuffer_modifier;
+	status32.session_id = status.session_id;
+	status32.owner_pid = status.owner_pid;
+	status32.reserved0 = status.reserved0;
+	memcpy(status32.reserved, status.reserved, sizeof(status32.reserved));
+
+	if (copy_to_user(compat_ptr(arg), &status32, sizeof(status32)))
+		return -EFAULT;
+	return 0;
+}
+
+static long hermes_kms_compat_acquire_frame(struct file *filp,
+					    unsigned long arg)
+{
+	struct drm_hermes_kms_acquire_frame_v10_compat frame32;
+	struct drm_hermes_kms_acquire_frame frame = { };
+	unsigned int i;
+	int ret;
+
+	if (copy_from_user(&frame32, compat_ptr(arg), sizeof(frame32)))
+		return -EFAULT;
+
+	frame.flags = frame32.flags;
+	frame.reserved0 = frame32.reserved0;
+	for (i = 0; i < ARRAY_SIZE(frame.reserved); i++)
+		frame.reserved[i] = frame32.reserved[i];
+
+	ret = drm_ioctl_kernel(filp, hermes_kms_ioctl_acquire_frame, &frame,
+			       DRM_RENDER_ALLOW);
+	if (ret)
+		return ret;
+
+	/* Actual fields through damage_x2 precede the divergent trailing pad. */
+	memcpy(&frame32, &frame,
+	       offsetof(struct drm_hermes_kms_acquire_frame_v10_compat,
+			damage_x2) + sizeof(frame32.damage_x2));
+	memset(frame32.reserved, 0, sizeof(frame32.reserved));
+	if (copy_to_user(compat_ptr(arg), &frame32, sizeof(frame32))) {
+		hermes_kms_close_frame_fds(&frame);
+		return -EFAULT;
+	}
+	return 0;
+}
+
+static long hermes_kms_compat_ioctl(struct file *filp, unsigned int cmd,
+				    unsigned long arg)
+{
+	if (cmd == DRM_IOCTL_HERMES_KMS_GET_STATUS_V10_COMPAT)
+		return hermes_kms_compat_get_status(filp, arg);
+	if (cmd == DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME_V10_COMPAT)
+		return hermes_kms_compat_acquire_frame(filp, arg);
+
+	return drm_compat_ioctl(filp, cmd, arg);
+}
+#else
+#define hermes_kms_compat_ioctl NULL
+#endif
 
 static const struct file_operations hermes_kms_fops = {
 	.owner = THIS_MODULE,
@@ -1875,7 +3124,7 @@ static const struct file_operations hermes_kms_fops = {
 	.open = drm_open,
 	.release = drm_release,
 	.unlocked_ioctl = drm_ioctl,
-	.compat_ioctl = drm_compat_ioctl,
+	.compat_ioctl = hermes_kms_compat_ioctl,
 	.poll = drm_poll,
 	.read = drm_read,
 	.llseek = noop_llseek,
@@ -1910,16 +3159,32 @@ static int hermes_kms_stats_show(struct seq_file *m, void *data)
 		seq_printf(m, "requested_mode:        %ux%u@%u\n",
 			   output->requested_width, output->requested_height,
 			   output->requested_refresh_hz);
-		seq_printf(m, "vblank_period_ns:      %lld\n",
-			   ktime_to_ns(output->vblank_period));
+		seq_printf(m, "vblank_period_ns:      %d\n",
+			   READ_ONCE(drm_crtc_vblank_crtc(&output->crtc)->framedur_ns));
 		seq_printf(m, "vblank_count:          %llu\n",
-			   READ_ONCE(output->vblank_count));
+			   (unsigned long long)atomic64_read(
+				   &output->vblank_count));
 		seq_printf(m, "vblank_overrun_count:  %llu\n",
-			   READ_ONCE(output->vblank_overrun_count));
+			   (unsigned long long)atomic64_read(
+				   &output->vblank_overrun_count));
 		seq_printf(m, "frame_sequence:        %llu\n",
-			   output->frame_sequence);
+			   (unsigned long long)atomic64_read(
+				   &output->frame_sequence));
 		seq_printf(m, "frame_update_count:    %llu\n",
 			   output->frame_update_count);
+		seq_printf(m, "cursor_sequence:       %llu\n",
+			   (unsigned long long)atomic64_read(
+				   &output->cursor_sequence));
+		seq_printf(m, "cursor_image_sequence: %llu\n",
+			   output->cursor_image_sequence);
+		seq_printf(m, "cursor_update_count:   %llu\n",
+			   output->cursor_update_count);
+		seq_printf(m, "cursor_acquire_count:  %llu\n",
+			   output->cursor_acquire_count);
+		seq_printf(m, "cursor_wait_count:     %llu\n",
+			   output->cursor_wait_count);
+		seq_printf(m, "cursor_visible:        %d\n",
+			   output->cursor_visible);
 		seq_printf(m, "acquire_count:         %llu\n",
 			   output->acquire_count);
 		seq_printf(m, "acquire_no_frame:      %llu\n",
@@ -1991,17 +3256,39 @@ static int hermes_kms_dumb_create(struct drm_file *file,
 				  struct drm_mode_create_dumb *args)
 {
 	struct drm_gem_shmem_object *shmem;
+	u64 line_bits;
+	u64 pitch;
+	u64 padded_height;
 	u64 padded_size;
 	int ret;
 
-	ret = drm_mode_size_dumb(drm, args, HERMES_KMS_PITCH_ALIGN, 0);
-	if (ret)
-		return ret;
+	if (args->flags || !args->width || !args->height || !args->bpp)
+		return -EINVAL;
+	if (check_mul_overflow((u64)args->width, (u64)args->bpp,
+			       &line_bits))
+		return -EOVERFLOW;
+	pitch = DIV_ROUND_UP_ULL(line_bits, 8);
+	if (check_add_overflow(pitch, (u64)HERMES_KMS_PITCH_ALIGN - 1,
+			       &pitch))
+		return -EOVERFLOW;
+	pitch = round_down(pitch, (u64)HERMES_KMS_PITCH_ALIGN);
+	if (!pitch || pitch > U32_MAX)
+		return -E2BIG;
+	args->pitch = pitch;
 
-	padded_size = (u64)args->pitch *
-		      ALIGN(args->height, HERMES_KMS_IMPORT_HEIGHT_ALIGN);
-	if (padded_size > args->size)
-		args->size = ALIGN(padded_size, PAGE_SIZE);
+	padded_height = ALIGN((u64)args->height,
+			      HERMES_KMS_IMPORT_HEIGHT_ALIGN);
+	if (check_mul_overflow((u64)args->pitch, padded_height,
+			       &padded_size))
+		return -EOVERFLOW;
+	/* size is output-only: never let an untrusted input value choose allocation. */
+	if (check_add_overflow(padded_size, (u64)PAGE_SIZE - 1,
+			       &padded_size))
+		return -EOVERFLOW;
+	args->size = round_down(padded_size, (u64)PAGE_SIZE);
+	/* drm_gem_shmem_create() takes size_t, while the dumb UAPI uses u64. */
+	if (args->size > SIZE_MAX)
+		return -E2BIG;
 
 	shmem = drm_gem_shmem_create(drm, args->size);
 	if (IS_ERR(shmem))
@@ -2015,7 +3302,7 @@ static int hermes_kms_dumb_create(struct drm_file *file,
 static const struct drm_driver hermes_kms_driver = {
 	/*
 	 * DRIVER_RENDER exposes a render node (/dev/dri/renderD*). The frame
-	 * consumer (Hermes/Apollo) opens that node to call ACQUIRE_FRAME and
+	 * capture consumer opens that node to call ACQUIRE_FRAME and
 	 * friends, all of which are DRM_RENDER_ALLOW. A render node never holds
 	 * DRM master, so the compositor (KWin/GNOME) can own the primary node
 	 * (card*) and drive the modeset without an EBUSY conflict. This mirrors
@@ -2023,7 +3310,7 @@ static const struct drm_driver hermes_kms_driver = {
 	 * pulls frames through a side channel.
 	 */
 	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC |
-			   DRIVER_RENDER,
+				   DRIVER_RENDER,
 	.name = HERMES_KMS_DRIVER_NAME,
 	.desc = HERMES_KMS_DRIVER_DESC,
 	.major = HERMES_KMS_DRIVER_MAJOR,
@@ -2154,8 +3441,15 @@ static int hermes_kms_modeset_init(struct hermes_kms_device *hdev)
 	if (ret)
 		return ret;
 
-	drm->mode_config.min_width = HERMES_KMS_MIN_WIDTH;
-	drm->mode_config.min_height = HERMES_KMS_MIN_HEIGHT;
+	/*
+	 * These are framebuffer limits, not display-mode limits.  Keep them low
+	 * enough for cursor buffers; the connector and SET_OUTPUT paths enforce
+	 * HERMES_KMS_MIN_WIDTH/HEIGHT for actual modes.
+	 * Setting these to the minimum mode size makes the DRM core reject cursor
+	 * ADDFB2 requests before fb_create is reached.
+	 */
+	drm->mode_config.min_width = HERMES_KMS_MIN_FRAMEBUFFER_WIDTH;
+	drm->mode_config.min_height = HERMES_KMS_MIN_FRAMEBUFFER_HEIGHT;
 	drm->mode_config.max_width = HERMES_KMS_MAX_WIDTH;
 	drm->mode_config.max_height = HERMES_KMS_MAX_HEIGHT;
 	drm->mode_config.preferred_depth = 24;
@@ -2276,8 +3570,14 @@ static int hermes_kms_probe(struct platform_device *pdev)
 		mutex_init(&output->state_lock);
 		mutex_init(&output->export_lock);
 		init_waitqueue_head(&output->frame_wait);
-		hrtimer_setup(&output->vblank_timer, hermes_kms_vblank_timer,
-			      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+		atomic64_set(&output->authorization_generation, 1);
+		atomic64_set(&output->frame_sequence, 0);
+		atomic64_set(&output->cursor_sequence, 0);
+		atomic64_set(&output->vblank_count, 0);
+		atomic64_set(&output->vblank_overrun_count, 0);
+		ratelimit_state_init(&output->output_change_ratelimit,
+				     HERMES_KMS_OUTPUT_CHANGE_INTERVAL,
+				     HERMES_KMS_OUTPUT_CHANGE_BURST);
 		output->next_session_id = 1;
 		hermes_kms_init_output_state(drm, output);
 	}
@@ -2357,8 +3657,9 @@ static void hermes_kms_remove(struct platform_device *pdev)
 		}
 		hermes_kms_clear_owner_locked(output);
 		mutex_unlock(&output->state_lock);
-		hermes_kms_track_frame(output, NULL);
-		hrtimer_cancel(&output->vblank_timer);
+		hermes_kms_track_frame(output, NULL, NULL, false);
+		hermes_kms_track_cursor(output, NULL, false);
+		wake_up_interruptible(&output->frame_wait);
 	}
 
 	drm_dev_unregister(&hdev->drm);
@@ -2367,19 +3668,26 @@ static void hermes_kms_remove(struct platform_device *pdev)
 	for (i = 0; i < hdev->output_count; i++) {
 		struct hermes_kms_output *output = &hdev->outputs[i];
 		struct drm_framebuffer *fb;
+		struct drm_framebuffer *cursor_fb;
 
 		mutex_lock(&output->state_lock);
 		fb = output->framebuffer;
+		cursor_fb = output->cursor_framebuffer;
 		output->framebuffer = NULL;
+		output->cursor_framebuffer = NULL;
 		hermes_kms_clear_frame_locked(output);
+		hermes_kms_clear_cursor_metadata_locked(output);
 		mutex_unlock(&output->state_lock);
 
 		mutex_lock(&output->export_lock);
-		hermes_kms_drop_export_cache_locked(output);
+		hermes_kms_drop_export_cache_locked(&output->frame_export_cache);
+		hermes_kms_drop_export_cache_locked(&output->cursor_export_cache);
 		mutex_unlock(&output->export_lock);
 
 		if (fb)
 			drm_framebuffer_put(fb);
+		if (cursor_fb)
+			drm_framebuffer_put(cursor_fb);
 	}
 
 	device_remove_file(&pdev->dev, &dev_attr_hermes_kms_session_index);

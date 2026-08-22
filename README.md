@@ -29,12 +29,16 @@ The compositor owns the card and the capture consumer only reads frames:
 
 1. The driver exposes a **render node** (`DRIVER_RENDER`). Without it, compositors
    skip the GPU and never enumerate the virtual connector.
-2. The compositor (KWin/GNOME) takes DRM master on the primary node, enables
-   the `HERMES-1` connector, and scans out the desktop into its framebuffer.
-3. Hermes opens the **render node** (never the primary node, which would steal
-   DRM master and EBUSY-block the compositor) and pulls the current scanout as
-   DMA-BUFs via `ACQUIRE_FRAME` — all Hermes ioctls are `DRM_RENDER_ALLOW`.
-4. A real GPU imports those DMA-BUFs and encodes them. The frame never leaves
+2. A userspace owner opens the **render node** (never the primary node, which
+   would steal DRM master and EBUSY-block the compositor), claims an output,
+   and obtains an opaque session capability.
+3. The compositor (KWin/GNOME) takes DRM master on the primary node, enables
+   the now-connected `HERMES-1` output, and scans out the desktop into its
+   framebuffer.
+4. The owner hands the capability to a capture fd over an application-defined
+   trusted channel. The bound fd pulls the current scanout as DMA-BUFs via
+   `ACQUIRE_FRAME`; the kernel never checks an application or process name.
+5. A real GPU imports those DMA-BUFs and encodes them. The frame never leaves
    the GPU.
 
 Measured capture cost on KWin at 720p: ~8 us/frame (`ACQUIRE_FRAME`) versus
@@ -43,24 +47,50 @@ Measured capture cost on KWin at 720p: ~8 us/frame (`ACQUIRE_FRAME`) versus
 ## Using it in other projects
 
 The driver is not Hermes-specific. "Hermes" here is the reference consumer, not
-a requirement: there is no per-process gating, no exported Hermes-only symbol,
-and the capture path is a plain DRM ioctl UAPI over the render node. Any
+a requirement: there is no hard-coded process gating, no exported Hermes-only
+symbol, and the capture path is a plain DRM ioctl UAPI over the render node. Any
 userspace consumer — another streaming host such as Apollo/Sunshine, a recorder,
 or your own tool — can use it by talking the same UAPI, with no fork required:
 
-1. Open the render node and probe with `GET_VERSION` / `GET_CAPS`.
-2. For UAPI v8 multi-output use, bind that fd with `SELECT_OUTPUT`; use one fd
-   per simultaneous virtual display. Unselected/legacy fds use the first output.
+1. Open a candidate render node and identify it with the DRM core
+   `DRM_IOCTL_VERSION` ioctl (or libdrm's `drmGetVersion()`); require the exact
+   driver name `hermes-kms` before issuing any Hermes-KMS private ioctl. Private
+   DRM command numbers are driver-local and are not safe device probes. Then use
+   `GET_VERSION` / `GET_CAPS`. The current interface is UAPI v11; require
+   `HERMES_KMS_CAP_SESSION_TOKEN` before using the protected capture path.
+2. For UAPI v8 multi-output discovery/control, select an available output on
+   the prospective owner fd with `SELECT_OUTPUT`; use one owner fd per
+   simultaneous virtual display. An unselected fd is scoped to the first
+   output, but still needs UAPI v11 authorization for protected operations.
 3. For UAPI v9 independent sessions, discover every Hermes DRM card through
    `GET_IDENTITY.device_index/device_count` and give each compositor a
    different primary node. Each card is a separate DRM-master domain.
    With UAPI v10, prefer cards whose identity role is `SESSION`; their
    `session_index` maps directly to the packaged `hermes-kms-N` seat and
-   broker. The `HOST` card remains available to the normal desktop.
-4. Optionally `SET_OUTPUT` to request a specific mode (this does not take DRM
-   master, so the compositor keeps it).
-5. Run the `WAIT_FRAME` → `ACQUIRE_FRAME` loop and import the returned DMA-BUF
-   into your encoder.
+   broker. Session-role primary nodes are root-only and are opened through
+   that broker; the `HOST` card remains available to the normal desktop.
+4. On an owner fd, call `SET_OUTPUT` to claim and configure an available output
+   (this does not take DRM master, so the compositor keeps it), then use
+   `SESSION_ACCESS(GET_TOKEN)` to retrieve its opaque token and session ID.
+5. Transfer the token through a trusted channel defined by your project. On
+   each separate capture fd, call `SESSION_ACCESS(BIND)` with the output index,
+   token and session ID. `BIND` selects the active output and authorizes the fd
+   atomically; do not call `SELECT_OUTPUT` first on that capture fd.
+6. A primary-frame-only consumer runs `WAIT_FRAME` → `ACQUIRE_FRAME` and
+   imports the returned DMA-BUF into its encoder.
+7. A consumer that needs the hardware cursor requires
+   `HERMES_KMS_CAP_CURSOR_CAPTURE`, waits on both streams with `WAIT_UPDATE`,
+   acquires the current primary frame and cursor with `ACQUIRE_FRAME` and
+   `ACQUIRE_CURSOR`, waits on their sync_file fds, and composites the cursor.
+   `GET_STATUS` and `GET_METRICS` use the same binding.
+8. Disable the output or close its owner fd to revoke the capability and end
+   the session.
+
+The capability is deliberately generic: the driver neither knows nor accepts
+an executable name, Steam application ID, UID, TGID, or Hermes-specific
+credential. This also lets a broker hand capture access to a sandboxed worker
+without baking that broker's policy into the kernel ABI. Treat the 128-bit
+token as a secret and do not put it in logs or command lines.
 
 [tools/hermes-kmsctl](tools/hermes-kmsctl) and
 [tools/hermes-kms-import-check](tools/hermes-kms-import-check) are small,
@@ -76,15 +106,18 @@ What is currently validated: VAAPI with `XRGB8888`, linear. NVENC/AMF and
 NV12/P010/HDR are not validated yet — see the [Roadmap](#roadmap). Forks and
 contributions extending those paths are welcome under the project's license.
 
-The project is GPL-2.0 licensed, so forks are free and must stay open under the
-same terms — see [License](#license).
+The kernel module is GPL-2.0, while the installed UAPI has the Linux syscall-note
+exception and the optional userspace session helper is MIT-licensed. This keeps
+an independently developed consumer separate from the Hermes application; see
+[License](#license).
 
 ## Features
 
 - out-of-tree kernel module: `hermes_kms.ko`;
 - explicit CRTC/encoder/plane modeset with a software vblank timer, so the
   compositor composes the virtual output at its full refresh (60/120/144 Hz);
-- cursor plane so the compositor offloads pointer motion;
+- cursor plane so the compositor offloads pointer motion, plus a separately
+  sequenced cursor-capture stream for consumers that composite it themselves;
 - damage tracking (`FB_DAMAGE_CLIPS`) forwarded to the capture consumer via
   `ACQUIRE_FRAME`;
 - render node for masterless, zero-copy frame consumption;
@@ -108,19 +141,31 @@ same terms — see [License](#license).
   while keeping the framebuffer pitch independently aligned for DMA-BUF;
 - DMA-BUF export of the tracked scanout framebuffer, cached per buffer object;
 - real `dma_resv` write fence exported as a sync_file;
-- Hermes/apps UAPI through DRM ioctls; frame/metric tracking;
+- UAPI v11 generic, opaque session-capability handoff between an output owner
+  and one or more capture fds, with no application/process-name coupling;
+- fixed-layout DRM ioctls for frame acquisition, damage, synchronization and
+  metrics, including vblank and late-vblank counters;
 - debugfs telemetry at `/sys/kernel/debug/dri/<n>/hermes_kms_stats`;
 - debug/control tool: `tools/hermes-kmsctl/hermes-kmsctl`;
 - 640x480 through 3840x2160 mode range, 1920x1080 preferred.
 
 ## Build
 
-Install matching kernel headers first.
+Install matching kernel headers first. The default target builds only the
+kernel module and therefore does not require the optional diagnostic-tool
+libraries:
 
 On CachyOS/Arch-like systems:
 
 ```bash
 make
+```
+
+To build the module and every diagnostic userspace tool, install the libdrm,
+VAAPI, GBM, EGL and OpenGL development packages, then run:
+
+```bash
+make full
 ```
 
 Clean:
@@ -176,10 +221,14 @@ Boot will refuse to load it. Either enroll your own MOK and pass it to the build
 
 ```bash
 podman build \
-  --build-arg MODULE_SIGN_KEY=/path/to/MOK.priv \
-  --build-arg MODULE_SIGN_CERT=/path/to/MOK.der \
+  --no-cache \
+  --secret id=module_sign_key,src=/path/to/MOK.priv \
+  --secret id=module_sign_cert,src=/path/to/MOK.der \
   -t localhost/bazzite-hermes:latest -f packaging/bazzite/Containerfile .
 ```
+
+Both secrets are required together. They are mounted only in the discarded
+build stage and are never copied into the build context or final image.
 
 …or turn Secure Boot off in firmware. There is no way around that pair.
 
@@ -205,7 +254,7 @@ compositor-driven (real streaming) and isolated `modetest` (driver validation).
 Inspect the driver with the control tool while it is loaded:
 
 ```bash
-sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=1 outputs=2
+sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0 outputs=2
 sleep 1
 tools/hermes-kmsctl/hermes-kmsctl version
 tools/hermes-kmsctl/hermes-kmsctl outputs
@@ -213,17 +262,38 @@ tools/hermes-kmsctl/hermes-kmsctl identity
 tools/hermes-kmsctl/hermes-kmsctl --output 2 identity
 tools/hermes-kmsctl/hermes-kmsctl caps
 tools/hermes-kmsctl/hermes-kmsctl status
-tools/hermes-kmsctl/hermes-kmsctl metrics
-tools/hermes-kmsctl/hermes-kmsctl wait 0 1000
 tools/hermes-kmsctl/hermes-kmsctl --verbose status
-tools/hermes-kmsctl/hermes-kmsctl hold 1920x1080@60
-tools/hermes-kmsctl/hermes-kmsctl --output 2 hold 1280x720@60
 ls -l /dev/dri/
 modetest -c
 drm_info
 journalctl -k -g hermes-kms
 sudo rmmod hermes_kms
 ```
+
+Active output state and capture are capability-protected. For command-line
+diagnostics, keep an owner running in one terminal and publish its credential
+to a same-UID, mode-0600 file under the user's runtime directory:
+
+```bash
+session_file="${XDG_RUNTIME_DIR:?}/hermes-kms-session"
+tools/hermes-kmsctl/hermes-kmsctl --output 1 \
+  --session-file "$session_file" hold 1920x1080@60
+```
+
+While that command holds the owner fd open, use the file from another terminal:
+
+```bash
+session_file="${XDG_RUNTIME_DIR:?}/hermes-kms-session"
+tools/hermes-kmsctl/hermes-kmsctl --session-file "$session_file" status
+tools/hermes-kmsctl/hermes-kmsctl --session-file "$session_file" metrics
+tools/hermes-kmsctl/hermes-kmsctl --session-file "$session_file" wait 0 1000
+tools/hermes-kmsctl/hermes-kmsctl --session-file "$session_file" \
+  frame --require-dmabuf --sync-file
+```
+
+`hermes-kmsctl` removes its diagnostic credential file when the owner exits.
+Production consumers should normally transfer the token in memory over their
+own trusted IPC rather than writing it to disk.
 
 Optional initial mode/state parameters:
 
@@ -318,7 +388,15 @@ Other validation scripts (run as root, in the virtme-ng VM or on the host):
   while the scanout buffer churns, to catch dma-buf/fence lifetime bugs (run
   under `slub_debug=FZPU`);
 - `scripts/host-vblank-isolated.sh` — isolated vblank-rate check on real
-  hardware; `scripts/host-restore-display.sh` re-enables the physical monitor.
+	  hardware; `scripts/host-restore-display.sh` re-enables a caller-selected
+	  physical monitor and can stop caller-selected streaming processes gracefully.
+
+For example, from SSH or a TTY:
+
+```bash
+scripts/host-restore-display.sh --physical HDMI-A-1 --virtual Virtual-1 \
+  --stop my-stream-server
+```
 
 Remove the rule to return to the compositor-driven path:
 
@@ -329,13 +407,41 @@ sudo make uninstall-dev-udev
 The seat exclusion cannot live inside the kernel driver: `seat`,
 `master-of-seat`, `ID_SEAT`, and `ID_AUTOSEAT` are udev/logind userspace
 policy. The dev udev rule also sets `GROUP="video"`, `MODE="0660"`, and
-`TAG+="uaccess"` so Hermes control ioctls can run without root.
+`TAG+="uaccess"` so a local test controller can run without root.
 
 ## Userspace communication
 
-Hermes-KMS exposes a small DRM ioctl UAPI in [include/uapi/drm/hermes_kms_drm.h](include/uapi/drm/hermes_kms_drm.h).
+Hermes-KMS exposes a small DRM ioctl UAPI in
+[include/uapi/drm/hermes_kms_drm.h](include/uapi/drm/hermes_kms_drm.h).
+External projects can install the public UAPI and the application-neutral MIT
+session helper without installing any Hermes application code:
 
-Initial ioctls:
+```bash
+sudo make install-uapi
+```
+
+```c
+#include <drm/hermes_kms_drm.h>
+#include <hermes-kms/hermes_session.h>  /* optional header-only helper */
+```
+
+Both paths honor `DESTDIR`, `PREFIX`, `UAPI_INCLUDE_DIR`, and
+`HERMES_INCLUDE_DIR`; `sudo make uninstall-uapi` removes only those two managed
+headers. Consumers using the helper also need the normal libdrm and Linux UAPI
+headers available at compile time.
+
+The kernel/module sources remain GPL-2.0, and the public UAPI carries the Linux
+syscall-note exception. The standalone session helper and its userspace-only
+tests are MIT-licensed under [LICENSES/MIT.txt](LICENSES/MIT.txt), so another
+project can reuse that helper without inheriting application-specific code.
+
+Before calling any ioctl listed below, identify the fd with the DRM core
+`DRM_IOCTL_VERSION` ioctl (or `drmGetVersion()`) and require the exact driver
+name `hermes-kms`. Do not use a private ioctl as the initial probe: private DRM
+command numbers have meaning only after the core driver identity is known and
+can overlap with another driver's commands.
+
+The current interface is UAPI v11. Its ioctls are:
 
 - `DRM_IOCTL_HERMES_KMS_GET_VERSION`
 - `DRM_IOCTL_HERMES_KMS_GET_IDENTITY`
@@ -346,19 +452,49 @@ Initial ioctls:
 - `DRM_IOCTL_HERMES_KMS_WAIT_FRAME`
 - `DRM_IOCTL_HERMES_KMS_GET_METRICS`
 - `DRM_IOCTL_HERMES_KMS_SELECT_OUTPUT` (UAPI v8)
+- `DRM_IOCTL_HERMES_KMS_SESSION_ACCESS` (UAPI v11)
+- `DRM_IOCTL_HERMES_KMS_ACQUIRE_CURSOR` (UAPI v11)
+- `DRM_IOCTL_HERMES_KMS_WAIT_UPDATE` (UAPI v11)
 
 `GET_CAPS.output_count` reports the number of independent outputs.
 `SELECT_OUTPUT` binds all output-scoped ioctls on that fd to a 0-based output;
 new fds default to output 0 for compatibility. `GET_IDENTITY` then exposes the
-selected stable Hermes-facing name (`HERMES-1`, `HERMES-2`, ...) while the DRM
+selected stable driver-facing name (`HERMES-1`, `HERMES-2`, ...) while the DRM
 core may still expose connector objects as `Virtual-*`.
 UAPI v9 also exposes `GET_IDENTITY.device_index` and `device_count`. UAPI v10
 adds `device_role`, `session_index`, and `session_device_count` in words that
 were previously reserved. Consumers must check
 `HERMES_KMS_CAP_SESSION_DEVICE_POOL` before interpreting them.
+`GET_IDENTITY.cursor_plane_id` identifies the cursor plane when
+`HERMES_KMS_CAP_CURSOR_CAPTURE` is advertised.
 `HERMES_KMS_CAP_MULTI_DEVICE` means the module can create multiple independent
 DRM devices with `devices=N`; every device has its own DRM-master ownership
 domain and contains `output_count` selectable outputs.
+
+UAPI v11 advertises `HERMES_KMS_CAP_SESSION_TOKEN` and protects active output
+state, frame capture, waits and metrics with a generic session capability.
+`GET_STATUS` remains public while an output is completely idle so a controller
+can discover and claim it. The fd that successfully calls `SET_OUTPUT` is the
+owner and can call
+`SESSION_ACCESS(GET_TOKEN)` with only the operation field set and every other
+request field zero; the response returns its output index, 128-bit token,
+session ID and `RESULT_TOKEN_VALID`. A second fd calls
+`SESSION_ACCESS(BIND)` with those three values. `BIND` selects the active output
+and authorizes the fd in one operation, returning `RESULT_BOUND` with the token
+fields cleared; a preceding `SELECT_OUTPUT` is neither needed nor valid for
+another session's active output. `UNBIND` removes access from that fd. Disabling
+the output or closing the owner fd invalidates every binding for the old
+session.
+
+Token transport and policy belong to userspace. The kernel does not key access
+to Hermes, Steam, an executable name, UID or process relationship; any project
+can pass the opaque token through its own trusted IPC channel. Tokens are
+credentials: keep them out of logs, arguments and world-readable files.
+
+For short-lived migration of old diagnostic clients, root can load the module
+with `insecure_legacy_unbound_access=1`. This restores unbound pre-v11 access
+and therefore permits any process that can open the node to inspect/capture an
+active session; it is intentionally off by default and is unsafe for normal use.
 
 `GET_STATUS` now reports scanout/frame metadata:
 
@@ -372,11 +508,17 @@ domain and contains `output_count` selectable outputs.
 - per-plane pitch/offset.
 
 `SET_OUTPUT` is an `IOWR` ioctl. On enable or disable it returns the applied
-mode, result flags, and the session ID owned by that fd. Hermes should keep the
-same fd open for the whole stream; if that fd closes, the driver disconnects the
-output, clears the tracked frame, and emits hotplug.
+mode, result flags, and the session ID owned by that fd. The controller should
+keep the same fd open for the whole stream; if it closes, the driver revokes the
+token, disconnects the output, clears the tracked frame, and emits hotplug.
+Real state changes are rate-limited to a burst of ten per output per second;
+`EAGAIN` means no mutation occurred and may be retried with bounded backoff.
+Exact repeats and an already-idle disable are not charged.
 
-`ACQUIRE_FRAME` supports metadata-only acquisition by default. If userspace sets `HERMES_KMS_FRAME_REQUEST_DMABUF`, the driver exports DMA-BUF fds for the currently tracked scanout framebuffer and sets `HERMES_KMS_FRAME_DMABUF_VALID` on success.
+`ACQUIRE_FRAME` supports metadata-only acquisition by default. If userspace sets
+`HERMES_KMS_FRAME_REQUEST_DMABUF`, the driver exports DMA-BUF fds for the
+currently tracked scanout framebuffer and sets
+`HERMES_KMS_FRAME_DMABUF_VALID` on success.
 
 If userspace sets `HERMES_KMS_FRAME_REQUEST_SYNC_FILE`, `ACQUIRE_FRAME`
 returns a sync_file fd carrying the framebuffer's implicit write fence (from the
@@ -384,14 +526,19 @@ buffer's `dma_resv`), or an already-signalled fence when the buffer is idle. The
 consumer waits on it before sampling, so a frame the compositor flipped while its
 GPU was still rendering is read only after that render completes.
 
-When the compositor supplies damage (`FB_DAMAGE_CLIPS`), `ACQUIRE_FRAME` also
-returns the merged dirty rectangle (`damage_x1..y2`, flagged by
-`HERMES_KMS_FRAME_DAMAGE_VALID`) so the consumer can encode only the changed
-region. With no damage the whole frame is treated as dirty.
+When the compositor supplies damage (`FB_DAMAGE_CLIPS`), `ACQUIRE_FRAME` can
+return the merged half-open dirty rectangle (`damage_x1..y2`, flagged by
+`HERMES_KMS_FRAME_DAMAGE_VALID`). A consecutive new sequence can use that
+rectangle; acquiring the same sequence again returns a valid empty rectangle,
+meaning no additional primary-plane change. On the fd's first acquire, after a
+skipped sequence, or when the compositor supplies no damage, the flag is clear
+and the consumer must treat the whole frame as dirty. A cursor-only commit does
+not advance the primary-frame sequence.
 
-`WAIT_FRAME` lets Hermes block until `frame_sequence` advances past a known
-sequence, with a caller-provided timeout. This is the intended low-latency
-capture loop:
+`WAIT_FRAME` lets a capture consumer block until `frame_sequence` advances past
+a known sequence, with a caller-provided timeout. This is the intended
+low-latency primary-only capture loop; cursor-only commits deliberately do not
+wake it:
 
 ```text
 WAIT_FRAME(after_sequence, timeout_ms)
@@ -400,14 +547,76 @@ import DMA-BUF into encoder
 after_sequence = returned sequence
 ```
 
-This hands userspace a shared buffer with no driver-side CPU readback. Hermes
-validates end-to-end zero-copy on VAAPI today (XRGB8888, linear): the captured
+### Separate cursor capture
+
+When `HERMES_KMS_CAP_CURSOR_CAPTURE` is present, the hardware cursor is exposed
+as a latest-state stream separate from the primary framebuffer. This matters
+because a compositor can move its cursor plane without redrawing the primary
+plane; such pixels are not present in the DMA-BUF returned by `ACQUIRE_FRAME`.
+`WAIT_UPDATE` accepts the last consumed primary `frame_sequence` and cursor
+`cursor_sequence`, then wakes when either advances. Its response sets
+`HERMES_KMS_WAIT_UPDATE_FRAME_READY`,
+`HERMES_KMS_WAIT_UPDATE_CURSOR_READY`, or both and samples the current
+sequences, timestamps, and output status coherently under the same state lock.
+With no pending update, a zero timeout returns `EAGAIN` and a nonzero timeout
+expires with `ETIMEDOUT`; session revocation takes precedence as `EACCES`.
+
+The two sequence spaces are independent. Coherent values in one `WAIT_UPDATE`
+response do not mean that its frame and cursor sequence numbers identify one
+atomic compositor transaction, and an acquire made afterward can observe an
+even newer latest state. Consumers should treat each READY bit relative to the
+corresponding sequence they supplied, retain the latest complete state of each
+stream, and tolerate skipped values rather than treating the two counters as a
+paired frame ID.
+
+`ACQUIRE_CURSOR` returns cursor metadata by default and can export its DMA-BUF
+and write-fence sync_file when the corresponding request flags are set. The
+cursor plane uses `DRM_FORMAT_ARGB8888`; its RGB components follow the standard
+DRM premultiplied-alpha convention and the plane opacity is full, so a software
+consumer must not interpret the pixels as straight alpha or multiply RGB by
+alpha a second time. Wait for the returned sync_file before reading or importing
+the buffer.
+
+`position_x/y` is the nominal, unclipped top-left of the full cursor image in
+CRTC coordinates. When `HOTSPOT_VALID` is set, `hotspot_x/y` is relative to
+that full image, so the logical pointer hotspot is
+`(position_x + hotspot_x, position_y + hotspot_y)`. Hermes exposes a universal
+cursor plane rather than requiring the para-virtualized DRM hotspot extension;
+ordinary compositors therefore pre-adjust the plane position and the hotspot
+validity bit remains clear.
+`crtc_x/y/w/h` is the clipped integer destination rectangle, while
+`src_x/y/w/h` is the matching clipped source rectangle in DRM 16.16 fixed-point
+pixels. Use those clipped rectangles when the cursor crosses an output edge;
+do not crop by changing the meaning of the hotspot. The validity flags say
+which metadata groups may be consumed. `VISIBLE` is intentionally independent
+of `BUFFER_VALID`, allowing an off-screen or hidden cursor to retain a reusable
+image.
+
+`cursor_sequence` advances for position, visibility, or image-state updates.
+`image_sequence` advances conservatively whenever a committed cursor buffer may
+need to be sampled again, including in-place pixel updates. Refresh cached pixels
+when it changes. If a primary or cursor buffer is replaced while an fd export is
+being prepared, `ACQUIRE_FRAME` or `ACQUIRE_CURSOR` can return `ESTALE`; discard
+that attempt and retry the latest-state acquire with a small bounded loop. This
+prevents a consumer from receiving an fd paired with stale metadata.
+
+A combined loop therefore uses `WAIT_UPDATE`, refreshes whichever primary or
+cursor state advanced, waits for requested fences, and composites the clipped
+premultiplied cursor over the primary image. If the compositor uses a software
+cursor instead of the KMS cursor plane, no separate visible cursor buffer is
+reported because those pixels are already part of the primary framebuffer.
+
+This hands userspace a shared buffer with no driver-side CPU readback. The
+reference consumer validates end-to-end zero-copy on VAAPI today (XRGB8888, linear): the captured
 DMA-BUF is imported by a real GPU and encoded directly. NVENC/AMF still need
 their own format/modifier/import validation.
 
 `GET_METRICS` reports counters and timestamps for frame updates, frame waits,
 acquires, DMA-BUF exports, sync_file exports, hotplug events, output lifecycle,
-and owner-fd cleanup.
+and owner-fd cleanup. UAPI v11 also names the previously reserved
+`vblank_count` and `vblank_overrun_count` words without changing the struct's
+size. The overrun counter measures timer intervals missed when a vblank
+callback runs late; it is not a count of rejected frame acquires.
 
 The driver deliberately does not advertise `writeback_connector` yet. That
 needs real DRM writeback connector plumbing, not placeholder flags.
@@ -415,17 +624,19 @@ needs real DRM writeback connector plumbing, not placeholder flags.
 Diagnostic command:
 
 ```bash
-tools/hermes-kmsctl/hermes-kmsctl frame
-tools/hermes-kmsctl/hermes-kmsctl frame --require-dmabuf --sync-file
-tools/hermes-kmsctl/hermes-kmsctl wait 0 1000
-tools/hermes-kmsctl/hermes-kmsctl metrics
-tools/hermes-kms-import-check/hermes-kms-import-check --wait-ms 1000
+tools/hermes-kmsctl/hermes-kmsctl --session-file "$session_file" frame
+tools/hermes-kmsctl/hermes-kmsctl --session-file "$session_file" \
+  frame --require-dmabuf --sync-file
+tools/hermes-kmsctl/hermes-kmsctl --session-file "$session_file" wait 0 1000
+tools/hermes-kmsctl/hermes-kmsctl --session-file "$session_file" metrics
+tools/hermes-kms-import-check/hermes-kms-import-check \
+  --session-file "$session_file" --wait-ms 1000
 ```
 
 `hermes-kms-import-check` acquires the latest Hermes-KMS DMA-BUF frame and tries
 to import it into VAAPI through `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`. This
 is an encoder-path preflight: success means the VA driver accepted the exported
-buffer as a `VASurface`; failure means Hermes will need a different scanout
+buffer as a `VASurface`; failure means a consumer may need a different scanout
 format, modifier, GPU placement, or a conversion path before true encoder
 zero-copy is possible.
 
@@ -443,13 +654,17 @@ See [docs/roadmap.md](docs/roadmap.md) and [docs/driver-design.md](docs/driver-d
 
 ## License
 
-Hermes-KMS is licensed under the **GNU General Public License, version 2**
-(GPL-2.0) — the same license as the Linux kernel, which an out-of-tree DRM/KMS
-module must use. See [LICENSE](LICENSE) for the full text; sources carry
-`SPDX-License-Identifier: GPL-2.0`.
+The kernel module and kernel-side sources are licensed under the **GNU General
+Public License, version 2** (GPL-2.0), the license required for this out-of-tree
+DRM/KMS module. See [LICENSE](LICENSE); those sources carry
+`SPDX-License-Identifier: GPL-2.0`. GPL-2.0 terms apply when distributing a fork
+or derivative of that kernel/module code, including the corresponding-source
+obligations.
 
-In short: you can use, modify, and redistribute it freely, and you can fork it.
-Any distributed fork or derivative must remain under GPL-2.0 and ship its source
-— it cannot be made proprietary. (Note that, like all GPL software, the license
-governs the freedoms above; it does not by itself forbid charging for copies, but
-recipients always keep the right to the source and to redistribute.)
+The installed public UAPI header instead carries
+`GPL-2.0 WITH Linux-syscall-note`, matching the normal Linux userspace boundary.
+The optional header-only session helper and its userspace-only tests carry the
+MIT license in [LICENSES/MIT.txt](LICENSES/MIT.txt). An independently developed
+userspace project therefore does not have to become the Hermes application or
+adopt its application license merely because it issues the documented ioctls,
+includes the syscall-note UAPI, or reuses the MIT helper.
