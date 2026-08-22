@@ -22,6 +22,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/sync_file.h>
+#include <linux/version.h>
 #include <linux/wait.h>
 
 #include <drm/hermes_kms_drm.h>
@@ -54,6 +55,32 @@
 #include <drm/drm_print.h>
 #include <drm/drm_prime.h>
 #include <drm/drm_vblank.h>
+
+/*
+ * Linux 7.2 renamed struct drm_atomic_state to struct drm_atomic_commit -- the
+ * object was always one commit's worth of state, never the device's entire
+ * state -- and retyped every atomic helper callback with it. Nothing else about
+ * those callbacks changed, so the source stays on the current upstream name and
+ * maps it back on older kernels.
+ *
+ * kbuild probes the target kernel's own drm_atomic.h and defines
+ * HERMES_KMS_HAVE_DRM_ATOMIC_COMMIT, so a tree that backported the rename is
+ * detected as well; LINUX_VERSION_CODE is the fallback for when that header
+ * could not be read. Drop this block once 7.2 is the oldest kernel we build
+ * against.
+ *
+ * Before 7.2 this also shadows the blocking commit function of the same name,
+ * drm_atomic_commit(). The driver never calls it, and a call added later would
+ * fail to build rather than do something else.
+ */
+#ifndef HERMES_KMS_HAVE_DRM_ATOMIC_COMMIT
+#define HERMES_KMS_HAVE_DRM_ATOMIC_COMMIT \
+	(LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0))
+#endif
+
+#if !HERMES_KMS_HAVE_DRM_ATOMIC_COMMIT
+#define drm_atomic_commit drm_atomic_state
+#endif
 
 #define HERMES_KMS_DRIVER_NAME "hermes-kms"
 #define HERMES_KMS_DRIVER_DESC "Hermes virtual KMS display"
@@ -733,7 +760,7 @@ static enum drm_mode_status
 hermes_kms_plane_mode_valid(const struct drm_display_mode *mode);
 
 static int hermes_kms_crtc_atomic_check(struct drm_crtc *crtc,
-					struct drm_atomic_state *state)
+					struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *crtc_state =
 		drm_atomic_get_new_crtc_state(state, crtc);
@@ -774,7 +801,7 @@ static int hermes_kms_crtc_atomic_check(struct drm_crtc *crtc,
 }
 
 static void hermes_kms_crtc_atomic_enable(struct drm_crtc *crtc,
-					  struct drm_atomic_state *state)
+					  struct drm_atomic_commit *state)
 {
 	struct hermes_kms_output *output =
 		crtc_to_hermes_kms_output(crtc);
@@ -802,7 +829,7 @@ static void hermes_kms_crtc_atomic_enable(struct drm_crtc *crtc,
 }
 
 static void hermes_kms_crtc_atomic_disable(struct drm_crtc *crtc,
-					   struct drm_atomic_state *state)
+					   struct drm_atomic_commit *state)
 {
 	struct hermes_kms_output *output =
 		crtc_to_hermes_kms_output(crtc);
@@ -819,7 +846,7 @@ static void hermes_kms_crtc_atomic_disable(struct drm_crtc *crtc,
 }
 
 static void hermes_kms_crtc_atomic_flush(struct drm_crtc *crtc,
-					 struct drm_atomic_state *state)
+					 struct drm_atomic_commit *state)
 {
 	struct hermes_kms_output *output =
 		crtc_to_hermes_kms_output(crtc);
@@ -870,7 +897,7 @@ hermes_kms_plane_mode_valid(const struct drm_display_mode *mode)
 }
 
 static int hermes_kms_plane_atomic_check(struct drm_plane *plane,
-					 struct drm_atomic_state *state)
+					 struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *new_state =
 		drm_atomic_get_new_plane_state(state, plane);
@@ -901,7 +928,7 @@ static int hermes_kms_plane_atomic_check(struct drm_plane *plane,
 }
 
 static void hermes_kms_plane_atomic_update(struct drm_plane *plane,
-					   struct drm_atomic_state *state)
+					   struct drm_atomic_commit *state)
 {
 	struct hermes_kms_output *output =
 		primary_to_hermes_kms_output(plane);
@@ -961,7 +988,7 @@ static const struct drm_plane_funcs hermes_kms_plane_funcs = {
  * be blended into the streamed primary plane here.
  */
 static int hermes_kms_cursor_atomic_check(struct drm_plane *plane,
-					  struct drm_atomic_state *state)
+					  struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *new_state =
 		drm_atomic_get_new_plane_state(state, plane);
@@ -980,7 +1007,7 @@ static int hermes_kms_cursor_atomic_check(struct drm_plane *plane,
 }
 
 static void hermes_kms_cursor_atomic_update(struct drm_plane *plane,
-					    struct drm_atomic_state *state)
+					    struct drm_atomic_commit *state)
 {
 	/*
 	 * Nothing to scan out: the cursor is consumed client-side. The update

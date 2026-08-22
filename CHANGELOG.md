@@ -28,6 +28,24 @@ subject to change between minor releases.
 
 ### Fixed
 
+- The module builds again on Linux 7.2. That release renamed
+  `struct drm_atomic_state` to `struct drm_atomic_commit` — the object was
+  always one commit's worth of state, never the device's entire state — and
+  retyped every atomic helper callback with it. The four CRTC and four plane
+  callbacks here still took the old type, so DKMS failed with 15
+  `-Wincompatible-function-pointer-types` and `-Wincompatible-pointer-types`
+  errors and left users on 7.2 with no virtual display at all (Hermes#26).
+  - The callbacks now use the current upstream name, and a compat `#define`
+    maps it back to `drm_atomic_state` on older kernels. Nothing else about
+    those callbacks changed between the two spellings.
+  - Which name to use is decided by grepping the target kernel's own
+    `include/drm/drm_atomic.h` from kbuild rather than by comparing
+    `LINUX_VERSION_CODE`, so a tree that backported the rename builds too; the
+    version comparison is the fallback for when that header cannot be read.
+  - Verified both ways: against the 7.1 headers the driver builds warning-free
+    as before, and against a copy of them with the rename applied it builds
+    warning-free where the unpatched source produces exactly the 15 reported
+    errors.
 - Scanning out of a buffer the driver did not allocate no longer produces a
   DMA-BUF the consumer cannot import. A compositor that renders on the real GPU
   can import that buffer into this device and scan out of it directly rather
