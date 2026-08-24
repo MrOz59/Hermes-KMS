@@ -28,6 +28,16 @@ subject to change between minor releases.
 
 ### Added
 
+- Scanout modifier pass-through. The primary plane now implements
+  `format_mod_supported` and accepts any DRM format modifier, because the driver
+  only latches and re-exports the compositor's buffer and never samples a pixel.
+  Previously the DRM core's linear-only default rejected a tiled or compressed
+  scanout at atomic check time, forcing the compositor to render into a detiled
+  target. The new `scanout_modifiers=` module parameter additionally publishes up
+  to 15 extra layouts through the primary plane's `IN_FORMATS`, which is what an
+  IN_FORMATS-driven compositor (KWin, wlroots) negotiates from; the default
+  remains linear-only, so behaviour is unchanged until it is set. The cursor
+  plane deliberately stays linear-only.
 - UAPI v11 generic session-capability handoff. An output owner obtains a random,
   opaque 128-bit token and can authorize separate capture fds with an atomic
   token/session/output bind. Closing or disabling the owner revokes the session.

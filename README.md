@@ -139,6 +139,9 @@ an independently developed consumer separate from the Hermes application; see
 - exact requested mode synthesized from CVT timings and re-probed on
   `SET_OUTPUT`, preserving non-eight-aligned visible widths such as 854 pixels
   while keeping the framebuffer pitch independently aligned for DMA-BUF;
+- scanout modifier pass-through: any tiled or compressed layout the compositor's
+  render GPU produces is accepted, and `scanout_modifiers=` publishes the extra
+  layouts an `IN_FORMATS`-driven compositor can negotiate;
 - DMA-BUF export of the tracked scanout framebuffer, cached per buffer object;
 - real `dma_resv` write fence exported as a sync_file;
 - UAPI v11 generic, opaque session-capability handoff between an output owner

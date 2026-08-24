@@ -118,6 +118,16 @@
 #define HERMES_KMS_OUTPUT_CHANGE_INTERVAL HZ
 #define HERMES_KMS_OUTPUT_CHANGE_BURST 10
 
+/*
+ * Extra scanout layouts advertised through the primary plane's IN_FORMATS,
+ * on top of the always-present DRM_FORMAT_MOD_LINEAR. The list is only a
+ * negotiation hint: hermes_kms_plane_format_mod_supported() accepts any
+ * layout, but a compositor that allocates strictly from IN_FORMATS (KWin,
+ * wlroots) can only pick what is listed here.
+ */
+#define HERMES_KMS_MAX_EXTRA_MODIFIERS 15
+#define HERMES_KMS_PLANE_MODIFIER_SLOTS (HERMES_KMS_MAX_EXTRA_MODIFIERS + 2)
+
 static bool initial_enabled;
 static bool hotplug_events = true;
 static bool non_desktop;
@@ -151,6 +161,21 @@ module_param(devices, uint, 0444);
 MODULE_PARM_DESC(devices, "Number of independent virtual DRM devices (1-8, default 1)");
 module_param(session_devices, uint, 0444);
 MODULE_PARM_DESC(session_devices, "Number of private session devices (0-8). When non-zero, also creates one seat0 host device");
+
+/*
+ * The driver never reads scanout pixels, so it has no layout preference of its
+ * own. What it cannot know in the kernel is which tiled/compressed layouts the
+ * compositor's render GPU and the consumer's encoder both understand, and that
+ * intersection is what a compositor negotiates from IN_FORMATS. Let userspace,
+ * which can query both through GBM/EGL/VA, publish the list.
+ */
+static unsigned long long scanout_modifiers[HERMES_KMS_MAX_EXTRA_MODIFIERS];
+static unsigned int scanout_modifier_count;
+static u64 hermes_kms_plane_modifiers[HERMES_KMS_PLANE_MODIFIER_SLOTS];
+
+module_param_array(scanout_modifiers, ullong, &scanout_modifier_count, 0444);
+MODULE_PARM_DESC(scanout_modifiers,
+		 "Extra DRM format modifiers to advertise for scanout, beyond linear (up to 15). Any modifier is accepted regardless; this list is what IN_FORMATS-driven compositors can choose from");
 
 struct hermes_kms_device;
 
@@ -1278,6 +1303,29 @@ static const struct drm_plane_helper_funcs hermes_kms_plane_helper_funcs = {
 	.atomic_disable = hermes_kms_plane_atomic_noop,
 };
 
+/*
+ * Hermes-KMS latches the scanout framebuffer, holds a reference and hands the
+ * very same buffer to the capture consumer; it never samples a pixel. Every
+ * layout the compositor's render GPU can produce is therefore acceptable, and
+ * ACQUIRE_FRAME reports the modifier verbatim so the encoder imports exactly
+ * what was scanned out.
+ *
+ * Without this hook the DRM core falls back to the plane's modifier list, and
+ * a plane initialised with no list gets the core default of
+ * DRM_FORMAT_MOD_LINEAR alone. That rejects a tiled/compressed scanout at
+ * atomic check time (drm_atomic_plane_check -> drm_plane_has_format) and costs
+ * the compositor a detiled render target for no reason.
+ *
+ * The plane's format list is checked by drm_plane_has_format() before this
+ * hook runs, and create_in_format_blob() only ever asks about listed
+ * modifiers, so accepting unconditionally is correct for both callers.
+ */
+static bool hermes_kms_plane_format_mod_supported(struct drm_plane *plane,
+						  u32 format, u64 modifier)
+{
+	return true;
+}
+
 static const struct drm_plane_funcs hermes_kms_plane_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane = drm_atomic_helper_disable_plane,
@@ -1285,7 +1333,44 @@ static const struct drm_plane_funcs hermes_kms_plane_funcs = {
 	.reset = drm_atomic_helper_plane_reset,
 	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
+	.format_mod_supported = hermes_kms_plane_format_mod_supported,
 };
+
+/*
+ * Build the INVALID-terminated list handed to drm_universal_plane_init().
+ * Linear is always first so it stays the safe common denominator, and a
+ * repeated or unusable entry from the module parameter is dropped rather than
+ * truncating the list at the terminator.
+ */
+static void hermes_kms_init_plane_modifiers(void)
+{
+	unsigned int count = 0;
+	unsigned int i;
+	unsigned int j;
+
+	hermes_kms_plane_modifiers[count++] = DRM_FORMAT_MOD_LINEAR;
+
+	for (i = 0; i < scanout_modifier_count &&
+		    count < HERMES_KMS_PLANE_MODIFIER_SLOTS - 1; i++) {
+		u64 modifier = scanout_modifiers[i];
+
+		if (modifier == DRM_FORMAT_MOD_INVALID) {
+			pr_warn("%s: ignoring DRM_FORMAT_MOD_INVALID in scanout_modifiers\n",
+				HERMES_KMS_DRIVER_NAME);
+			continue;
+		}
+		for (j = 0; j < count; j++) {
+			if (hermes_kms_plane_modifiers[j] == modifier)
+				break;
+		}
+		if (j < count)
+			continue;
+
+		hermes_kms_plane_modifiers[count++] = modifier;
+	}
+
+	hermes_kms_plane_modifiers[count] = DRM_FORMAT_MOD_INVALID;
+}
 
 /*
  * Cursor plane. Exposing a cursor plane lets the compositor (KWin/GNOME) move
@@ -1323,6 +1408,13 @@ static const struct drm_plane_helper_funcs hermes_kms_cursor_helper_funcs = {
 	.atomic_disable = hermes_kms_plane_atomic_noop,
 };
 
+/*
+ * The cursor plane deliberately keeps the core's linear-only modifier list and
+ * no pass-through hook. Its image is published as a separate ARGB8888 capture
+ * stream that consumers are documented to composite themselves, frequently on
+ * the CPU, so a tiled cursor buffer would move detiling work to every consumer
+ * to save the compositor nothing measurable.
+ */
 static const struct drm_plane_funcs hermes_kms_cursor_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane = drm_atomic_helper_disable_plane,
@@ -3377,7 +3469,8 @@ static int hermes_kms_output_modeset_init(struct hermes_kms_output *output)
 				       &hermes_kms_plane_funcs,
 				       hermes_kms_formats,
 				       ARRAY_SIZE(hermes_kms_formats),
-				       NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
+				       hermes_kms_plane_modifiers,
+				       DRM_PLANE_TYPE_PRIMARY, NULL);
 	if (ret)
 		return ret;
 	drm_plane_helper_add(&output->primary,
@@ -3731,6 +3824,8 @@ static int __init hermes_kms_init(void)
 		devices = device_count;
 	}
 	registered_device_count = device_count;
+
+	hermes_kms_init_plane_modifiers();
 
 	ret = platform_driver_register(&hermes_kms_platform_driver);
 	if (ret)

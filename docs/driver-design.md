@@ -35,6 +35,31 @@ A cursor plane lets the compositor offload pointer motion without recompositing
 the whole output, and `FB_DAMAGE_CLIPS` on the primary plane lets the driver
 forward the changed region to the capture consumer.
 
+### Scanout layouts
+
+The driver never samples a scanout pixel: it latches the framebuffer, holds a
+reference, and re-exports the same buffer to the capture consumer, reporting
+the modifier verbatim through `ACQUIRE_FRAME`. Any layout the compositor's
+render GPU can produce is therefore acceptable, so the primary plane implements
+`format_mod_supported` and accepts every modifier. Without that hook the DRM
+core falls back to the plane's modifier list, and a plane initialised without
+one gets the core default of `DRM_FORMAT_MOD_LINEAR` alone — which rejects a
+tiled or compressed scanout in `drm_atomic_plane_check()` and makes the
+compositor render into a detiled target for nothing.
+
+Accepting a layout and advertising it are separate questions. A compositor that
+allocates strictly from the plane's `IN_FORMATS` blob can only choose what that
+blob lists, and the kernel cannot know which tiled or compressed layouts the
+compositor's render GPU and the consumer's encoder both understand — that
+intersection is a userspace property. `scanout_modifiers=` therefore lets
+userspace, which can query both through GBM/EGL/VA, publish up to 15 extra
+layouts alongside the always-present linear entry. The default is linear-only.
+
+The cursor plane keeps the core's linear-only list and no pass-through hook.
+Its image is published as a separate ARGB8888 stream that consumers are
+documented to composite themselves, often on the CPU, so a tiled cursor would
+move detiling into every consumer to save the compositor nothing measurable.
+
 DRM's `mode_config.min_width/min_height` limit every framebuffer, including a
 cursor, rather than only connector modes. Hermes therefore advertises a 1x1
 framebuffer minimum while separately enforcing its 640x480 minimum display mode
@@ -412,6 +437,8 @@ The module supports these topology and initial-state parameters:
   plus a host card, mutually exclusive with an explicit `devices` topology)
 - `hotplug_events`
 - `non_desktop`
+- `scanout_modifiers` (up to 15 extra `IN_FORMATS` layouts; linear is always
+  advertised and every modifier is accepted regardless of this list)
 
 Topology, initial mode/state and `non_desktop` are read-only after module load.
 `hotplug_events` remains a runtime diagnostic switch. The root-only
