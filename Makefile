@@ -59,7 +59,7 @@ DKMS_NAME := hermes-kms
 DKMS_VERSION := $(shell awk '/^#define HERMES_KMS_DRIVER_MAJOR/{maj=$$3} /^#define HERMES_KMS_DRIVER_MINOR/{min=$$3} /^#define HERMES_KMS_DRIVER_PATCH/{pat=$$3} END{print maj"."min"."pat}' kernel/hermes-kms/hermes_kms.c)
 DKMS_SRC := /usr/src/$(DKMS_NAME)-$(DKMS_VERSION)
 
-.PHONY: all full check check-uapi check-session modules tools install-runtime-udev uninstall-runtime-udev \
+.PHONY: all full check check-uapi check-session check-edid modules tools install-runtime-udev uninstall-runtime-udev \
 	install-dev-udev uninstall-dev-udev \
 	dkms-install dkms-uninstall modules-install install-configs \
 	install-uapi uninstall-uapi clean clean-tools
@@ -69,7 +69,7 @@ all: modules
 # Opt in to developer diagnostics that need libdrm, VAAPI, GBM, EGL and GL.
 full: modules tools
 
-check: check-uapi check-session
+check: check-uapi check-session check-edid
 
 # Pin public structure layouts and ioctl encodings on the native userspace ABI.
 # When a working multilib compiler is present, exercise the 32-bit compat ABI
@@ -126,6 +126,22 @@ check-session:
 		else \
 			printf 'session file helper: 32-bit SKIP (multilib compiler/runtime unavailable)\n'; \
 		fi
+
+# Validate the synthetic EDID the module hands to compositors. A bad checksum
+# makes the block vanish and a too-narrow range descriptor silently filters
+# advertised modes, so both are pinned here rather than discovered on a desktop.
+# Needs no libdrm: the generator header is deliberately free of kernel-only
+# constructs so it can be compiled on the host.
+check-edid:
+	@set -eu; \
+		test_tmp="$$(mktemp -d "$${TMPDIR:-/tmp}/hermes-kms-edid.XXXXXX")"; \
+		cleanup() { $(RM) -r -- "$$test_tmp"; }; \
+		trap cleanup EXIT; \
+		trap 'exit 1' HUP INT TERM; \
+		$(CC) $(CFLAGS) -std=c11 -Wall -Wextra -Werror -pedantic \
+			tests/edid.c -o "$$test_tmp/edid"; \
+		"$$test_tmp/edid"; \
+		printf 'synthetic EDID: PASS\n'
 
 # Install the driver via DKMS so it persists across reboots and rebuilds for
 # every new kernel (the same mechanism evdi-dkms uses). Run as root. Registered

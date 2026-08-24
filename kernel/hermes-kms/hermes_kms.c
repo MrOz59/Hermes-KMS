@@ -34,6 +34,8 @@
 
 #include <drm/hermes_kms_drm.h>
 
+#include "hermes_kms_edid.h"
+
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic_state_helper.h>
@@ -105,16 +107,26 @@
 #define HERMES_KMS_MAX_REGISTERED_DEVICES \
 	(1 + HERMES_KMS_MAX_SESSION_DEVICES)
 
-#define HERMES_KMS_MIN_WIDTH 640
-#define HERMES_KMS_MIN_HEIGHT 480
+#define HERMES_KMS_DEFAULT_MIN_WIDTH 640
+#define HERMES_KMS_DEFAULT_MIN_HEIGHT 480
 #define HERMES_KMS_MIN_FRAMEBUFFER_WIDTH 1
 #define HERMES_KMS_MIN_FRAMEBUFFER_HEIGHT 1
-#define HERMES_KMS_MAX_WIDTH 3840
-#define HERMES_KMS_MAX_HEIGHT 2160
+#define HERMES_KMS_DEFAULT_MAX_WIDTH 7680
+#define HERMES_KMS_DEFAULT_MAX_HEIGHT 4320
 #define HERMES_KMS_DEFAULT_WIDTH 1920
 #define HERMES_KMS_DEFAULT_HEIGHT 1080
 #define HERMES_KMS_DEFAULT_REFRESH_HZ 60
-#define HERMES_KMS_MAX_REFRESH_HZ 240
+#define HERMES_KMS_DEFAULT_MAX_REFRESH_HZ 240
+
+/*
+ * Hard envelope the mode-range module parameters are clamped into. The upper
+ * dimension matches what a DRM framebuffer can address in practice; the
+ * refresh ceiling is well past any real sink and only exists so a typo cannot
+ * program an absurd software-vblank period.
+ */
+#define HERMES_KMS_LIMIT_MIN_DIMENSION 64
+#define HERMES_KMS_LIMIT_MAX_DIMENSION 16384
+#define HERMES_KMS_LIMIT_MAX_REFRESH_HZ 1000
 #define HERMES_KMS_OUTPUT_CHANGE_INTERVAL HZ
 #define HERMES_KMS_OUTPUT_CHANGE_BURST 10
 
@@ -172,6 +184,36 @@ MODULE_PARM_DESC(session_devices, "Number of private session devices (0-8). When
 static unsigned long long scanout_modifiers[HERMES_KMS_MAX_EXTRA_MODIFIERS];
 static unsigned int scanout_modifier_count;
 static u64 hermes_kms_plane_modifiers[HERMES_KMS_PLANE_MODIFIER_SLOTS];
+
+/*
+ * The advertised mode envelope. A virtual display has no panel to constrain it,
+ * so these are policy rather than hardware: a streaming host wants whatever
+ * geometry its remote client asked for. GET_CAPS reports the configured values
+ * and the synthetic EDID's range descriptor is derived from them, so a
+ * compositor and a consumer see one consistent envelope.
+ */
+static unsigned int min_width = HERMES_KMS_DEFAULT_MIN_WIDTH;
+static unsigned int min_height = HERMES_KMS_DEFAULT_MIN_HEIGHT;
+static unsigned int max_width = HERMES_KMS_DEFAULT_MAX_WIDTH;
+static unsigned int max_height = HERMES_KMS_DEFAULT_MAX_HEIGHT;
+static unsigned int max_refresh_hz = HERMES_KMS_DEFAULT_MAX_REFRESH_HZ;
+static unsigned int physical_width_mm;
+static unsigned int physical_height_mm;
+
+module_param(min_width, uint, 0444);
+MODULE_PARM_DESC(min_width, "Smallest accepted display mode width (default 640)");
+module_param(min_height, uint, 0444);
+MODULE_PARM_DESC(min_height, "Smallest accepted display mode height (default 480)");
+module_param(max_width, uint, 0444);
+MODULE_PARM_DESC(max_width, "Largest accepted display mode width (default 7680)");
+module_param(max_height, uint, 0444);
+MODULE_PARM_DESC(max_height, "Largest accepted display mode height (default 4320)");
+module_param(max_refresh_hz, uint, 0444);
+MODULE_PARM_DESC(max_refresh_hz, "Largest accepted refresh rate in Hz (default 240)");
+module_param(physical_width_mm, uint, 0444);
+MODULE_PARM_DESC(physical_width_mm, "Reported physical panel width in mm (0 leaves it undefined)");
+module_param(physical_height_mm, uint, 0444);
+MODULE_PARM_DESC(physical_height_mm, "Reported physical panel height in mm (0 leaves it undefined)");
 
 module_param_array(scanout_modifiers, ullong, &scanout_modifier_count, 0444);
 MODULE_PARM_DESC(scanout_modifiers,
@@ -458,38 +500,32 @@ static const u32 hermes_kms_cursor_formats[] = {
 };
 
 /*
- * Synthetic EDID 1.3 base block identifying the Hermes virtual monitor.
- * Compositors (e.g. KWin) warn and may refuse to configure a connector with
- * no EDID ("Could not find edid for connector"). This block provides identity
- * (manufacturer "HRM", name "Hermes KMS") and range limits so the output is
- * treated as a normal monitor. The actual mode list is still generated
- * dynamically in get_modes() via CVT so arbitrary client geometries work; the
- * EDID's detailed timing is only a fallback/preferred hint. Checksum verified.
- *
- * The range limits are not a hint, though — userspace validates modes against
- * them, so they have to cover everything this driver accepts. They used to say
- * 75 Hz / 150 kHz / 300 MHz, which contradicted HERMES_KMS_MAX_REFRESH_HZ and
- * silently ruled out every mode above 75 Hz: a client asking for 1080p120 got a
- * connector that advertised the mode through CVT and then refused it here.
- * They now say 240 Hz / 255 kHz / 1200 MHz, matching what the driver allows.
- *
- * 255 kHz is the ceiling a 1.3 range descriptor can express without the 1.4
- * offset flags. That covers up to 1440p144; 4K above ~113 Hz needs more
- * horizontal rate than can be stated here, so it would still be filtered out.
+ * The EDID generator lives in its own header so a host-side test can exercise
+ * the exact bytes the module produces. Pin the two range-descriptor constants
+ * it has to restate against the kernel's own definitions.
  */
-static const u8 hermes_kms_edid[128] = {
-	0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x22, 0x4d, 0x01, 0x00,
-	0x01, 0x00, 0x00, 0x00, 0x01, 0x22, 0x01, 0x03, 0x80, 0x00, 0x00, 0x78,
-	0x02, 0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54, 0x00,
-	0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-	0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3a, 0x80, 0x18, 0x71, 0x38,
-	0x2d, 0x40, 0x58, 0x2c, 0x45, 0x00, 0x13, 0x2b, 0x21, 0x00, 0x00, 0x1e,
-	0x00, 0x00, 0x00, 0xfc, 0x00, 0x48, 0x65, 0x72, 0x6d, 0x65, 0x73, 0x20,
-	0x4b, 0x4d, 0x53, 0x0a, 0x20, 0x20, 0x00, 0x00, 0x00, 0xfd, 0x00, 0x17,
-	0xf0, 0x0f, 0xff, 0x78, 0x01, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-	0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe6,
-};
+static_assert(HERMES_KMS_EDID_OFFSET_MAX_VFREQ ==
+	      DRM_EDID_RANGE_OFFSET_MAX_VFREQ);
+static_assert(HERMES_KMS_EDID_OFFSET_MAX_HFREQ ==
+	      DRM_EDID_RANGE_OFFSET_MAX_HFREQ);
+static_assert(HERMES_KMS_EDID_RANGE_LIMITS_ONLY ==
+	      DRM_EDID_RANGE_LIMITS_ONLY_FLAG);
+
+static bool hermes_kms_build_output_edid(struct hermes_kms_output *output,
+					 u32 serial)
+{
+	const struct hermes_kms_edid_limits limits = {
+		.max_width = max_width,
+		.max_height = max_height,
+		.max_refresh_hz = max_refresh_hz,
+		.physical_width_mm = physical_width_mm,
+		.physical_height_mm = physical_height_mm,
+	};
+
+	static_assert(sizeof(output->edid) == HERMES_KMS_EDID_SIZE);
+
+	return hermes_kms_build_edid(output->edid, serial, &limits);
+}
 
 static bool hermes_kms_hotplug_event(struct hermes_kms_output *output)
 {
@@ -522,8 +558,8 @@ static void hermes_kms_reprobe_modes(struct hermes_kms_output *output)
 
 	mutex_lock(&drm->mode_config.mutex);
 	drm_helper_probe_single_connector_modes(&output->connector,
-						HERMES_KMS_MAX_WIDTH,
-						HERMES_KMS_MAX_HEIGHT);
+						max_width,
+						max_height);
 	mutex_unlock(&drm->mode_config.mutex);
 }
 
@@ -1016,8 +1052,8 @@ static int hermes_kms_connector_get_modes(struct drm_connector *connector)
 	 * resolution without a SET_OUTPUT round-trip, and so the connector is
 	 * never left with zero modes if CVT synthesis fails.
 	 */
-	count += drm_add_modes_noedid(connector, HERMES_KMS_MAX_WIDTH,
-				      HERMES_KMS_MAX_HEIGHT);
+	count += drm_add_modes_noedid(connector, max_width,
+				      max_height);
 
 	return count;
 }
@@ -1238,15 +1274,15 @@ static const struct drm_crtc_helper_funcs hermes_kms_crtc_helper_funcs = {
 static enum drm_mode_status
 hermes_kms_plane_mode_valid(const struct drm_display_mode *mode)
 {
-	if (mode->hdisplay < HERMES_KMS_MIN_WIDTH ||
-	    mode->vdisplay < HERMES_KMS_MIN_HEIGHT)
+	if (mode->hdisplay < min_width ||
+	    mode->vdisplay < min_height)
 		return MODE_BAD;
 
-	if (mode->hdisplay > HERMES_KMS_MAX_WIDTH ||
-	    mode->vdisplay > HERMES_KMS_MAX_HEIGHT)
+	if (mode->hdisplay > max_width ||
+	    mode->vdisplay > max_height)
 		return MODE_VIRTUAL_X;
 
-	if (drm_mode_vrefresh(mode) > HERMES_KMS_MAX_REFRESH_HZ)
+	if (drm_mode_vrefresh(mode) > max_refresh_hz)
 		return MODE_CLOCK_HIGH;
 
 	return MODE_OK;
@@ -1477,13 +1513,13 @@ static int hermes_kms_ioctl_get_caps(struct drm_device *drm, void *data,
 		caps->flags |= HERMES_KMS_CAP_MULTI_DEVICE;
 	if (session_devices)
 		caps->flags |= HERMES_KMS_CAP_SESSION_DEVICE_POOL;
-	caps->min_width = HERMES_KMS_MIN_WIDTH;
-	caps->min_height = HERMES_KMS_MIN_HEIGHT;
-	caps->max_width = HERMES_KMS_MAX_WIDTH;
-	caps->max_height = HERMES_KMS_MAX_HEIGHT;
+	caps->min_width = min_width;
+	caps->min_height = min_height;
+	caps->max_width = max_width;
+	caps->max_height = max_height;
 	caps->preferred_width = HERMES_KMS_DEFAULT_WIDTH;
 	caps->preferred_height = HERMES_KMS_DEFAULT_HEIGHT;
-	caps->max_refresh_hz = HERMES_KMS_MAX_REFRESH_HZ;
+	caps->max_refresh_hz = max_refresh_hz;
 	caps->output_count = hdev->output_count;
 
 	return 0;
@@ -2596,12 +2632,12 @@ out_unlock_context:
 static bool hermes_kms_valid_requested_mode(u32 width, u32 height,
 					    u32 refresh_hz)
 {
-	return width >= HERMES_KMS_MIN_WIDTH &&
-	       height >= HERMES_KMS_MIN_HEIGHT &&
-	       width <= HERMES_KMS_MAX_WIDTH &&
-	       height <= HERMES_KMS_MAX_HEIGHT &&
+	return width >= min_width &&
+	       height >= min_height &&
+	       width <= max_width &&
+	       height <= max_height &&
 	       refresh_hz > 0 &&
-	       refresh_hz <= HERMES_KMS_MAX_REFRESH_HZ;
+	       refresh_hz <= max_refresh_hz;
 }
 
 static void hermes_kms_init_output_state(struct drm_device *drm,
@@ -3537,14 +3573,14 @@ static int hermes_kms_modeset_init(struct hermes_kms_device *hdev)
 	/*
 	 * These are framebuffer limits, not display-mode limits.  Keep them low
 	 * enough for cursor buffers; the connector and SET_OUTPUT paths enforce
-	 * HERMES_KMS_MIN_WIDTH/HEIGHT for actual modes.
+	 * min_width/min_height for actual modes.
 	 * Setting these to the minimum mode size makes the DRM core reject cursor
 	 * ADDFB2 requests before fb_create is reached.
 	 */
 	drm->mode_config.min_width = HERMES_KMS_MIN_FRAMEBUFFER_WIDTH;
 	drm->mode_config.min_height = HERMES_KMS_MIN_FRAMEBUFFER_HEIGHT;
-	drm->mode_config.max_width = HERMES_KMS_MAX_WIDTH;
-	drm->mode_config.max_height = HERMES_KMS_MAX_HEIGHT;
+	drm->mode_config.max_width = max_width;
+	drm->mode_config.max_height = max_height;
 	drm->mode_config.preferred_depth = 24;
 	/* Standard 256x256 cursor envelope so compositors size HW cursors. */
 	drm->mode_config.cursor_width = 256;
@@ -3635,30 +3671,19 @@ static int hermes_kms_probe(struct platform_device *pdev)
 
 	for (i = 0; i < hdev->output_count; i++) {
 		struct hermes_kms_output *output = &hdev->outputs[i];
-		u8 checksum = 0;
-		unsigned int j;
+		unsigned int identity;
 
 		output->hdev = hdev;
 		output->index = i;
+		identity = hdev->device_index * hdev->output_count + i + 1;
 		snprintf(output->output_name, sizeof(output->output_name),
-			 HERMES_KMS_OUTPUT_NAME_PREFIX "%u",
-			 hdev->device_index * hdev->output_count + i + 1);
+			 HERMES_KMS_OUTPUT_NAME_PREFIX "%u", identity);
 
-		/*
-		 * Give every connector a stable, distinct EDID serial. KWin uses
-		 * EDID identity when persisting layouts; identical virtual panels
-		 * would otherwise be easy to collapse or swap across restarts.
-		 */
-		memcpy(output->edid, hermes_kms_edid, sizeof(output->edid));
-		j = hdev->device_index * hdev->output_count + i + 1;
-		output->edid[12] = j & 0xff;
-		output->edid[13] = (j >> 8) & 0xff;
-		output->edid[14] = (j >> 16) & 0xff;
-		output->edid[15] = (j >> 24) & 0xff;
-		j = 0;
-		for (j = 0; j < sizeof(output->edid) - 1; j++)
-			checksum += output->edid[j];
-		output->edid[sizeof(output->edid) - 1] = -checksum;
+		if (!hermes_kms_build_output_edid(output, identity))
+			drm_warn(drm,
+				 "%s: mode range %ux%u@%u exceeds what an EDID range descriptor can state; userspace may filter the fastest modes\n",
+				 output->output_name, max_width, max_height,
+				 max_refresh_hz);
 
 		mutex_init(&output->state_lock);
 		mutex_init(&output->export_lock);
@@ -3798,6 +3823,48 @@ static struct platform_driver hermes_kms_platform_driver = {
 static struct platform_device *
 hermes_kms_platform_devices[HERMES_KMS_MAX_REGISTERED_DEVICES];
 
+/*
+ * Clamp the mode-range parameters into the hard envelope and keep them
+ * mutually consistent. Everything downstream -- mode validation, GET_CAPS, the
+ * EDID range descriptor, mode_config's framebuffer limits -- reads these, so a
+ * nonsensical combination has to be corrected once, here, rather than produce
+ * an envelope that disagrees with itself.
+ */
+static void __init hermes_kms_sanitize_mode_range(void)
+{
+	unsigned int requested_min_width = min_width;
+	unsigned int requested_min_height = min_height;
+	unsigned int requested_max_width = max_width;
+	unsigned int requested_max_height = max_height;
+	unsigned int requested_max_refresh_hz = max_refresh_hz;
+
+	min_width = clamp_t(unsigned int, min_width,
+			    HERMES_KMS_LIMIT_MIN_DIMENSION,
+			    HERMES_KMS_LIMIT_MAX_DIMENSION);
+	min_height = clamp_t(unsigned int, min_height,
+			     HERMES_KMS_LIMIT_MIN_DIMENSION,
+			     HERMES_KMS_LIMIT_MAX_DIMENSION);
+	max_width = clamp_t(unsigned int, max_width, min_width,
+			    HERMES_KMS_LIMIT_MAX_DIMENSION);
+	max_height = clamp_t(unsigned int, max_height, min_height,
+			     HERMES_KMS_LIMIT_MAX_DIMENSION);
+	max_refresh_hz = clamp_t(unsigned int, max_refresh_hz, 1,
+				 HERMES_KMS_LIMIT_MAX_REFRESH_HZ);
+
+	if (min_width != requested_min_width ||
+	    min_height != requested_min_height ||
+	    max_width != requested_max_width ||
+	    max_height != requested_max_height ||
+	    max_refresh_hz != requested_max_refresh_hz)
+		pr_warn("%s: mode range %ux%u-%ux%u@%u out of range, using %ux%u-%ux%u@%u\n",
+			HERMES_KMS_DRIVER_NAME,
+			requested_min_width, requested_min_height,
+			requested_max_width, requested_max_height,
+			requested_max_refresh_hz,
+			min_width, min_height, max_width, max_height,
+			max_refresh_hz);
+}
+
 static int __init hermes_kms_init(void)
 {
 	unsigned int device_count = devices;
@@ -3825,6 +3892,7 @@ static int __init hermes_kms_init(void)
 	}
 	registered_device_count = device_count;
 
+	hermes_kms_sanitize_mode_range();
 	hermes_kms_init_plane_modifiers();
 
 	ret = platform_driver_register(&hermes_kms_platform_driver);

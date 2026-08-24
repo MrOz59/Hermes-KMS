@@ -121,7 +121,9 @@ an independently developed consumer separate from the Hermes application; see
 - damage tracking (`FB_DAMAGE_CLIPS`) forwarded to the capture consumer via
   `ACQUIRE_FRAME`;
 - render node for masterless, zero-copy frame consumption;
-- synthetic EDID so compositors treat `HERMES-1` as a normal monitor;
+- synthetic EDID 1.4 so compositors treat `HERMES-1` as a normal
+  continuous-frequency monitor, with range limits derived from the configured
+  mode envelope;
 - 1–8 independent outputs on one DRM card (`outputs=`, default 1 for
   compatibility), with separate KMS pipelines, sessions, frame channels, and
   EDID serials;
@@ -150,7 +152,10 @@ an independently developed consumer separate from the Hermes application; see
   metrics, including vblank and late-vblank counters;
 - debugfs telemetry at `/sys/kernel/debug/dri/<n>/hermes_kms_stats`;
 - debug/control tool: `tools/hermes-kmsctl/hermes-kmsctl`;
-- 640x480 through 3840x2160 mode range, 1920x1080 preferred.
+- configurable mode envelope, 640x480 through 7680x4320 at up to 240 Hz by
+  default with 1920x1080 preferred, reported through `GET_CAPS` and reflected in
+  the synthetic EDID's range limits;
+- optional reported physical panel size, so a compositor can derive a scale.
 
 ## Build
 

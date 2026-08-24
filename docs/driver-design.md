@@ -62,9 +62,45 @@ move detiling into every consumer to save the compositor nothing measurable.
 
 DRM's `mode_config.min_width/min_height` limit every framebuffer, including a
 cursor, rather than only connector modes. Hermes therefore advertises a 1x1
-framebuffer minimum while separately enforcing its 640x480 minimum display mode
-in mode validation and `SET_OUTPUT`; the cursor plane itself remains capped at
-256x256.
+framebuffer minimum while separately enforcing its configured minimum display
+mode in mode validation and `SET_OUTPUT`; the cursor plane itself remains capped
+at 256x256.
+
+### Mode envelope
+
+A virtual display has no panel to constrain it, so the accepted mode range is
+policy rather than hardware: a streaming host wants whatever geometry its remote
+client asked for. `min_width`, `min_height`, `max_width`, `max_height` and
+`max_refresh_hz` configure that envelope, defaulting to 640x480 through
+7680x4320 at up to 240 Hz, and are clamped into a 64..16384 pixel, 1..1000 Hz
+hard limit at module load. `GET_CAPS` reports the configured values, so a
+consumer never has to assume the defaults.
+
+The synthetic EDID's display range limits descriptor is derived from the same
+envelope. Those limits are not a hint — userspace validates modes against them
+and the kernel infers extra DMT modes through `mode_in_range()` — so a
+descriptor narrower than the driver's own envelope silently rules out modes the
+connector advertises. The block is EDID 1.4 rather than 1.3 for three reasons:
+1.3 cannot state more than 255 kHz of horizontal rate, while 1.4's byte-4 offset
+flags double that ceiling; `drm_get_monitor_range()` ignores the descriptor
+entirely on anything older; and it only publishes the range at all when the
+feature byte declares a continuous-frequency display, which is exactly what this
+driver is. The formula byte stays at "range limits only" for the same reason —
+the kernel deliberately refuses to derive a monitor range from a GTF or CVT
+descriptor.
+
+An envelope too wide to state even in 1.4 (8K at 240 Hz needs roughly 1.2 MHz of
+horizontal rate against a 510 kHz ceiling) saturates the descriptor and logs a
+warning, so the resulting mode filtering is diagnosable instead of mysterious.
+
+`physical_width_mm`/`physical_height_mm` optionally publish a panel size, which
+is what a compositor divides into the mode to pick a scale factor. Both the
+base block's centimetre fields and the detailed timing's millimetre fields are
+written together, since userspace reads either. The default leaves the size
+undefined.
+
+`tests/edid.c`, wired into `make check`, builds the same bytes the module does
+and decodes them the way `drivers/gpu/drm/drm_edid.c` decodes them.
 
 ## Multi-output prototype
 
@@ -431,6 +467,8 @@ The module supports these topology and initial-state parameters:
 - `initial_width`
 - `initial_height`
 - `initial_refresh_hz`
+- `min_width`, `min_height`, `max_width`, `max_height`, `max_refresh_hz`
+- `physical_width_mm`, `physical_height_mm`
 - `outputs` (1–8, default 1, fixed until the module is reloaded)
 - `devices` (1–8, legacy multi-device topology)
 - `session_devices` (0 disables the pool; 1–8 creates that many private cards
