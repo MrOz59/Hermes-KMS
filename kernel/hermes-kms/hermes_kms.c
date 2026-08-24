@@ -117,6 +117,7 @@
 #define HERMES_KMS_DEFAULT_HEIGHT 1080
 #define HERMES_KMS_DEFAULT_REFRESH_HZ 60
 #define HERMES_KMS_DEFAULT_MAX_REFRESH_HZ 240
+#define HERMES_KMS_DEFAULT_COLOR_DEPTH 8
 
 /*
  * Hard envelope the mode-range module parameters are clamped into. The upper
@@ -199,6 +200,7 @@ static unsigned int max_height = HERMES_KMS_DEFAULT_MAX_HEIGHT;
 static unsigned int max_refresh_hz = HERMES_KMS_DEFAULT_MAX_REFRESH_HZ;
 static unsigned int physical_width_mm;
 static unsigned int physical_height_mm;
+static unsigned int color_depth = HERMES_KMS_DEFAULT_COLOR_DEPTH;
 
 module_param(min_width, uint, 0444);
 MODULE_PARM_DESC(min_width, "Smallest accepted display mode width (default 640)");
@@ -214,6 +216,8 @@ module_param(physical_width_mm, uint, 0444);
 MODULE_PARM_DESC(physical_width_mm, "Reported physical panel width in mm (0 leaves it undefined)");
 module_param(physical_height_mm, uint, 0444);
 MODULE_PARM_DESC(physical_height_mm, "Reported physical panel height in mm (0 leaves it undefined)");
+module_param(color_depth, uint, 0444);
+MODULE_PARM_DESC(color_depth, "Bits per primary colour channel advertised in the EDID: 6, 8, 10, 12, 14 or 16 (default 8)");
 
 module_param_array(scanout_modifiers, ullong, &scanout_modifier_count, 0444);
 MODULE_PARM_DESC(scanout_modifiers,
@@ -489,9 +493,25 @@ hermes_kms_drop_export_cache_locked(struct hermes_kms_export_cache *cache)
 	}
 }
 
+/*
+ * Scanout formats offered to the compositor. The driver stores no pixels and
+ * reports the fourcc verbatim through ACQUIRE_FRAME, so the list only has to
+ * cover what a compositor might reasonably compose into and an encoder might
+ * import.
+ *
+ * The 2101010 entries make ten-bit-per-channel composition possible, which is
+ * the prerequisite for wide gamut and HDR. They are inert by default: the
+ * synthetic EDID advertises eight bits per primary unless color_depth= says
+ * otherwise, and a compositor will not drive an output deeper than its sink
+ * claims to accept.
+ */
 static const u32 hermes_kms_formats[] = {
 	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_XRGB2101010,
+	DRM_FORMAT_ARGB2101010,
+	DRM_FORMAT_XBGR2101010,
+	DRM_FORMAT_ABGR2101010,
 };
 
 /* The cursor plane only needs the standard alpha cursor format. */
@@ -514,17 +534,18 @@ static_assert(HERMES_KMS_EDID_RANGE_LIMITS_ONLY ==
 static bool hermes_kms_build_output_edid(struct hermes_kms_output *output,
 					 u32 serial)
 {
-	const struct hermes_kms_edid_limits limits = {
+	const struct hermes_kms_edid_config config = {
 		.max_width = max_width,
 		.max_height = max_height,
 		.max_refresh_hz = max_refresh_hz,
 		.physical_width_mm = physical_width_mm,
 		.physical_height_mm = physical_height_mm,
+		.color_depth = color_depth,
 	};
 
 	static_assert(sizeof(output->edid) == HERMES_KMS_EDID_SIZE);
 
-	return hermes_kms_build_edid(output->edid, serial, &limits);
+	return hermes_kms_build_edid(output->edid, serial, &config);
 }
 
 static bool hermes_kms_hotplug_event(struct hermes_kms_output *output)
@@ -3850,6 +3871,13 @@ static void __init hermes_kms_sanitize_mode_range(void)
 			     HERMES_KMS_LIMIT_MAX_DIMENSION);
 	max_refresh_hz = clamp_t(unsigned int, max_refresh_hz, 1,
 				 HERMES_KMS_LIMIT_MAX_REFRESH_HZ);
+
+	if (!hermes_kms_edid_depth_field(color_depth)) {
+		pr_warn("%s: color_depth=%u is not an EDID-encodable depth, using %u\n",
+			HERMES_KMS_DRIVER_NAME, color_depth,
+			HERMES_KMS_DEFAULT_COLOR_DEPTH);
+		color_depth = HERMES_KMS_DEFAULT_COLOR_DEPTH;
+	}
 
 	if (min_width != requested_min_width ||
 	    min_height != requested_min_height ||

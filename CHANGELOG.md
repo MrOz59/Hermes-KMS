@@ -28,6 +28,11 @@ subject to change between minor releases.
 
 ### Added
 
+- Ten-bit scanout formats. The primary plane now also offers `XRGB2101010`,
+  `ARGB2101010`, `XBGR2101010` and `ABGR2101010`, the prerequisite for wide
+  gamut and HDR composition. They stay inert until `color_depth=` raises the
+  depth the synthetic EDID advertises, since a compositor will not drive an
+  output deeper than its sink claims to accept.
 - Configurable mode envelope. `min_width`, `min_height`, `max_width`,
   `max_height` and `max_refresh_hz` replace the compiled-in 640x480..3840x2160
   limits, and the default maximum rises to 7680x4320 so ultrawide and 8K clients

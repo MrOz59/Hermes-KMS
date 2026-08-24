@@ -100,7 +100,7 @@ static void check_structure(const u8 *edid, const char *what)
 	      what);
 }
 
-static void check_envelope(const struct hermes_kms_edid_limits *limits,
+static void check_envelope(const struct hermes_kms_edid_config *config,
 			   const char *what)
 {
 	u8 edid[HERMES_KMS_EDID_SIZE];
@@ -108,7 +108,7 @@ static void check_envelope(const struct hermes_kms_edid_limits *limits,
 	u32 expected_hfreq_khz;
 	u64 vtotal;
 
-	representable = hermes_kms_build_edid(edid, 1, limits);
+	representable = hermes_kms_build_edid(edid, 1, config);
 	check_structure(edid, what);
 
 	/*
@@ -116,15 +116,15 @@ static void check_envelope(const struct hermes_kms_edid_limits *limits,
 	 * point is that the encoded descriptor is not narrower than the modes
 	 * the driver will accept.
 	 */
-	vtotal = ((u64)limits->max_height * 1000000 +
-		  (1000000 - HERMES_KMS_CVT_VBLANK_US * limits->max_refresh_hz) - 1) /
-		 (1000000 - HERMES_KMS_CVT_VBLANK_US * limits->max_refresh_hz);
-	expected_hfreq_khz = (u32)((vtotal * limits->max_refresh_hz + 999) / 1000);
+	vtotal = ((u64)config->max_height * 1000000 +
+		  (1000000 - HERMES_KMS_CVT_VBLANK_US * config->max_refresh_hz) - 1) /
+		 (1000000 - HERMES_KMS_CVT_VBLANK_US * config->max_refresh_hz);
+	expected_hfreq_khz = (u32)((vtotal * config->max_refresh_hz + 999) / 1000);
 
 	if (representable) {
-		CHECK(decoded_max_vfreq(edid) >= limits->max_refresh_hz,
+		CHECK(decoded_max_vfreq(edid) >= config->max_refresh_hz,
 		      "%s: advertised max %u Hz is below the accepted %u Hz",
-		      what, decoded_max_vfreq(edid), limits->max_refresh_hz);
+		      what, decoded_max_vfreq(edid), config->max_refresh_hz);
 		CHECK(decoded_max_hfreq_khz(edid) >= expected_hfreq_khz,
 		      "%s: advertised max %u kHz is below the needed %u kHz",
 		      what, decoded_max_hfreq_khz(edid), expected_hfreq_khz);
@@ -137,9 +137,47 @@ static void check_envelope(const struct hermes_kms_edid_limits *limits,
 	}
 }
 
+static void check_color_depth(void)
+{
+	static const struct {
+		u32 requested;
+		u8 expected_field;
+	} depths[] = {
+		{ 0, 0 }, { 6, 1 }, { 8, 2 }, { 10, 3 },
+		{ 12, 4 }, { 14, 5 }, { 16, 6 }, { 9, 0 },
+	};
+	unsigned int i;
+
+	for (i = 0; i < sizeof(depths) / sizeof(depths[0]); i++) {
+		struct hermes_kms_edid_config config = {
+			.max_width = 1920,
+			.max_height = 1080,
+			.max_refresh_hz = 60,
+			.color_depth = depths[i].requested,
+		};
+		u8 edid[HERMES_KMS_EDID_SIZE];
+		u8 video_input;
+
+		hermes_kms_build_edid(edid, 1, &config);
+		check_structure(edid, "colour depth");
+
+		video_input = edid[HERMES_KMS_EDID_VIDEO_INPUT_OFFSET];
+		CHECK(video_input & 0x80,
+		      "depth %u: the input must stay digital",
+		      depths[i].requested);
+		CHECK(((video_input >> 4) & 0x07) == depths[i].expected_field,
+		      "depth %u: encoded field is %u, expected %u",
+		      depths[i].requested, (video_input >> 4) & 0x07,
+		      depths[i].expected_field);
+		CHECK((video_input & 0x0f) == 0,
+		      "depth %u: the digital interface must stay undefined",
+		      depths[i].requested);
+	}
+}
+
 static void check_serials_differ(void)
 {
-	const struct hermes_kms_edid_limits limits = {
+	const struct hermes_kms_edid_config config = {
 		.max_width = 3840,
 		.max_height = 2160,
 		.max_refresh_hz = 240,
@@ -149,8 +187,8 @@ static void check_serials_differ(void)
 	unsigned int i;
 	bool differs = false;
 
-	hermes_kms_build_edid(first, 1, &limits);
-	hermes_kms_build_edid(second, 2, &limits);
+	hermes_kms_build_edid(first, 1, &config);
+	hermes_kms_build_edid(second, 2, &config);
 	check_structure(first, "serial 1");
 	check_structure(second, "serial 2");
 
@@ -165,7 +203,7 @@ static void check_serials_differ(void)
 
 static void check_physical_size(void)
 {
-	struct hermes_kms_edid_limits limits = {
+	struct hermes_kms_edid_config config = {
 		.max_width = 1920,
 		.max_height = 1080,
 		.max_refresh_hz = 60,
@@ -175,15 +213,15 @@ static void check_physical_size(void)
 	u32 dtd_width_mm;
 	u32 dtd_height_mm;
 
-	hermes_kms_build_edid(edid, 1, &limits);
+	hermes_kms_build_edid(edid, 1, &config);
 	check_structure(edid, "undefined size");
 	CHECK(edid[HERMES_KMS_EDID_SIZE_CM_OFFSET] == 0 &&
 	      edid[HERMES_KMS_EDID_SIZE_CM_OFFSET + 1] == 0,
 	      "an unset physical size must stay undefined");
 
-	limits.physical_width_mm = 697;
-	limits.physical_height_mm = 392;
-	hermes_kms_build_edid(edid, 1, &limits);
+	config.physical_width_mm = 697;
+	config.physical_height_mm = 392;
+	hermes_kms_build_edid(edid, 1, &config);
 	check_structure(edid, "defined size");
 
 	dtd = &edid[HERMES_KMS_EDID_DTD_OFFSET];
@@ -203,24 +241,28 @@ int main(void)
 {
 	static const struct {
 		const char *what;
-		struct hermes_kms_edid_limits limits;
+		struct hermes_kms_edid_config config;
 	} envelopes[] = {
-		{ "1080p60", { 1920, 1080, 60, 0, 0 } },
-		{ "1080p240", { 1920, 1080, 240, 0, 0 } },
-		{ "1440p144", { 2560, 1440, 144, 0, 0 } },
-		{ "ultrawide", { 5120, 1440, 240, 0, 0 } },
-		{ "4k120", { 3840, 2160, 120, 0, 0 } },
-		{ "default envelope", { 7680, 4320, 240, 0, 0 } },
-		{ "tiny", { 640, 480, 1, 0, 0 } },
-		{ "extreme", { 16384, 16384, 1000, 0, 0 } },
+#define ENVELOPE(w, h, hz) \
+	{ .max_width = (w), .max_height = (h), .max_refresh_hz = (hz) }
+		{ "1080p60", ENVELOPE(1920, 1080, 60) },
+		{ "1080p240", ENVELOPE(1920, 1080, 240) },
+		{ "1440p144", ENVELOPE(2560, 1440, 144) },
+		{ "ultrawide", ENVELOPE(5120, 1440, 240) },
+		{ "4k120", ENVELOPE(3840, 2160, 120) },
+		{ "default envelope", ENVELOPE(7680, 4320, 240) },
+		{ "tiny", ENVELOPE(640, 480, 1) },
+		{ "extreme", ENVELOPE(16384, 16384, 1000) },
+#undef ENVELOPE
 	};
 	unsigned int i;
 
 	for (i = 0; i < sizeof(envelopes) / sizeof(envelopes[0]); i++)
-		check_envelope(&envelopes[i].limits, envelopes[i].what);
+		check_envelope(&envelopes[i].config, envelopes[i].what);
 
 	check_serials_differ();
 	check_physical_size();
+	check_color_depth();
 
 	if (failures) {
 		fprintf(stderr, "%d EDID check(s) failed\n", failures);

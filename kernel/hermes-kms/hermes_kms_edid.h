@@ -44,6 +44,7 @@ typedef uint64_t u64;
 /* Byte offsets patched by hermes_kms_build_edid(). */
 #define HERMES_KMS_EDID_SERIAL_OFFSET		12
 #define HERMES_KMS_EDID_VERSION_OFFSET		18
+#define HERMES_KMS_EDID_VIDEO_INPUT_OFFSET	20
 #define HERMES_KMS_EDID_SIZE_CM_OFFSET		21
 #define HERMES_KMS_EDID_FEATURES_OFFSET		24
 #define HERMES_KMS_EDID_DTD_OFFSET		54
@@ -72,13 +73,42 @@ typedef uint64_t u64;
 /* Physical size the EDID's millimetre fields can express. */
 #define HERMES_KMS_EDID_MAX_SIZE_MM 4095
 
-struct hermes_kms_edid_limits {
+struct hermes_kms_edid_config {
 	u32 max_width;
 	u32 max_height;
 	u32 max_refresh_hz;
 	u32 physical_width_mm;
 	u32 physical_height_mm;
+	/* Bits per primary colour channel; 0 leaves the depth undefined. */
+	u32 color_depth;
 };
+
+/*
+ * Byte 20 encodes the colour bit depth in bits 6:4 as an index rather than a
+ * count: 0 undefined, 1 six bits, 2 eight, 3 ten, 4 twelve, 5 fourteen, 6
+ * sixteen. A compositor reads this to decide whether driving the output at ten
+ * bits per channel is worth doing at all, so advertising more than eight stays
+ * a deliberate configuration choice rather than a default.
+ */
+static inline u8 hermes_kms_edid_depth_field(u32 color_depth)
+{
+	switch (color_depth) {
+	case 6:
+		return 1;
+	case 8:
+		return 2;
+	case 10:
+		return 3;
+	case 12:
+		return 4;
+	case 14:
+		return 5;
+	case 16:
+		return 6;
+	default:
+		return 0;
+	}
+}
 
 /*
  * EDID 1.4 base block identifying the Hermes virtual monitor. Compositors
@@ -133,15 +163,15 @@ static const u8 hermes_kms_edid_template[HERMES_KMS_EDID_SIZE] = {
  */
 static inline bool
 hermes_kms_fill_edid_range(u8 *descriptor,
-			   const struct hermes_kms_edid_limits *limits)
+			   const struct hermes_kms_edid_config *config)
 {
 	u32 vblank_scale = 1000000 -
-			   HERMES_KMS_CVT_VBLANK_US * limits->max_refresh_hz;
+			   HERMES_KMS_CVT_VBLANK_US * config->max_refresh_hz;
 	u64 vtotal;
 	u64 htotal;
 	u64 hfreq_khz;
 	u64 clock_10mhz;
-	u32 vfreq = limits->max_refresh_hz;
+	u32 vfreq = config->max_refresh_hz;
 	bool representable = true;
 	u8 offsets = 0;
 
@@ -150,15 +180,15 @@ hermes_kms_fill_edid_range(u8 *descriptor,
 	 * sane reaches it, but the arithmetic must not divide by zero or wrap
 	 * if a caller ever raises the refresh ceiling that far.
 	 */
-	if ((u64)HERMES_KMS_CVT_VBLANK_US * limits->max_refresh_hz >= 1000000)
+	if ((u64)HERMES_KMS_CVT_VBLANK_US * config->max_refresh_hz >= 1000000)
 		vblank_scale = 1;
 
-	vtotal = DIV_ROUND_UP_ULL((u64)limits->max_height * 1000000,
+	vtotal = DIV_ROUND_UP_ULL((u64)config->max_height * 1000000,
 				  vblank_scale);
-	htotal = DIV_ROUND_UP_ULL((u64)limits->max_width *
+	htotal = DIV_ROUND_UP_ULL((u64)config->max_width *
 				  HERMES_KMS_CVT_HTOTAL_NUMERATOR,
 				  HERMES_KMS_CVT_HTOTAL_DENOMINATOR);
-	hfreq_khz = DIV_ROUND_UP_ULL(vtotal * limits->max_refresh_hz, 1000);
+	hfreq_khz = DIV_ROUND_UP_ULL(vtotal * config->max_refresh_hz, 1000);
 	clock_10mhz = DIV_ROUND_UP_ULL(hfreq_khz * htotal, 10000);
 
 	if (hfreq_khz > HERMES_KMS_EDID_MAX_HFREQ_KHZ) {
@@ -207,7 +237,7 @@ hermes_kms_fill_edid_range(u8 *descriptor,
  */
 static inline bool
 hermes_kms_build_edid(u8 *edid, u32 serial,
-		      const struct hermes_kms_edid_limits *limits)
+		      const struct hermes_kms_edid_config *config)
 {
 	u8 checksum = 0;
 	bool representable;
@@ -221,16 +251,20 @@ hermes_kms_build_edid(u8 *edid, u32 serial,
 	edid[HERMES_KMS_EDID_SERIAL_OFFSET + 3] = (serial >> 24) & 0xff;
 
 	representable = hermes_kms_fill_edid_range(
-		&edid[HERMES_KMS_EDID_RANGE_OFFSET], limits);
+		&edid[HERMES_KMS_EDID_RANGE_OFFSET], config);
+
+	/* Digital input, interface undefined; only the depth field varies. */
+	edid[HERMES_KMS_EDID_VIDEO_INPUT_OFFSET] =
+		(u8)(0x80 | (hermes_kms_edid_depth_field(config->color_depth) << 4));
 
 	/*
 	 * The base block states the size in whole centimetres while the
 	 * detailed timing states it in millimetres, and userspace reads either,
 	 * so write both or leave both at the template's undefined default.
 	 */
-	if (limits->physical_width_mm && limits->physical_height_mm) {
-		u32 width_mm = limits->physical_width_mm;
-		u32 height_mm = limits->physical_height_mm;
+	if (config->physical_width_mm && config->physical_height_mm) {
+		u32 width_mm = config->physical_width_mm;
+		u32 height_mm = config->physical_height_mm;
 		u32 width_cm;
 		u32 height_cm;
 

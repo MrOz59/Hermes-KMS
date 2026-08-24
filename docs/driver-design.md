@@ -35,6 +35,19 @@ A cursor plane lets the compositor offload pointer motion without recompositing
 the whole output, and `FB_DAMAGE_CLIPS` on the primary plane lets the driver
 forward the changed region to the capture consumer.
 
+### Scanout formats
+
+The primary plane offers `XRGB8888`/`ARGB8888` and the four `2101010` variants.
+The driver stores no pixels and reports the fourcc verbatim through
+`ACQUIRE_FRAME`, so the list only has to cover what a compositor might compose
+into and an encoder might import.
+
+The ten-bit entries are the prerequisite for wide gamut and HDR, and are inert
+by default: a compositor will not drive an output deeper than its sink claims to
+accept, and the synthetic EDID advertises eight bits per primary unless
+`color_depth=` says otherwise. Raising it is therefore a deliberate choice, and
+consumers must be prepared for a ten-bit fourcc when it is made.
+
 ### Scanout layouts
 
 The driver never samples a scanout pixel: it latches the framebuffer, holds a
@@ -469,6 +482,7 @@ The module supports these topology and initial-state parameters:
 - `initial_refresh_hz`
 - `min_width`, `min_height`, `max_width`, `max_height`, `max_refresh_hz`
 - `physical_width_mm`, `physical_height_mm`
+- `color_depth`
 - `outputs` (1–8, default 1, fixed until the module is reloaded)
 - `devices` (1–8, legacy multi-device topology)
 - `session_devices` (0 disables the pool; 1–8 creates that many private cards
