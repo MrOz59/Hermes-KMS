@@ -190,7 +190,10 @@ reports a stable 1-based `session_index`; udev maps that index to
 `hermes-kms-N` and requests the matching private seat broker.
 Session-role primary nodes and unconfigured render nodes are root-only mode
 0600. The root broker opens the primary node and passes access over its
-per-session socket; global `video` membership and active-seat `uaccess` ACLs do
+per-session socket. It creates its own private mount namespace rather than
+requiring the caller to supply one, which is what lets it bind its per-instance
+runtime directory over `/run` without any risk to the host's, and it runs under
+a syscall filter with a reduced capability set; global `video` membership and active-seat `uaccess` ACLs do
 not bypass that boundary. The setup helper grants only the configured consumer
 UID access to render nodes for capability-protected control and capture.
 

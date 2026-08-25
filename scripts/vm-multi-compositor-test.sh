@@ -135,9 +135,10 @@ for index in 0 1; do
 	runtime="$TEST_ROOT/weston-$((index + 1))"
 	seatd_runtime="$TEST_ROOT/seatd-runtime/$((index + 1))"
 	install -d -m 0700 -o "$TEST_USER" -g "$(id -gn "$TEST_USER")" "$runtime"
+	# The launcher creates its own private mount namespace, so it no longer
+	# has to be wrapped in unshare here.
 	HERMES_SEATD_RUNTIME_ROOT="$TEST_ROOT/seatd-runtime" \
 	HERMES_SESSION_USER_FILE="$TEST_ROOT/session-user" \
-	unshare --mount --propagation private \
 		"$REPO/scripts/hermes-kms-seatd-instance" \
 		"$((index + 1))" auto seat >"$runtime/seatd.log" 2>&1 &
 	SEATD_PIDS+=("$!")

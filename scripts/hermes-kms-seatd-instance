@@ -25,28 +25,30 @@ command -v chown >/dev/null || {
 	printf 'chown is required\n' >&2
 	exit 1
 }
-command -v readlink >/dev/null || {
-	printf 'readlink is required\n' >&2
-	exit 1
-}
 command -v seatd >/dev/null || {
 	printf 'seatd is required\n' >&2
 	exit 1
 }
+command -v unshare >/dev/null || {
+	printf 'unshare is required\n' >&2
+	exit 1
+}
 
 # Binding the instance directory over /run is safe only inside a private mount
-# namespace. Refuse a direct root invocation, which would otherwise hide the
-# host's /run and break systemd, udev and other runtime services.
-if ! SELF_MOUNT_NS="$(readlink /proc/self/ns/mnt)" ||
-   ! INIT_MOUNT_NS="$(readlink /proc/1/ns/mnt)"; then
-	printf 'unable to verify the private mount namespace\n' >&2
-	exit 1
-fi
-if [ "$SELF_MOUNT_NS" = "$INIT_MOUNT_NS" ]; then
-	printf '%s\n' \
-		'refusing to run in the host mount namespace' \
-		'use the packaged systemd unit or invoke this helper through unshare --mount' >&2
-	exit 1
+# namespace: doing it in the host's would hide the real /run and break systemd,
+# udev and every other runtime service.
+#
+# Create that namespace here rather than asking the caller for one. The previous
+# guard compared /proc/self/ns/mnt against /proc/1/ns/mnt, and reading another
+# process's namespace link needs PTRACE_MODE_READ, so it needs CAP_SYS_PTRACE --
+# which the packaged unit deliberately does not grant. The check therefore
+# rejected the very service it was written for, and the broker could not start
+# at all. Making the namespace instead of verifying it removes the check, the
+# capability and that failure together, and turns a direct root invocation from
+# something to refuse into something that is simply safe.
+if [ -z "${HERMES_SEATD_PRIVATE_NS:-}" ]; then
+	export HERMES_SEATD_PRIVATE_NS=1
+	exec unshare --mount --propagation private -- "$0" "$@"
 fi
 
 # The packaged setup helper stores the consumer's numeric uid. Resolve it
@@ -102,9 +104,10 @@ if [ -L "$SESSION_RUN/udev" ] || { [ -e "$SESSION_RUN/udev" ] && [ ! -d "$SESSIO
 fi
 install -d -o root -g root -m 0755 -- "$SESSION_RUN/udev"
 
-# The caller must provide a private mount namespace (the packaged systemd unit
-# uses PrivateMounts=yes). Preserve udev's runtime database inside the private
-# /run so libseat/libinput retain device metadata.
+# The namespace above is already private; re-asserting it costs nothing and
+# keeps the invariant stated next to the mounts that depend on it. Preserve
+# udev's runtime database inside the private /run so libseat/libinput retain
+# device metadata.
 mount --make-rprivate /
 if [ -d /run/udev ]; then
 	mount --rbind /run/udev "$SESSION_RUN/udev"

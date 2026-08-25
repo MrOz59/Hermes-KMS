@@ -11,9 +11,11 @@ TARGET_FILES=(
 )
 BACKUP_ROOT=
 CONFIG_DIR_EXISTED=0
+DIRECT_PID=
 
 cleanup()
 {
+	[ -n "$DIRECT_PID" ] && kill "$DIRECT_PID" 2>/dev/null || true
 	systemctl stop "$UNIT" 2>/dev/null || true
 	rmdir /run/hermes-kms-seatd 2>/dev/null || true
 	if [ -n "$BACKUP_ROOT" ]; then
@@ -52,15 +54,31 @@ command -v seatd >/dev/null || {
 	exit 1
 }
 
-if direct_output="$("$REPO/scripts/hermes-kms-seatd-instance" 1 root root 2>&1)"; then
-	printf 'launcher accepted a dangerous direct host-namespace invocation\n' >&2
-	exit 1
-fi
-printf '%s\n' "$direct_output" | \
-	grep -q 'refusing to run in the host mount namespace' || {
-	printf 'launcher did not explain its host-namespace refusal\n' >&2
+# A direct invocation used to be refused, because it could have replaced the
+# host's /run. The launcher now creates its own mount namespace instead, so the
+# property to check is no longer "it says no" but "the host's /run survives".
+"$REPO/scripts/hermes-kms-seatd-instance" 8 root root \
+	>/dev/null 2>&1 &
+DIRECT_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	[ -S /run/hermes-kms-seatd/8/seatd.sock ] && break
+	sleep 0.2
+done
+[ -S /run/hermes-kms-seatd/8/seatd.sock ] || {
+	printf 'directly invoked launcher did not expose its socket\n' >&2
+	kill "$DIRECT_PID" 2>/dev/null || true
 	exit 1
 }
+# The bind over /run must have stayed inside the launcher's own namespace.
+[ -d /run/systemd ] && [ -e /run/udev ] || {
+	printf 'a direct invocation replaced the host /run\n' >&2
+	kill "$DIRECT_PID" 2>/dev/null || true
+	exit 1
+}
+kill "$DIRECT_PID" 2>/dev/null || true
+wait "$DIRECT_PID" 2>/dev/null || true
+DIRECT_PID=
+rm -rf -- /run/hermes-kms-seatd
 
 [ -d /etc/hermes-kms ] && CONFIG_DIR_EXISTED=1
 BACKUP_ROOT="$(mktemp -d /tmp/hermes-systemd-broker.XXXXXX)"

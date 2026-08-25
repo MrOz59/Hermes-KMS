@@ -28,12 +28,26 @@ subject to change between minor releases.
 
 ### Changed
 
+- The seat broker unit gains `SystemCallFilter=@system-service @mount` and
+  `ProcSubset=pid`, and narrows `RestrictNamespaces` from `yes` to `mnt` for the
+  launcher's own unshare.
+
 - `insecure_legacy_unbound_access` is load-time only (`0444`) instead of
   runtime-writable, and logs a warning when set. At `0600` root could widen
   every output's capture access on a live system mid-session, with nothing in
   the log to show for it.
 
 ### Fixed
+
+- The packaged seat broker could not start at all. Its launcher guarded against
+  a direct host-namespace invocation by comparing `/proc/self/ns/mnt` with
+  `/proc/1/ns/mnt`, and reading another process's namespace link needs
+  `PTRACE_MODE_READ` and therefore `CAP_SYS_PTRACE` — which the unit
+  deliberately does not grant, so the check rejected the very service it was
+  written for. The launcher now creates its own private mount namespace instead
+  of verifying one, which removes the check, the capability requirement and the
+  failure together, and makes a direct root invocation safe rather than merely
+  refused.
 
 - The private-seat udev rule no longer has its `TAG-="uaccess"` silently undone.
   systemd's `70-uaccess.rules` adds `TAG+="uaccess"` to every DRM card and sorts

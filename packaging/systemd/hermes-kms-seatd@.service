@@ -30,12 +30,25 @@ ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
-RestrictNamespaces=yes
+# The launcher creates its own private mount namespace instead of trusting the
+# caller for one, which is what lets the namespace check go away along with the
+# CAP_SYS_PTRACE it would otherwise need. PrivateMounts=yes below still gives it
+# one first; this only permits the second, deliberate unshare.
+RestrictNamespaces=mnt
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+# @mount is required on top of the service baseline: the launcher bind-mounts
+# the per-instance runtime directory over its private /run, which is the whole
+# mechanism behind seatd's compiled-in socket path.
+SystemCallFilter=@system-service @mount
+SystemCallErrorNumber=EPERM
+# The launcher and seatd only ever read /proc entries belonging to processes
+# (their own mount namespace link and PID 1's); nothing here needs the kernel
+# information files.
+ProcSubset=pid
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SYS_ADMIN CAP_SYS_TTY_CONFIG
 # The launcher creates/owns the common runtime root before binding the
 # instance directory over its private /run.
