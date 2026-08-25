@@ -34,6 +34,7 @@
 static int g_fd = -1;
 static atomic_int g_stop;
 static atomic_ullong g_acquires, g_acq_errors, g_flips, g_producer_errors;
+static atomic_ullong g_acq_stale;
 
 static void producer_error(const char *operation) {
 	int saved_errno = errno;
@@ -74,7 +75,18 @@ static void *acquire_thread(void *arg) {
 			  HERMES_KMS_FRAME_REQUEST_SYNC_FILE;
 		if (ioctl(g_fd, DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME, &f) < 0) {
 			// ENODATA is expected when no fb is present this instant.
-			if (errno != ENODATA) atomic_fetch_add(&g_acq_errors, 1);
+			// ESTALE is the documented answer when a flip lands
+			// between latching the metadata and installing the fds:
+			// the UAPI contract is that the consumer discards the
+			// attempt and retries, which is exactly what this loop
+			// does. Counting it as an error is what made a healthy
+			// run report ~20 failures out of eight million
+			// acquires. Track it separately so a sudden change in
+			// the race rate is still visible.
+			if (errno == ESTALE)
+				atomic_fetch_add(&g_acq_stale, 1);
+			else if (errno != ENODATA)
+				atomic_fetch_add(&g_acq_errors, 1);
 			continue;
 		}
 		atomic_fetch_add(&g_acquires, 1);
@@ -283,6 +295,7 @@ int main(int argc, char **argv) {
 
 	unsigned long long acq = atomic_load(&g_acquires);
 	unsigned long long err = atomic_load(&g_acq_errors);
+	unsigned long long stale = atomic_load(&g_acq_stale);
 	unsigned long long fl = atomic_load(&g_flips);
 	unsigned long long producer_err = atomic_load(&g_producer_errors);
 	memset(&output, 0, sizeof(output));
@@ -298,8 +311,8 @@ int main(int argc, char **argv) {
 		perror("close DRM device");
 		producer_err++;
 	}
-	printf("acquires=%llu errors=%llu flips=%llu producer_errors=%llu thread_errors=%d\n",
-	       acq, err, fl, producer_err, thread_errors);
+	printf("acquires=%llu errors=%llu stale_retries=%llu flips=%llu producer_errors=%llu thread_errors=%d\n",
+	       acq, err, stale, fl, producer_err, thread_errors);
 	// A run that never flipped did not exercise the cache transition at all.
 	int fail = (err != 0) || (acq == 0) || (fl == 0) ||
 		   (producer_err != 0) || (thread_errors != 0);
