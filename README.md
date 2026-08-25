@@ -133,6 +133,9 @@ an independently developed consumer separate from the Hermes application; see
   load. Role and session index are settable before the card exists, so a
   dynamic card lands on the same seat and broker a pool card would, and the
   `card`/`render_node` attributes report the nodes it received;
+- per-card render-node ownership (`access_uid`), so several mutually untrusted
+  consumers can each hold their own card instead of sharing the one uid the
+  packaged pool grants every Hermes node;
 - 1–8 independent DRM cards (`devices=`, default 1), each with its own
   DRM-master domain so separate compositors can back separate graphical
   sessions. The legacy `devices=N outputs=1` layout remains available;

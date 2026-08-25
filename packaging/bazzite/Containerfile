@@ -35,6 +35,7 @@ COPY packaging/modules-load.d ./packaging/modules-load.d
 COPY packaging/polkit ./packaging/polkit
 COPY packaging/systemd ./packaging/systemd
 COPY udev/72-hermes-kms-session-seats.rules ./udev/72-hermes-kms-session-seats.rules
+COPY udev/92-hermes-kms-access.rules ./udev/92-hermes-kms-access.rules
 COPY scripts/hermes-kms-seatd-instance scripts/hermes-kms-setup ./scripts/
 
 RUN --mount=type=secret,id=module_sign_key,required=false \

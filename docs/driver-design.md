@@ -228,14 +228,42 @@ mkdir  /sys/kernel/config/hermes-kms/stream-1
 echo 1 > /sys/kernel/config/hermes-kms/stream-1/outputs
 echo session > /sys/kernel/config/hermes-kms/stream-1/role
 echo 3 > /sys/kernel/config/hermes-kms/stream-1/session_index
+echo 1000 > /sys/kernel/config/hermes-kms/stream-1/access_uid
 echo 1 > /sys/kernel/config/hermes-kms/stream-1/enabled
 cat    /sys/kernel/config/hermes-kms/stream-1/card         # cardN
 cat    /sys/kernel/config/hermes-kms/stream-1/render_node  # renderDN
 rmdir  /sys/kernel/config/hermes-kms/stream-1
 ```
 
-`outputs`, `role` and `session_index` are writable only while the card is
-disabled, because the KMS object graph is built once at probe; writing them on a
+### Per-card render-node ownership
+
+The packaged pool's private cards are private from the desktop — dedicated seat,
+private broker, root-only primary node — but not from each other. The access
+rule `hermes-kms-setup` writes grants one configured uid *every* Hermes render
+node, so whoever holds that uid can open any card in the pool and claim any
+unowned output. That is fine for the single-consumer host the pool was designed
+for and wrong for anything else.
+
+`access_uid` closes it. A card created through configfs can name the uid it
+belongs to; the driver publishes that as the `hermes_kms_access_uid` sysfs
+attribute on the platform device and does not interpret it further, keeping
+device-node policy where the rest of it already lives. The packaged
+`92-hermes-kms-access.rules` turns it into ownership of that card's render
+node, and its number is deliberate: it runs after the broader `90-` grant, so a
+card that names a uid overrides it while a card that names none keeps the
+existing behaviour.
+
+The uid must resolve to a real local account. udev refuses to apply an `OWNER`
+it cannot resolve and simply moves on, which on its own would leave the node
+with whatever the broader grant had already set — so the rule denies first and
+grants second, and a card naming an account that does not exist ends up
+root-only rather than falling back to a wider grant.
+
+Primary nodes keep their role-based policy: a session card's `card*` node stays
+root-only and is reached through its private seat broker.
+
+`outputs`, `role`, `session_index` and `access_uid` are writable only while the
+card is disabled, because the KMS object graph is built once at probe; writing them on a
 live card returns `EBUSY`. Everything an identity needs is therefore settled
 before the card exists, so a dynamically created session card lands on the same
 `hermes-kms-N` seat and private broker a pool card would. A `session` role with

@@ -237,6 +237,8 @@ install-configs:
 		'$(DESTDIR)/usr/lib/modprobe.d/hermes-kms.conf'
 	install -Dm0644 udev/72-hermes-kms-session-seats.rules \
 		'$(DESTDIR)$(SYSTEM_UDEV_RULE_DIR)/72-hermes-kms-session-seats.rules'
+	install -Dm0644 udev/92-hermes-kms-access.rules \
+		'$(DESTDIR)$(SYSTEM_UDEV_RULE_DIR)/92-hermes-kms-access.rules'
 	install -Dm0755 scripts/hermes-kms-seatd-instance \
 		'$(DESTDIR)/usr/lib/hermes-kms/hermes-kms-seatd-instance'
 	install -Dm0755 scripts/hermes-kms-setup \
@@ -333,6 +335,7 @@ uninstall-runtime-udev:
 	$(RM) /usr/lib/modules-load.d/hermes-kms.conf
 	$(RM) /usr/lib/modprobe.d/hermes-kms.conf
 	$(RM) $(SYSTEM_UDEV_RULE_DIR)/72-hermes-kms-session-seats.rules
+	$(RM) $(SYSTEM_UDEV_RULE_DIR)/92-hermes-kms-access.rules
 	$(RM) $(SYSTEM_UDEV_RULE_DIR)/70-hermes-kms-session-seats.rules
 	$(RM) /usr/lib/systemd/system/hermes-kms-seatd@.service
 	$(RM) /usr/lib/hermes-kms/hermes-kms-seatd-instance

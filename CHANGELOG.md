@@ -50,6 +50,17 @@ subject to change between minor releases.
 
 ### Added
 
+- Per-card render-node ownership. A card created through configfs can name the
+  uid it belongs to with `access_uid`; the driver publishes it as the
+  `hermes_kms_access_uid` sysfs attribute and the packaged
+  `92-hermes-kms-access.rules` turns it into ownership of that card's render
+  node. Until now the access rule `hermes-kms-setup` writes granted one
+  configured uid *every* Hermes render node, so the pool's private cards were
+  private from the desktop but not from each other — whoever held that uid could
+  open any card and claim any unowned output. The rule denies before it grants,
+  so a card naming an account that does not exist ends up root-only rather than
+  falling back to the broader grant.
+
 - UAPI v13 session-capability lifecycle. `SESSION_ACCESS(ROTATE_TOKEN)` replaces
   a session's token while every existing binding keeps working, and
   `SESSION_ACCESS(REVOKE_BINDINGS)` additionally drops every bound descriptor at

@@ -245,6 +245,13 @@ struct hermes_kms_device_config {
 	unsigned int outputs;
 	unsigned int role;
 	unsigned int session_index;
+	/*
+	 * uid that should own this card's render node, or 0 for none. The
+	 * kernel neither enforces nor interprets it: it is published as a sysfs
+	 * attribute for udev to act on, which keeps device-node policy where
+	 * the rest of it already lives.
+	 */
+	unsigned int access_uid;
 };
 
 /*
@@ -424,6 +431,7 @@ struct hermes_kms_device {
 	unsigned int device_role;
 	unsigned int session_index;
 	unsigned int session_device_count;
+	unsigned int access_uid;
 	unsigned int output_count;
 	struct hermes_kms_output outputs[HERMES_KMS_MAX_OUTPUTS];
 };
@@ -3993,6 +4001,26 @@ static ssize_t hermes_kms_session_index_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(hermes_kms_session_index);
 
+/*
+ * The uid a card was created for, or nothing at all.
+ *
+ * Reads back empty rather than "0" so a udev rule can test for it with a plain
+ * "?*" match: a card that names no uid must fall through to whatever broader
+ * policy the installation already has, not be assigned to root explicitly.
+ */
+static ssize_t hermes_kms_access_uid_show(struct device *dev,
+					  struct device_attribute *attr,
+					  char *buf)
+{
+	struct hermes_kms_device *hdev = dev_get_drvdata(dev);
+
+	if (!hdev || !hdev->access_uid)
+		return sysfs_emit(buf, "\n");
+
+	return sysfs_emit(buf, "%u\n", hdev->access_uid);
+}
+static DEVICE_ATTR_RO(hermes_kms_access_uid);
+
 static void hermes_kms_free_output_identities(struct hermes_kms_device *hdev)
 {
 	unsigned int i;
@@ -4031,6 +4059,7 @@ static int hermes_kms_probe(struct platform_device *pdev)
 		hdev->device_role = config->role;
 		hdev->session_index = config->session_index;
 		hdev->session_device_count = session_devices;
+		hdev->access_uid = config->access_uid;
 	} else if (session_devices) {
 		hdev->session_device_count = session_devices;
 		hdev->device_role = hdev->device_index == 0 ?
@@ -4107,14 +4136,17 @@ static int hermes_kms_probe(struct platform_device *pdev)
 				 &dev_attr_hermes_kms_session_index);
 	if (ret)
 		goto err_remove_role;
+	ret = device_create_file(&pdev->dev, &dev_attr_hermes_kms_access_uid);
+	if (ret)
+		goto err_remove_session_index;
 
 	ret = hermes_kms_modeset_init(hdev);
 	if (ret)
-		goto err_remove_session_index;
+		goto err_remove_access_uid;
 
 	ret = drm_dev_register(drm, 0);
 	if (ret)
-		goto err_remove_session_index;
+		goto err_remove_access_uid;
 
 	atomic_inc(&hermes_kms_live_devices);
 
@@ -4148,6 +4180,8 @@ static int hermes_kms_probe(struct platform_device *pdev)
 
 	return 0;
 
+err_remove_access_uid:
+	device_remove_file(&pdev->dev, &dev_attr_hermes_kms_access_uid);
 err_remove_session_index:
 	device_remove_file(&pdev->dev,
 			   &dev_attr_hermes_kms_session_index);
@@ -4216,6 +4250,7 @@ static void hermes_kms_remove(struct platform_device *pdev)
 			drm_framebuffer_put(cursor_fb);
 	}
 
+	device_remove_file(&pdev->dev, &dev_attr_hermes_kms_access_uid);
 	device_remove_file(&pdev->dev, &dev_attr_hermes_kms_session_index);
 	device_remove_file(&pdev->dev, &dev_attr_hermes_kms_role);
 	hermes_kms_free_output_identities(hdev);
@@ -4273,6 +4308,7 @@ struct hermes_kms_config_device {
 	unsigned int outputs;
 	unsigned int role;
 	unsigned int session_index;
+	unsigned int access_uid;
 	bool enabled;
 };
 
@@ -4318,6 +4354,7 @@ static int hermes_kms_config_create(struct hermes_kms_config_device *cfg)
 		.outputs = cfg->outputs,
 		.role = cfg->role,
 		.session_index = cfg->session_index,
+		.access_uid = cfg->access_uid,
 	};
 	struct platform_device *pdev;
 	int id;
@@ -4484,6 +4521,49 @@ static ssize_t hermes_kms_config_session_index_store(struct config_item *item,
 	return ret ? ret : (ssize_t)count;
 }
 
+static ssize_t hermes_kms_config_access_uid_show(struct config_item *item,
+						char *page)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	unsigned int value;
+
+	mutex_lock(&cfg->lock);
+	value = cfg->access_uid;
+	mutex_unlock(&cfg->lock);
+
+	return sysfs_emit(page, "%u\n", value);
+}
+
+static ssize_t hermes_kms_config_access_uid_store(struct config_item *item,
+						  const char *page,
+						  size_t count)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	unsigned int value;
+	int ret;
+
+	ret = kstrtouint(page, 0, &value);
+	if (ret)
+		return ret;
+	/*
+	 * Reject (unsigned)-1, which is the "invalid uid" sentinel, and leave 0
+	 * meaning "no uid named": root already reaches every node through
+	 * CAP_DAC_OVERRIDE, so naming it would say nothing.
+	 */
+	if (value == (unsigned int)-1)
+		return -EINVAL;
+
+	mutex_lock(&cfg->lock);
+	/* udev reads the attribute when the render-node uevent fires. */
+	if (cfg->enabled)
+		ret = -EBUSY;
+	else
+		cfg->access_uid = value;
+	mutex_unlock(&cfg->lock);
+
+	return ret ? ret : (ssize_t)count;
+}
+
 static ssize_t hermes_kms_config_enabled_show(struct config_item *item,
 					      char *page)
 {
@@ -4577,6 +4657,7 @@ static ssize_t hermes_kms_config_device_index_show(struct config_item *item,
 CONFIGFS_ATTR(hermes_kms_config_, outputs);
 CONFIGFS_ATTR(hermes_kms_config_, role);
 CONFIGFS_ATTR(hermes_kms_config_, session_index);
+CONFIGFS_ATTR(hermes_kms_config_, access_uid);
 CONFIGFS_ATTR(hermes_kms_config_, enabled);
 CONFIGFS_ATTR_RO(hermes_kms_config_, card);
 CONFIGFS_ATTR_RO(hermes_kms_config_, render_node);
@@ -4586,6 +4667,7 @@ static struct configfs_attribute *hermes_kms_config_attrs[] = {
 	&hermes_kms_config_attr_outputs,
 	&hermes_kms_config_attr_role,
 	&hermes_kms_config_attr_session_index,
+	&hermes_kms_config_attr_access_uid,
 	&hermes_kms_config_attr_enabled,
 	&hermes_kms_config_attr_card,
 	&hermes_kms_config_attr_render_node,

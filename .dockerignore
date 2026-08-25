@@ -16,6 +16,7 @@
 !packaging/systemd/hermes-kms-seatd@.service
 !udev/
 !udev/72-hermes-kms-session-seats.rules
+!udev/92-hermes-kms-access.rules
 !scripts/
 !scripts/hermes-kms-seatd-instance
 !scripts/hermes-kms-setup

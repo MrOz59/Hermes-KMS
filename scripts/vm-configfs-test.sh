@@ -10,8 +10,10 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KO="$REPO/kernel/hermes-kms/hermes_kms.ko"
 CTL="$REPO/tools/hermes-kmsctl/hermes-kmsctl"
 CONFIGFS=/sys/kernel/config/hermes-kms
+ACCESS_RULE=/run/udev/rules.d/92-hermes-kms-access.rules
 FAIL=0
 LOADED_BY_TEST=0
+RULE_INSTALLED=0
 
 cleanup()
 {
@@ -24,6 +26,10 @@ cleanup()
 	done
 	if [ "$LOADED_BY_TEST" -eq 1 ]; then
 		timeout -k 1s 5s rmmod hermes_kms 2>/dev/null || true
+	fi
+	if [ "$RULE_INSTALLED" -eq 1 ]; then
+		rm -f -- "$ACCESS_RULE"
+		udevadm control --reload-rules 2>/dev/null || true
 	fi
 }
 trap cleanup EXIT
@@ -93,6 +99,10 @@ hermes_cards()
 	printf 'hermes_kms is already loaded; use a disposable VM or unload it first\n' >&2
 	exit 1
 }
+
+install -Dm0644 "$REPO/udev/92-hermes-kms-access.rules" "$ACCESS_RULE"
+RULE_INSTALLED=1
+udevadm control --reload-rules
 
 insmod "$KO" initial_enabled=0 hotplug_events=0
 LOADED_BY_TEST=1
@@ -203,6 +213,60 @@ for i in 1 2 3; do
 done
 sleep 0.5
 check "card count after removing the pool" 1 "$(hermes_cards)"
+
+# A card can name the uid that owns its render node. Without this the packaged
+# pool grants one configured uid every Hermes render node, so its private cards
+# are private from the desktop but not from each other.
+mkdir "$CONFIGFS/tenant-a"
+mkdir "$CONFIGFS/tenant-b"
+mkdir "$CONFIGFS/tenant-none"
+mkdir "$CONFIGFS/tenant-ghost"
+# bin and daemon, which exist on every distribution, stand in for two real
+# consumer accounts; udev only applies an OWNER that resolves.
+printf 1 > "$CONFIGFS/tenant-a/access_uid"
+printf 2 > "$CONFIGFS/tenant-b/access_uid"
+printf 4001 > "$CONFIGFS/tenant-ghost/access_uid"
+check "access_uid default" 0 "$(cat "$CONFIGFS/tenant-none/access_uid")"
+for name in tenant-a tenant-b tenant-none tenant-ghost; do
+	printf 1 > "$CONFIGFS/$name/enabled"
+done
+sleep 0.5
+udevadm trigger --subsystem-match=drm --action=change
+udevadm settle
+sleep 0.3
+
+check "tenant-a render node owner" 1 \
+	"$(stat -c %u "/dev/dri/$(cat "$CONFIGFS/tenant-a/render_node")")"
+check "tenant-b render node owner" 2 \
+	"$(stat -c %u "/dev/dri/$(cat "$CONFIGFS/tenant-b/render_node")")"
+check "tenant-a render node mode" 600 \
+	"$(stat -c %a "/dev/dri/$(cat "$CONFIGFS/tenant-a/render_node")")"
+# An access_uid that resolves to no account must deny rather than fall back to
+# whatever broader grant the installation already has.
+check "unresolvable access_uid denies" 0 \
+	"$(stat -c %u "/dev/dri/$(cat "$CONFIGFS/tenant-ghost/render_node")")"
+# A card that names no uid must fall through to whatever policy already exists,
+# not be assigned to root by this rule.
+NONE_OWNER="$(stat -c %u "/dev/dri/$(cat "$CONFIGFS/tenant-none/render_node")")"
+if [ "$NONE_OWNER" = 4001 ] || [ "$NONE_OWNER" = 4002 ]; then
+	printf 'FAIL: a card naming no uid picked up another card owner (%s)\n' \
+		"$NONE_OWNER" >&2
+	FAIL=1
+else
+	printf 'ok: a card naming no uid was left alone (owner %s)\n' \
+		"$NONE_OWNER"
+fi
+# The primary node keeps its role-based policy regardless.
+check "tenant-a card node owner" 0 \
+	"$(stat -c %u "/dev/dri/$(cat "$CONFIGFS/tenant-a/card")")"
+
+refuse "access_uid write" "$CONFIGFS/tenant-a/access_uid" 4003
+
+for name in tenant-a tenant-b tenant-none tenant-ghost; do
+	rmdir "$CONFIGFS/$name"
+done
+sleep 0.5
+check "card count after removing the tenants" 1 "$(hermes_cards)"
 
 rmmod hermes_kms
 LOADED_BY_TEST=0

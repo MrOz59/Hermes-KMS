@@ -1,0 +1,26 @@
+# Per-card render-node ownership for cards created through configfs.
+#
+# The packaged pool grants one configured uid every Hermes render node
+# (90-hermes-kms-user.rules, written by hermes-kms-setup), so its "private"
+# session cards are private from the desktop but not from each other: whoever
+# holds that uid can open any of them and claim any unowned output. A card
+# created through configfs can instead name the uid it belongs to, and this
+# rule turns that into actual device-node policy.
+#
+# The 92- prefix is deliberate: this has to run after the broader 90- grant so
+# a card that names a uid overrides it, while a card that names none keeps the
+# existing behaviour. Render nodes are not touched by systemd's
+# 70-uaccess.rules, which only matches card*, so nothing re-adds uaccess here.
+#
+# ATTRS selects the parent platform device, which is what lets $attr read the
+# attribute from it. Primary nodes deliberately keep their role-based policy:
+# a session card's card* node stays root-only and is reached through its
+# private seat broker.
+#
+# This is deliberately two rules. udev refuses to apply an OWNER that does not
+# resolve to an existing account -- it logs "Failed to resolve user" and moves
+# on -- so a single rule would leave the node with whatever the broader 90-
+# grant had already set. Denying first means a card whose access_uid names no
+# real account ends up root-only instead of falling back to a wider grant.
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", DEVPATH=="*/platform/hermes-kms*/drm/renderD*", ATTRS{hermes_kms_access_uid}=="?*", OWNER="root", GROUP="root", MODE="0600", TAG-="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", DEVPATH=="*/platform/hermes-kms*/drm/renderD*", ATTRS{hermes_kms_access_uid}=="?*", OWNER="$attr{hermes_kms_access_uid}"
