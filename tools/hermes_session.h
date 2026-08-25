@@ -221,6 +221,78 @@ out:
 	return ret;
 }
 
+/*
+ * Replace the session's token, keeping the session and every existing binding
+ * alive, so a token that may have been exposed stops granting new binds without
+ * interrupting a running consumer. With @revoke_bindings set, every bound
+ * descriptor also loses access at once: its next protected ioctl fails with
+ * EACCES and a blocked wait is woken to the same error. Ownership, the session
+ * ID and the scanout survive either way.
+ *
+ * The caller's own blocked WAIT_FRAME, if it has one on another thread, also
+ * fails with EACCES across a revocation and should be reissued.
+ */
+static inline int
+hermes_session_refresh_owner_token(int fd, int revoke_bindings,
+				   struct hermes_session_credentials *credentials)
+{
+	struct drm_hermes_kms_session_access request = HERMES_SESSION_ZERO_INIT;
+	int saved_errno;
+	int ret = -1;
+
+	if (!credentials) {
+		errno = EINVAL;
+		return -1;
+	}
+	hermes_session_forget(credentials);
+	if (hermes_session_require_token_uapi(fd) < 0)
+		return -1;
+	request.operation = revoke_bindings ?
+		HERMES_KMS_SESSION_ACCESS_REVOKE_BINDINGS :
+		HERMES_KMS_SESSION_ACCESS_ROTATE_TOKEN;
+	if (ioctl(fd, DRM_IOCTL_HERMES_KMS_SESSION_ACCESS, &request) < 0)
+		goto out;
+	if (!(request.result_flags &
+	      HERMES_KMS_SESSION_ACCESS_RESULT_TOKEN_VALID) ||
+	    !request.session_id || (!request.token[0] && !request.token[1]) ||
+	    request.output_index == UINT32_MAX) {
+		errno = EPROTO;
+		goto out;
+	}
+	if (revoke_bindings &&
+	    !(request.result_flags &
+	      HERMES_KMS_SESSION_ACCESS_RESULT_REVOKED)) {
+		errno = EPROTO;
+		goto out;
+	}
+
+	credentials->token[0] = request.token[0];
+	credentials->token[1] = request.token[1];
+	credentials->session_id = request.session_id;
+	credentials->output_index = request.output_index;
+	ret = 0;
+
+out:
+	saved_errno = errno;
+	hermes_session_memzero(&request, sizeof(request));
+	if (ret)
+		errno = saved_errno;
+	return ret;
+}
+
+/* Drop this descriptor's own capture authorization. */
+static inline int hermes_session_unbind(int fd)
+{
+	struct drm_hermes_kms_session_access request = HERMES_SESSION_ZERO_INIT;
+
+	if (hermes_session_require_token_uapi(fd) < 0)
+		return -1;
+	request.operation = HERMES_KMS_SESSION_ACCESS_UNBIND;
+	if (ioctl(fd, DRM_IOCTL_HERMES_KMS_SESSION_ACCESS, &request) < 0)
+		return -1;
+	return 0;
+}
+
 static inline int
 hermes_session_bind(int fd,
 		    const struct hermes_session_credentials *credentials)

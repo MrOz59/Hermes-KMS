@@ -594,6 +594,8 @@ static int print_status(int fd)
 	printf("session_id=%llu\n",
 	       (unsigned long long)status.session_id);
 	printf("owner_pid=%d\n", status.owner_pid);
+	printf("bound_fd_count=%llu\n",
+	       (unsigned long long)status.bound_fd_count);
 	printf("last_update_ns=%llu\n",
 	       (unsigned long long)status.last_update_ns);
 	printf("last_enable_ns=%llu\n",
@@ -662,7 +664,17 @@ static int print_diagnose(int fd)
 	       (unsigned long long)status.frame_sequence);
 	printf("framebuffer_id=%u\n", status.framebuffer_id);
 	printf("owner_pid=%d\n", status.owner_pid);
+	printf("bound_fd_count=%llu\n",
+	       (unsigned long long)status.bound_fd_count);
 	if (have_metrics) {
+		printf("bind_count=%llu\n",
+		       (unsigned long long)metrics.bind_count);
+		printf("bind_reject_count=%llu\n",
+		       (unsigned long long)metrics.bind_reject_count);
+		printf("binding_revoke_count=%llu\n",
+		       (unsigned long long)metrics.binding_revoke_count);
+		printf("cross_session_buffer_export_count=%llu\n",
+		       (unsigned long long)metrics.cross_session_buffer_export_count);
 		printf("hotplug_event_count=%llu\n",
 		       (unsigned long long)metrics.hotplug_event_count);
 		printf("frame_update_count=%llu\n",

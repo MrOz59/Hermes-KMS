@@ -342,13 +342,41 @@ require the owner or a valid binding. Revoking a session wakes blocked waiters,
 which revalidate authorization and return an access error instead of consuming
 state from a replacement session.
 
+UAPI v13 adds the two operations that make a session's authorization
+manageable rather than all-or-nothing. `ROTATE_TOKEN` replaces the token while
+leaving the session and every existing binding intact, so a token that may have
+been exposed stops granting new binds without interrupting the consumers already
+running. `REVOKE_BINDINGS` additionally drops every binding at once: bound
+descriptors fail their next protected ioctl with `EACCES`, blocked waits are
+woken to the same error, and ownership, the session ID and the scanout all
+survive. It rotates the token as part of the same operation, because a
+revocation that left the old token usable would let the same holder simply bind
+again. Both are owner-only and both return the new token. An owner blocked in
+its own `WAIT_FRAME` on another thread sees that wait fail with `EACCES` across
+a revocation and should reissue it.
+
+Without these, the only way to cut off a consumer was to disable the output,
+which ends the stream — so a leaked token effectively could not be answered.
+
+`GET_STATUS.bound_fd_count` reports how many descriptors are bound to the live
+session, excluding the owner, and `GET_METRICS` adds `bind_count`,
+`bind_reject_count`, `unbind_count` and `binding_revoke_count`. A broker that
+handed its capability to one worker and sees two is looking at a leak;
+`bind_reject_count` is what a brute-force attempt would move.
+
 The driver stores no executable name, Steam application ID, UID or TGID policy.
 The owner can pass the capability through any application-defined trusted IPC
 channel, including to a sandboxed or separately supervised worker. Closing the
 owner fd or disabling the output invalidates the token and all bindings from
 that session, preventing subsequent protected ioctls and subsequent fd exports.
 Linux cannot recall a DMA-BUF fd that `ACQUIRE_FRAME` already installed: its
-holder retains access to that buffer until the fd is closed. A design that gives
+holder retains access to that buffer until the fd is closed. Revocation is
+therefore about future access, and `GET_METRICS.cross_session_buffer_export_count`
+reports the case where that matters most: a frame exported while the same buffer
+object was simultaneously the scanout of another output owned by a different
+session. A compositor mirroring one buffer onto two outputs does this
+legitimately, so the driver counts it rather than refusing — but while it is
+non-zero those two consumers are not isolated from each other. A design that gives
 capture access to an untrusted process must therefore put a trusted broker/copy
 boundary in front of it or guarantee per-session BO isolation and no reuse
 across the trust boundary. Userspace must also treat the token like any other

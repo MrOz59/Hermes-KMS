@@ -28,7 +28,7 @@
 	_Static_assert((unsigned long)(name) == (value), \
 		       "unexpected encoded ioctl value: " #name)
 
-_Static_assert(HERMES_KMS_UAPI_VERSION == 12,
+_Static_assert(HERMES_KMS_UAPI_VERSION == 13,
 	       "update the ABI test when intentionally changing the UAPI");
 
 /*
@@ -98,7 +98,8 @@ ASSERT_OFFSET(struct drm_hermes_kms_status, reserved_alignment, 132);
 ASSERT_OFFSET(struct drm_hermes_kms_status, framebuffer_modifier, 136);
 ASSERT_OFFSET(struct drm_hermes_kms_status, session_id, 144);
 ASSERT_OFFSET(struct drm_hermes_kms_status, owner_pid, 152);
-ASSERT_OFFSET(struct drm_hermes_kms_status, reserved, 160);
+ASSERT_OFFSET(struct drm_hermes_kms_status, bound_fd_count, 160);
+ASSERT_OFFSET(struct drm_hermes_kms_status, reserved, 168);
 
 ASSERT_SIZE(struct drm_hermes_kms_identity, 144);
 ASSERT_OFFSET(struct drm_hermes_kms_identity, connector_id, 96);
@@ -153,7 +154,13 @@ ASSERT_SIZE(struct drm_hermes_kms_metrics, 312);
 ASSERT_OFFSET(struct drm_hermes_kms_metrics, last_update_ns, 128);
 ASSERT_OFFSET(struct drm_hermes_kms_metrics, vblank_count, 184);
 ASSERT_OFFSET(struct drm_hermes_kms_metrics, vblank_overrun_count, 192);
-ASSERT_OFFSET(struct drm_hermes_kms_metrics, reserved, 200);
+ASSERT_OFFSET(struct drm_hermes_kms_metrics, bind_count, 200);
+ASSERT_OFFSET(struct drm_hermes_kms_metrics, bind_reject_count, 208);
+ASSERT_OFFSET(struct drm_hermes_kms_metrics, unbind_count, 216);
+ASSERT_OFFSET(struct drm_hermes_kms_metrics, binding_revoke_count, 224);
+ASSERT_OFFSET(struct drm_hermes_kms_metrics,
+	      cross_session_buffer_export_count, 232);
+ASSERT_OFFSET(struct drm_hermes_kms_metrics, reserved, 240);
 
 ASSERT_SIZE(struct drm_hermes_kms_session_access, 72);
 ASSERT_OFFSET(struct drm_hermes_kms_session_access, token, 0);

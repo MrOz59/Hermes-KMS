@@ -50,6 +50,24 @@ subject to change between minor releases.
 
 ### Added
 
+- UAPI v13 session-capability lifecycle. `SESSION_ACCESS(ROTATE_TOKEN)` replaces
+  a session's token while every existing binding keeps working, and
+  `SESSION_ACCESS(REVOKE_BINDINGS)` additionally drops every bound descriptor at
+  once — failing their next protected ioctl and waking blocked waits with
+  `EACCES` — while ownership, the session ID and the scanout survive. It rotates
+  the token too, since a revocation that left the old one usable would not be
+  one. Previously the only answer to a leaked token was disabling the output,
+  which ends the stream. Announced as `HERMES_KMS_CAP_SESSION_LIFECYCLE`.
+- Binding visibility. `GET_STATUS.bound_fd_count` reports how many descriptors
+  are bound to the live session, and `GET_METRICS` adds `bind_count`,
+  `bind_reject_count`, `unbind_count` and `binding_revoke_count`. An owner that
+  authorized one worker and sees two is looking at a leak. All from reserved
+  slots, so both structures keep their size.
+- `GET_METRICS.cross_session_buffer_export_count` records frames exported while
+  the same buffer object was also another session's scanout. Mirroring makes
+  this legitimate, so it is counted rather than refused, but a DMA-BUF fd cannot
+  be recalled and those consumers are therefore not isolated from each other.
+
 - Runtime card creation and removal through configfs. `mkdir
   /sys/kernel/config/hermes-kms/<name>`, set `outputs`, `role` and
   `session_index`, then write `enabled`; `card` and `render_node` report the

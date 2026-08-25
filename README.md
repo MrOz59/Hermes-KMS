@@ -156,6 +156,9 @@ an independently developed consumer separate from the Hermes application; see
 - real `dma_resv` write fence exported as a sync_file;
 - UAPI v11 generic, opaque session-capability handoff between an output owner
   and one or more capture fds, with no application/process-name coupling;
+- token rotation and one-shot revocation of every binding, so an owner can cut
+  off a consumer without tearing down its stream, plus live binding counts and
+  bind/reject/revoke metrics;
 - fixed-layout DRM ioctls for frame acquisition, damage, synchronization and
   metrics, including vblank and late-vblank counters;
 - debugfs telemetry at `/sys/kernel/debug/dri/<n>/hermes_kms_stats`;
@@ -378,6 +381,9 @@ module, drives a `modetest` producer, and verifies the DMA-BUF/sync_file path.
 
 Other validation scripts (run as root, in the virtme-ng VM or on the host):
 
+- `scripts/vm-session-lifecycle-test.sh` — checks token rotation, one-shot
+  binding revocation, binding accounting, and that a blocked `WAIT_FRAME` on a
+  revoked descriptor is woken with `EACCES` rather than left to time out;
 - `scripts/vm-configfs-test.sh` — creates and removes cards at runtime through
   configfs alongside a static card, and verifies role/seat metadata, unique
   output naming, rejected writes on a live card, refused unload, and clean

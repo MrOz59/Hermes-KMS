@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define HERMES_KMS_UAPI_VERSION 12
+#define HERMES_KMS_UAPI_VERSION 13
 
 #define HERMES_KMS_NAME_LEN 32
 
@@ -44,6 +44,11 @@ extern "C" {
  * node the creating controller recorded, rather than by walking indices.
  */
 #define HERMES_KMS_CAP_DYNAMIC_DEVICES		(1ULL << 16)
+/*
+ * SESSION_ACCESS accepts ROTATE_TOKEN and REVOKE_BINDINGS, GET_STATUS reports
+ * bound_fd_count, and GET_METRICS reports the bind/revoke counters.
+ */
+#define HERMES_KMS_CAP_SESSION_LIFECYCLE	(1ULL << 17)
 #define HERMES_KMS_CAP_DMABUF_EXPORT_PLANNED	(1ULL << 32)
 #define HERMES_KMS_CAP_ZERO_COPY_TARGET		(1ULL << 33)
 #define HERMES_KMS_CAP_WRITEBACK_CONNECTOR	(1ULL << 34)
@@ -155,7 +160,15 @@ struct drm_hermes_kms_status {
 	/* Diagnostic only; authorization is fd/token based, never PID based. */
 	__s32 owner_pid;
 	__u32 reserved0;
-	__aligned_u64 reserved[6];
+	/*
+	 * File descriptors currently bound to this output's live session, not
+	 * counting the owner itself (uapi >= 13). Revocation and a new session
+	 * both reset it to zero, so it always describes the session reported in
+	 * session_id. An owner that handed its capability to one worker and
+	 * sees two is looking at a leak.
+	 */
+	__aligned_u64 bound_fd_count;
+	__aligned_u64 reserved[5];
 };
 
 struct drm_hermes_kms_identity {
@@ -356,7 +369,25 @@ struct drm_hermes_kms_metrics {
 	 */
 	__aligned_u64 vblank_count;
 	__aligned_u64 vblank_overrun_count;
-	__aligned_u64 reserved[14];
+	/*
+	 * Session-capability lifecycle (uapi >= 13), from further reserved
+	 * slots; the structure size is unchanged. bind_reject_count counts
+	 * BIND attempts refused for a bad token, wrong session or revoked
+	 * authorization, which is what a brute-force attempt would look like.
+	 */
+	__aligned_u64 bind_count;
+	__aligned_u64 bind_reject_count;
+	__aligned_u64 unbind_count;
+	__aligned_u64 binding_revoke_count;
+	/*
+	 * Frames exported while the same buffer object was simultaneously the
+	 * scanout of another output owned by a different session. A compositor
+	 * mirroring one buffer onto two outputs does this legitimately, so it
+	 * is not an error -- but the two consumers are then not isolated from
+	 * each other, because a DMA-BUF fd cannot be recalled.
+	 */
+	__aligned_u64 cross_session_buffer_export_count;
+	__aligned_u64 reserved[9];
 };
 
 /*
@@ -365,6 +396,20 @@ struct drm_hermes_kms_metrics {
  * GET_TOKEN input is operation=GET_TOKEN with every other field zero; it
  * operates on the fd's selected output and returns token, session_id,
  * output_index and RESULT_TOKEN_VALID. The caller must own that output.
+ *
+ * ROTATE_TOKEN and REVOKE_BINDINGS take the same input shape as GET_TOKEN and
+ * are owner-only. ROTATE_TOKEN replaces the token while leaving the session and
+ * every existing binding intact, so a token that may have been exposed stops
+ * granting new binds without interrupting the consumers already running.
+ * REVOKE_BINDINGS additionally invalidates every binding at once and sets
+ * RESULT_REVOKED: bound descriptors immediately fail protected ioctls with
+ * EACCES and blocked waits are woken to the same error, while ownership, the
+ * session ID and the scanout survive. It rotates the token as part of the same
+ * operation, since a revocation that left the old token usable would let the
+ * same holder simply bind again. Both return the new token, and both are how an
+ * owner cuts off a consumer without tearing down its stream. An owner blocked
+ * in its own WAIT_FRAME across a REVOKE_BINDINGS sees that wait fail with
+ * EACCES and should reissue it.
  *
  * BIND input is operation=BIND plus token, session_id and output_index, with
  * flags/reserved zero. On success the fd is atomically selected and authorized
@@ -386,9 +431,12 @@ struct drm_hermes_kms_metrics {
 #define HERMES_KMS_SESSION_ACCESS_GET_TOKEN	1U
 #define HERMES_KMS_SESSION_ACCESS_BIND		2U
 #define HERMES_KMS_SESSION_ACCESS_UNBIND	3U
+#define HERMES_KMS_SESSION_ACCESS_ROTATE_TOKEN	4U
+#define HERMES_KMS_SESSION_ACCESS_REVOKE_BINDINGS 5U
 
 #define HERMES_KMS_SESSION_ACCESS_RESULT_BOUND	(1U << 0)
 #define HERMES_KMS_SESSION_ACCESS_RESULT_TOKEN_VALID (1U << 1)
+#define HERMES_KMS_SESSION_ACCESS_RESULT_REVOKED (1U << 2)
 
 struct drm_hermes_kms_session_access {
 	__aligned_u64 token[2];

@@ -313,6 +313,13 @@ struct hermes_kms_output {
 	struct hermes_kms_export_cache cursor_export_cache;
 	u64 access_token[2];
 	atomic64_t authorization_generation;
+	/*
+	 * Descriptors currently bound to the live session, excluding the owner.
+	 * Reset to zero whenever a session starts or its authorization is
+	 * revoked, so it always describes the session in session_id and a
+	 * binding left over from an older one can never decrement it.
+	 */
+	u32 bound_count;
 	struct ratelimit_state output_change_ratelimit;
 	u64 session_id;
 	u64 next_session_id;
@@ -395,6 +402,12 @@ struct hermes_kms_output {
 	u64 output_disable_count;
 	u64 hotplug_event_count;
 	u64 owner_close_disconnect_count;
+	u64 bind_count;
+	u64 bind_reject_count;
+	u64 unbind_count;
+	u64 binding_revoke_count;
+	u64 cross_session_buffer_export_count;
+	bool cross_session_buffer_logged;
 	u64 last_acquire_ns;
 	u64 last_wait_start_ns;
 	u64 last_wait_end_ns;
@@ -451,6 +464,63 @@ hermes_kms_output_for_context(struct hermes_kms_device *hdev,
 		return &hdev->outputs[0];
 
 	return &hdev->outputs[context->output_index];
+}
+
+/*
+ * One descriptor's binding, captured so it can be released after the context
+ * has already been pointed somewhere else.
+ *
+ * Releasing has to take the bound output's state_lock, and a rebind publishes
+ * under the *new* output's state_lock. Holding both would let two descriptors
+ * binding in opposite directions deadlock, so the old binding is copied out
+ * first and released once every other lock is dropped.
+ */
+struct hermes_kms_binding {
+	struct hermes_kms_output *output;
+	u64 session_id;
+	u64 authorization_generation;
+};
+
+static void hermes_kms_binding_none(struct hermes_kms_binding *binding)
+{
+	binding->output = NULL;
+	binding->session_id = 0;
+	binding->authorization_generation = 0;
+}
+
+/* Caller holds context->lock. Clears the context's binding into @binding. */
+static void hermes_kms_take_binding_locked(struct hermes_kms_file *context,
+					   struct hermes_kms_binding *binding)
+{
+	binding->output = context->bound_output;
+	binding->session_id = context->bound_session_id;
+	binding->authorization_generation =
+		context->bound_authorization_generation;
+	context->bound_output = NULL;
+	context->bound_session_id = 0;
+	context->bound_authorization_generation = 0;
+}
+
+/* Caller holds no output state_lock. */
+static void
+hermes_kms_release_binding(const struct hermes_kms_binding *binding)
+{
+	struct hermes_kms_output *output = binding->output;
+
+	if (!output)
+		return;
+
+	mutex_lock(&output->state_lock);
+	/*
+	 * Only a binding that is still live is counted. A session change or a
+	 * revocation already zeroed bound_count, so decrementing for a stale
+	 * binding would wrap it.
+	 */
+	if (output->bound_count && binding->session_id == output->session_id &&
+	    binding->authorization_generation ==
+		atomic64_read(&output->authorization_generation))
+		output->bound_count--;
+	mutex_unlock(&output->state_lock);
 }
 
 static void
@@ -689,6 +759,7 @@ static void hermes_kms_clear_owner_locked(struct hermes_kms_output *output)
 	output->owner_file = NULL;
 	output->owner_pid = 0;
 	output->session_id = 0;
+	output->bound_count = 0;
 	memzero_explicit(output->access_token, sizeof(output->access_token));
 	if (had_authorization) {
 		atomic64_inc(&output->authorization_generation);
@@ -696,15 +767,22 @@ static void hermes_kms_clear_owner_locked(struct hermes_kms_output *output)
 	}
 }
 
-/* Caller holds output->state_lock. */
-static void hermes_kms_start_session_locked(struct hermes_kms_output *output,
-					    struct drm_file *file)
+/* Caller holds output->state_lock. An all-zero token would read as "unset". */
+static void hermes_kms_new_token_locked(struct hermes_kms_output *output)
 {
 	do {
 		get_random_bytes(output->access_token,
 				 sizeof(output->access_token));
 	} while (!output->access_token[0] && !output->access_token[1]);
+}
 
+/* Caller holds output->state_lock. */
+static void hermes_kms_start_session_locked(struct hermes_kms_output *output,
+					    struct drm_file *file)
+{
+	hermes_kms_new_token_locked(output);
+
+	output->bound_count = 0;
 	output->owner_file = file;
 	output->owner_pid = task_tgid_nr(current);
 	output->session_id = hermes_kms_next_session_id_locked(output);
@@ -1613,6 +1691,7 @@ static int hermes_kms_ioctl_get_caps(struct drm_device *drm, void *data,
 			      HERMES_KMS_CAP_METRICS |
 			      HERMES_KMS_CAP_MULTI_OUTPUT |
 			      HERMES_KMS_CAP_SESSION_TOKEN |
+			      HERMES_KMS_CAP_SESSION_LIFECYCLE |
 			      HERMES_KMS_CAP_CURSOR_CAPTURE |
 			      HERMES_KMS_CAP_ZERO_COPY_TARGET |
 		      HERMES_KMS_CAP_SYNC_FILE;
@@ -1643,8 +1722,11 @@ static int hermes_kms_ioctl_select_output(struct drm_device *drm, void *data,
 	struct hermes_kms_output *current_output;
 	struct hermes_kms_output *old_bound;
 	struct hermes_kms_output *selected;
+	struct hermes_kms_binding previous;
 	unsigned int output_index = request->output_index;
 	int ret = 0;
+
+	hermes_kms_binding_none(&previous);
 
 	if (!context)
 		return -EINVAL;
@@ -1682,11 +1764,9 @@ static int hermes_kms_ioctl_select_output(struct drm_device *drm, void *data,
 	if (ret)
 		goto unlock_context;
 
-	old_bound = context->bound_output;
+	hermes_kms_take_binding_locked(context, &previous);
+	old_bound = previous.output;
 	context->output_index = output_index;
-	context->bound_output = NULL;
-	context->bound_session_id = 0;
-	context->bound_authorization_generation = 0;
 	hermes_kms_reset_acquire_history_locked(context);
 	atomic64_inc(&context->binding_generation);
 	/* A waiter may be authorized as the owner without bound_output set. */
@@ -1702,6 +1782,7 @@ fill_response:
 	strscpy(request->output_name, selected->output_name,
 		sizeof(request->output_name));
 	mutex_unlock(&context->lock);
+	hermes_kms_release_binding(&previous);
 	return 0;
 
 unlock_current:
@@ -1776,6 +1857,7 @@ static int hermes_kms_ioctl_get_status(struct drm_device *drm, void *data,
 	status->framebuffer_modifier = output->framebuffer_modifier;
 	status->session_id = output->session_id;
 	status->owner_pid = output->owner_pid ? output->owner_pid : -1;
+	status->bound_fd_count = output->bound_count;
 	if (output->framebuffer_id)
 		status->flags |= HERMES_KMS_STATUS_FRAME_VALID;
 	if (output->framebuffer)
@@ -1834,6 +1916,12 @@ static int hermes_kms_ioctl_get_metrics(struct drm_device *drm, void *data,
 	metrics->hotplug_event_count = output->hotplug_event_count;
 	metrics->owner_close_disconnect_count =
 		output->owner_close_disconnect_count;
+	metrics->bind_count = output->bind_count;
+	metrics->bind_reject_count = output->bind_reject_count;
+	metrics->unbind_count = output->unbind_count;
+	metrics->binding_revoke_count = output->binding_revoke_count;
+	metrics->cross_session_buffer_export_count =
+		output->cross_session_buffer_export_count;
 	metrics->last_update_ns = output->last_update_ns;
 	metrics->last_acquire_ns = output->last_acquire_ns;
 	metrics->last_wait_start_ns = output->last_wait_start_ns;
@@ -2395,6 +2483,53 @@ out_unlock:
 	return ret;
 }
 
+/*
+ * Report whether @fb's buffer object is, at this moment, also the scanout of
+ * another output on this device owned by a different session.
+ *
+ * This deliberately does not refuse the export. A compositor mirroring one
+ * buffer onto two outputs does exactly this, legitimately, and refusing would
+ * break mirrored capture. What it can do is record that the two consumers are
+ * not isolated from each other: Linux cannot recall a DMA-BUF fd, so whoever
+ * holds one for this buffer keeps reading it after the compositor moves the
+ * buffer to the other session's output.
+ *
+ * Sessions are told apart by owner file rather than session_id, because
+ * session_id is a per-output counter and repeats across outputs. Each output's
+ * state_lock is taken on its own and never nested, since two concurrent
+ * acquires on different outputs would otherwise be able to take them in
+ * opposite orders.
+ */
+static bool hermes_kms_buffer_shared_with_other_session(
+	struct hermes_kms_output *output, struct drm_framebuffer *fb,
+	struct drm_file *owner_file)
+{
+	struct hermes_kms_device *hdev = output->hdev;
+	struct drm_gem_object *obj;
+	unsigned int i;
+	bool shared = false;
+
+	obj = drm_gem_fb_get_obj(fb, 0);
+	if (!obj)
+		return false;
+
+	for (i = 0; i < hdev->output_count && !shared; i++) {
+		struct hermes_kms_output *other = &hdev->outputs[i];
+
+		if (other == output)
+			continue;
+
+		mutex_lock(&other->state_lock);
+		if (other->framebuffer && other->owner_file &&
+		    other->owner_file != owner_file)
+			shared = drm_gem_fb_get_obj(other->framebuffer, 0) ==
+				 obj;
+		mutex_unlock(&other->state_lock);
+	}
+
+	return shared;
+}
+
 static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 					  struct drm_file *file)
 {
@@ -2408,7 +2543,9 @@ static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 	u64 authorization_generation;
 	u64 sequence;
 	u64 session_id;
+	struct drm_file *owner_file;
 	bool damage_valid = false;
+	bool log_shared = false;
 	int ret = 0;
 
 	if (requested_flags & ~(HERMES_KMS_FRAME_REQUEST_DMABUF |
@@ -2459,6 +2596,7 @@ static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 		atomic64_read(&output->authorization_generation);
 	sequence = atomic64_read(&output->frame_sequence);
 	session_id = output->session_id;
+	owner_file = output->owner_file;
 	frame->flags = HERMES_KMS_FRAME_METADATA_VALID;
 	frame->sequence = sequence;
 	frame->timestamp_ns = output->last_update_ns;
@@ -2492,6 +2630,25 @@ static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 	if (damage_valid)
 		frame->flags |= HERMES_KMS_FRAME_DAMAGE_VALID;
 	mutex_unlock(&output->state_lock);
+
+	/*
+	 * Only meaningful once this device has more than one output; a single
+	 * output has nobody to share a buffer with.
+	 */
+	if ((requested_flags & HERMES_KMS_FRAME_REQUEST_DMABUF) &&
+	    hdev->output_count > 1 &&
+	    hermes_kms_buffer_shared_with_other_session(output, fb,
+							owner_file)) {
+		mutex_lock(&output->state_lock);
+		output->cross_session_buffer_export_count++;
+		log_shared = !output->cross_session_buffer_logged;
+		output->cross_session_buffer_logged = true;
+		mutex_unlock(&output->state_lock);
+		if (log_shared)
+			drm_info(drm,
+				 "%s scanout buffer is also another session's scanout; a DMA-BUF exported here cannot be recalled, so those consumers are not isolated from each other\n",
+				 output->output_name);
+	}
 
 	if (requested_flags & HERMES_KMS_FRAME_REQUEST_DMABUF) {
 		ret = hermes_kms_export_frame_dmabufs(output, fb,
@@ -2975,11 +3132,15 @@ static int hermes_kms_ioctl_session_access(struct drm_device *drm, void *data,
 	struct hermes_kms_output *current_output;
 	struct hermes_kms_output *old_bound;
 	struct hermes_kms_output *output;
+	struct hermes_kms_binding previous;
 	u64 token[2];
 	u64 session_id;
 	u32 operation = request->operation;
 	u32 output_index = request->output_index;
+	bool revoked = false;
 	int ret = 0;
+
+	hermes_kms_binding_none(&previous);
 
 	if (!context)
 		return -EINVAL;
@@ -3046,6 +3207,7 @@ get_token_unlock:
 		if (!output->owner_file || !output->output_enabled ||
 		    output->session_id != session_id ||
 		    crypto_memneq(token, output->access_token, sizeof(token))) {
+			output->bind_reject_count++;
 			ret = -EACCES;
 			goto bind_unlock_output;
 		}
@@ -3055,13 +3217,20 @@ get_token_unlock:
 		 * still locked. This is the BIND linearization point: revocation can
 		 * happen wholly before it (and fail) or after it (and invalidate the
 		 * recorded generation), never in between validation and publication.
+		 *
+		 * The previous binding is only copied out here; releasing it needs
+		 * its own output's state_lock, which cannot be taken while this one
+		 * is held.
 		 */
-		old_bound = context->bound_output;
+		hermes_kms_take_binding_locked(context, &previous);
+		old_bound = previous.output;
 		context->output_index = output_index;
 		context->bound_output = output;
 		context->bound_session_id = session_id;
 		context->bound_authorization_generation =
 			atomic64_read(&output->authorization_generation);
+		output->bound_count++;
+		output->bind_count++;
 		hermes_kms_reset_acquire_history_locked(context);
 		atomic64_inc(&context->binding_generation);
 bind_unlock_output:
@@ -3072,6 +3241,7 @@ bind_unlock_context:
 			memzero_explicit(token, sizeof(token));
 			return ret;
 		}
+		hermes_kms_release_binding(&previous);
 		/* Wake owner/unbound waiters too; they may have no old_bound. */
 		wake_up_interruptible(&current_output->frame_wait);
 		if (old_bound && old_bound != current_output)
@@ -3093,14 +3263,18 @@ bind_unlock_context:
 
 		mutex_lock(&context->lock);
 		current_output = hermes_kms_output_for_context(hdev, context);
-		old_bound = context->bound_output;
+		hermes_kms_take_binding_locked(context, &previous);
+		old_bound = previous.output;
 		output_index = context->output_index;
-		context->bound_output = NULL;
-		context->bound_session_id = 0;
-		context->bound_authorization_generation = 0;
 		hermes_kms_reset_acquire_history_locked(context);
 		atomic64_inc(&context->binding_generation);
 		mutex_unlock(&context->lock);
+		if (old_bound) {
+			hermes_kms_release_binding(&previous);
+			mutex_lock(&old_bound->state_lock);
+			old_bound->unbind_count++;
+			mutex_unlock(&old_bound->state_lock);
+		}
 		/* The owner is authorized without bound_output, but may be waiting. */
 		wake_up_interruptible(&current_output->frame_wait);
 		if (old_bound && old_bound != current_output)
@@ -3109,6 +3283,62 @@ bind_unlock_context:
 		memset(request, 0, sizeof(*request));
 		request->operation = operation;
 		request->output_index = output_index;
+		return 0;
+
+	case HERMES_KMS_SESSION_ACCESS_ROTATE_TOKEN:
+	case HERMES_KMS_SESSION_ACCESS_REVOKE_BINDINGS:
+		if (request->token[0] || request->token[1] ||
+		    request->session_id || request->output_index)
+			return -EINVAL;
+
+		mutex_lock(&context->lock);
+		output = hermes_kms_output_for_context(hdev, context);
+		mutex_lock(&output->state_lock);
+		if (output->owner_file != file || !output->session_id) {
+			ret = -EACCES;
+			goto rotate_unlock;
+		}
+
+		/*
+		 * Rotating alone stops the old token from granting new binds while
+		 * the consumers already running keep their access. Revoking has to
+		 * rotate as well: bumping the generation without replacing the token
+		 * would let the same holder bind again immediately, which is not a
+		 * revocation at all.
+		 */
+		hermes_kms_new_token_locked(output);
+		if (operation == HERMES_KMS_SESSION_ACCESS_REVOKE_BINDINGS) {
+			output->bound_count = 0;
+			output->binding_revoke_count++;
+			atomic64_inc(&output->authorization_generation);
+			revoked = true;
+		}
+		token[0] = output->access_token[0];
+		token[1] = output->access_token[1];
+		session_id = output->session_id;
+		output_index = output->index;
+rotate_unlock:
+		mutex_unlock(&output->state_lock);
+		mutex_unlock(&context->lock);
+		if (ret)
+			return ret;
+
+		/* Blocked waiters revalidate and fail with EACCES. */
+		if (revoked)
+			wake_up_interruptible(&output->frame_wait);
+
+		memset(request, 0, sizeof(*request));
+		request->token[0] = token[0];
+		request->token[1] = token[1];
+		request->session_id = session_id;
+		request->operation = operation;
+		request->output_index = output_index;
+		request->result_flags =
+			HERMES_KMS_SESSION_ACCESS_RESULT_TOKEN_VALID;
+		if (revoked)
+			request->result_flags |=
+				HERMES_KMS_SESSION_ACCESS_RESULT_REVOKED;
+		memzero_explicit(token, sizeof(token));
 		return 0;
 	default:
 		return -EINVAL;
@@ -3134,7 +3364,20 @@ static int hermes_kms_open(struct drm_device *drm, struct drm_file *file)
 static void hermes_kms_postclose(struct drm_device *drm, struct drm_file *file)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
+	struct hermes_kms_file *context = file->driver_priv;
+	struct hermes_kms_binding binding;
 	unsigned int i;
+
+	/*
+	 * Nothing else can reach this context any more -- an in-flight ioctl
+	 * holds a reference to the file -- so its binding can be taken without
+	 * context->lock. Do it before the owner loop, while no state_lock is
+	 * held.
+	 */
+	hermes_kms_binding_none(&binding);
+	if (context)
+		hermes_kms_take_binding_locked(context, &binding);
+	hermes_kms_release_binding(&binding);
 
 	for (i = 0; i < hdev->output_count; i++) {
 		struct hermes_kms_output *output = &hdev->outputs[i];
@@ -3393,6 +3636,18 @@ static int hermes_kms_stats_show(struct seq_file *m, void *data)
 		seq_printf(m, "owner_pid:             %d\n", output->owner_pid);
 		seq_printf(m, "session_id:            %llu\n",
 			   output->session_id);
+		seq_printf(m, "bound_fd_count:        %u\n",
+			   output->bound_count);
+		seq_printf(m, "bind_count:            %llu\n",
+			   output->bind_count);
+		seq_printf(m, "bind_reject_count:     %llu\n",
+			   output->bind_reject_count);
+		seq_printf(m, "unbind_count:          %llu\n",
+			   output->unbind_count);
+		seq_printf(m, "binding_revoke_count:  %llu\n",
+			   output->binding_revoke_count);
+		seq_printf(m, "cross_session_buffers: %llu\n",
+			   output->cross_session_buffer_export_count);
 		seq_printf(m, "requested_mode:        %ux%u@%u\n",
 			   output->requested_width, output->requested_height,
 			   output->requested_refresh_hz);
