@@ -389,8 +389,9 @@ hermes_session_random_bytes(void *buffer, size_t length)
 
 /* Atomically publish a mode-0600 credential without replacing any file. */
 static inline int
-hermes_session_write_file(const char *path,
-			  const struct hermes_session_credentials *credentials)
+hermes_session_write_file_internal(
+	const char *path,
+	const struct hermes_session_credentials *credentials, int replace)
 {
 	char line[160] = {0};
 	char *temporary = NULL;
@@ -459,9 +460,19 @@ hermes_session_write_file(const char *path,
 	}
 	fd = -1;
 
-	/* link() is an atomic no-replace publication on the same filesystem. */
-	if (link(temporary, path) < 0)
+	/*
+	 * link() is an atomic no-replace publication on the same filesystem;
+	 * rename() is the atomic replacing form, for rotating the credential in
+	 * a file a consumer may already be reading. Either way no reader ever
+	 * sees a partially written line.
+	 */
+	if (replace) {
+		if (rename(temporary, path) < 0)
+			goto out;
+		temporary[0] = '\0';
+	} else if (link(temporary, path) < 0) {
 		goto out;
+	}
 	ret = 0;
 
 out:
@@ -469,7 +480,9 @@ out:
 	if (fd >= 0)
 		close(fd);
 	if (temporary) {
-		unlink(temporary);
+		/* A successful rename already consumed the temporary name. */
+		if (temporary[0])
+			unlink(temporary);
 		free(temporary);
 	}
 	hermes_session_memzero(line, sizeof(line));
@@ -477,6 +490,26 @@ out:
 	if (ret)
 		errno = saved_errno;
 	return ret;
+}
+
+/* Publish a credential, refusing to replace an existing file. */
+static inline int
+hermes_session_write_file(const char *path,
+			  const struct hermes_session_credentials *credentials)
+{
+	return hermes_session_write_file_internal(path, credentials, 0);
+}
+
+/*
+ * Replace a published credential in place, for republishing after a token
+ * rotation. The file a consumer may be reading is swapped atomically, so it
+ * either sees the old credential or the new one and never a torn line.
+ */
+static inline int
+hermes_session_replace_file(
+	const char *path, const struct hermes_session_credentials *credentials)
+{
+	return hermes_session_write_file_internal(path, credentials, 1);
 }
 
 static inline int

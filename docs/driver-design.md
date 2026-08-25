@@ -421,6 +421,27 @@ file format is not part of the kernel UAPI and is not the recommended transport
 for applications; production integrations should normally keep the token in
 memory and use their existing trusted IPC.
 
+Rotating and revoking are only reachable from inside the process holding the
+owner's descriptor, because that descriptor *is* the authorization — a second
+`hermes-kmsctl` invocation opens a different `drm_file` and gets `EACCES`. An
+application already holds it and calls `hermes_session_refresh_owner_token()`
+directly. For the command line, `hermes-kmsctl hold --control PATH` creates a
+private FIFO and reads `rotate` and `revoke` from it:
+
+```bash
+hermes-kmsctl --session-file s.auth --control hermes.ctl hold 1920x1080@60 &
+echo rotate > hermes.ctl   # retire the token, republish s.auth, consumers stay
+echo revoke > hermes.ctl   # drop every binding and remove s.auth
+```
+
+A FIFO rather than standard input: a backgrounded holder reading the terminal
+would take `SIGTTIN` and stop, and one in a pipeline would consume input meant
+for something else. It is opened `O_RDWR` so the reader survives writers coming
+and going. `rotate` replaces the session file atomically, since consumers keep
+running and may be reading it; `revoke` removes it instead, because leaving a
+working credential behind would undo what was just asked for. A later `rotate`
+republishes.
+
 ## Frame and scanout tracking
 
 The driver latches the current primary scanout framebuffer and its metadata as

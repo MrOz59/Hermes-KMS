@@ -11,12 +11,20 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KO="$REPO/kernel/hermes-kms/hermes_kms.ko"
 SRC="$REPO/scripts/hermes-session-lifecycle.c"
 TEST_TMP="$(mktemp -d /tmp/hermes-session-lifecycle.XXXXXX)"
+CTL="$REPO/tools/hermes-kmsctl/hermes-kmsctl"
 BIN="$TEST_TMP/hermes-session-lifecycle"
+SESSION_FILE="$TEST_TMP/session.auth"
+CONTROL_FIFO="$TEST_TMP/control.fifo"
+HOLD_PID=
 FAIL=0
 LOADED_BY_TEST=0
 
 cleanup()
 {
+	if [ -n "$HOLD_PID" ]; then
+		kill -TERM "$HOLD_PID" 2>/dev/null || true
+		wait "$HOLD_PID" 2>/dev/null || true
+	fi
 	if [ "$LOADED_BY_TEST" -eq 1 ]; then
 		timeout -k 1s 5s rmmod hermes_kms 2>/dev/null || true
 	fi
@@ -48,6 +56,128 @@ LOADED_BY_TEST=1
 sleep 0.5
 
 "$BIN" || FAIL=1
+
+# The same operations through the command-line holder. The owner's
+# authorization lives in the descriptor that claimed the output, so a second
+# hermes-kmsctl invocation can never rotate or revoke on its behalf; the holder
+# reads the commands from its own control FIFO instead.
+if [ ! -x "$CTL" ]; then
+	printf 'control tool not built, skipping the CLI path: %s\n' "$CTL" >&2
+else
+	check()
+	{
+		if [ "$3" != "$2" ]; then
+			printf 'FAIL: %s expected %s, got %s\n' \
+				"$1" "$2" "${3:-<empty>}" >&2
+			FAIL=1
+		else
+			printf 'ok: %s\n' "$1"
+		fi
+	}
+
+	"$CTL" --session-file "$SESSION_FILE" --control "$CONTROL_FIFO" \
+		hold 1280x720@60 >"$TEST_TMP/hold.log" 2>&1 &
+	HOLD_PID=$!
+	for _ in $(seq 1 50); do
+		[ -s "$SESSION_FILE" ] && [ -p "$CONTROL_FIFO" ] && break
+		sleep 0.1
+	done
+	if [ ! -s "$SESSION_FILE" ] || [ ! -p "$CONTROL_FIFO" ]; then
+		printf 'FAIL: holder did not publish its session file and control FIFO\n'
+		printf '### holder log:\n'
+		cat "$TEST_TMP/hold.log" || true
+		printf '### session file: %s control fifo: %s\n' \
+			"$(ls -la "$SESSION_FILE" 2>&1)" \
+			"$(ls -la "$CONTROL_FIFO" 2>&1)"
+		FAIL=1
+	else
+		printf 'ok: holder published a session file and a control FIFO\n'
+		check "control FIFO mode" 600 "$(stat -c %a "$CONTROL_FIFO")"
+
+		cp -- "$SESSION_FILE" "$TEST_TMP/first.auth"
+		chmod 0600 "$TEST_TMP/first.auth"
+		if "$CTL" --session-file "$SESSION_FILE" status >/dev/null 2>&1; then
+			printf 'ok: the published credential binds\n'
+		else
+			printf 'FAIL: the published credential did not bind\n' >&2
+			FAIL=1
+		fi
+
+		printf 'rotate\n' > "$CONTROL_FIFO"
+		for _ in $(seq 1 50); do
+			cmp -s "$TEST_TMP/first.auth" "$SESSION_FILE" || break
+			sleep 0.1
+		done
+		if cmp -s "$TEST_TMP/first.auth" "$SESSION_FILE"; then
+			printf 'FAIL: rotate did not republish the session file\n' >&2
+			FAIL=1
+		else
+			printf 'ok: rotate republished the session file\n'
+		fi
+		cp -- "$SESSION_FILE" "$TEST_TMP/second.auth"
+		chmod 0600 "$TEST_TMP/second.auth"
+		if "$CTL" --session-file "$TEST_TMP/first.auth" status \
+			>/dev/null 2>&1; then
+			printf 'FAIL: the retired credential still binds\n' >&2
+			FAIL=1
+		else
+			printf 'ok: the retired credential no longer binds\n'
+		fi
+		if "$CTL" --session-file "$SESSION_FILE" status >/dev/null 2>&1; then
+			printf 'ok: the rotated credential binds\n'
+		else
+			printf 'FAIL: the rotated credential did not bind\n' >&2
+			FAIL=1
+		fi
+
+		printf 'revoke\n' > "$CONTROL_FIFO"
+		for _ in $(seq 1 50); do
+			[ -e "$SESSION_FILE" ] || break
+			sleep 0.1
+		done
+		if [ -e "$SESSION_FILE" ]; then
+			printf 'FAIL: revoke left a working credential published\n' >&2
+			FAIL=1
+		else
+			printf 'ok: revoke removed the published credential\n'
+		fi
+		if "$CTL" --session-file "$TEST_TMP/second.auth" status \
+			>/dev/null 2>&1; then
+			printf 'FAIL: the pre-revocation credential still binds\n' >&2
+			FAIL=1
+		else
+			printf 'ok: the pre-revocation credential no longer binds\n'
+		fi
+
+		# A misplaced option must be reported, not dropped.
+		if "$CTL" hold 1280x720@60 --session-file "$TEST_TMP/x.auth" \
+			>/dev/null 2>&1; then
+			printf 'FAIL: an option after the command was accepted\n' >&2
+			FAIL=1
+		else
+			printf 'ok: an option after the command is rejected\n'
+		fi
+
+		# An unknown command must be reported, not acted on.
+		printf 'wat\n' > "$CONTROL_FIFO"
+		sleep 0.3
+		if kill -0 "$HOLD_PID" 2>/dev/null; then
+			printf 'ok: the holder survived an unknown command\n'
+		else
+			printf 'FAIL: the holder exited on an unknown command\n' >&2
+			FAIL=1
+		fi
+	fi
+
+	kill -TERM "$HOLD_PID" 2>/dev/null || true
+	wait "$HOLD_PID" 2>/dev/null || true
+	HOLD_PID=
+	[ -e "$CONTROL_FIFO" ] && {
+		printf 'FAIL: the holder left its control FIFO behind\n' >&2
+		FAIL=1
+	}
+	[ -e "$CONTROL_FIFO" ] || printf 'ok: the holder removed its control FIFO\n'
+fi
 
 SPLAT="$(dmesg | tail -n +"$((DMESG_MARK + 1))" |
 	grep -iE 'BUG:|WARNING:|use-after-free|general protection' || true)"

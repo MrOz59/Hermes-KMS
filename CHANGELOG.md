@@ -39,6 +39,10 @@ subject to change between minor releases.
 
 ### Fixed
 
+- `hermes-kmsctl` no longer ignores arguments a command does not take. Options
+  have to precede the command, so `hold 1280x720@60 --session-file X` held an
+  output and published nothing, with no sign the flag had been dropped.
+
 - The packaged seat broker could not start at all. Its launcher guarded against
   a direct host-namespace invocation by comparing `/proc/self/ns/mnt` with
   `/proc/1/ns/mnt`, and reading another process's namespace link needs
@@ -63,6 +67,15 @@ subject to change between minor releases.
   carried no signal. Stale retries are now reported separately.
 
 ### Added
+
+- `hermes-kmsctl hold --control PATH` creates a private FIFO and reads `rotate`
+  and `revoke` from it, which is the only way the command line can reach those
+  operations: the owner's authorization is the descriptor that claimed the
+  output, so a second invocation opens a different `drm_file` and gets `EACCES`.
+  `rotate` republishes `--session-file` atomically and leaves running consumers
+  bound; `revoke` drops every binding and removes the file. `hermes_session.h`
+  gains `hermes_session_replace_file()`, `hermes_session_refresh_owner_token()`
+  and `hermes_session_unbind()`.
 
 - Per-card render-node ownership. A card created through configfs can name the
   uid it belongs to with `access_uid`; the driver publishes it as the

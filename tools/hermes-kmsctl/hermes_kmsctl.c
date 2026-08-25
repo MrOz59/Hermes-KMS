@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#define _GNU_SOURCE
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -11,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <drm/hermes_kms_drm.h>
@@ -33,8 +37,12 @@ static void usage(const char *argv0)
 		"  %s [OPTIONS] enable [WIDTHxHEIGHT@HZ]  (holds until Ctrl+C)\n"
 		"  %s [OPTIONS] hold [WIDTHxHEIGHT@HZ]\n"
 		"  %s [OPTIONS] disable\n"
-		"Options: --device PATH --output N --session-file PATH --verbose\n"
-		"For hold/enable, --session-file is created mode 0600; other commands read and bind it.\n",
+		"Options: --device PATH --output N --session-file PATH --control PATH --verbose\n"
+		"For hold/enable, --session-file is created mode 0600; other commands read and bind it.\n"
+		"--control PATH creates a private FIFO that hold/enable read commands from:\n"
+		"  rotate  retire the current token, leaving running consumers bound,\n"
+		"          and republish --session-file with the new one\n"
+		"  revoke  drop every bound descriptor at once and remove --session-file\n",
 		argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
 		argv0, argv0, argv0, argv0);
 }
@@ -778,8 +786,181 @@ static void drop_master_if_held(int fd, bool verbose)
 		fprintf(stderr, "DROP_MASTER ignored: %s\n", strerror(errno));
 }
 
+/*
+ * A private FIFO the holder reads commands from.
+ *
+ * The owner's authorization lives in the open file description that claimed the
+ * output, not in the process or the uid, so a second hermes-kmsctl invocation
+ * can never rotate or revoke on its behalf -- the driver compares owner_file
+ * against the caller's drm_file and answers EACCES. The operation is only
+ * reachable from inside the process holding that descriptor, which is this one.
+ *
+ * A FIFO rather than stdin: a backgrounded holder reading the terminal would
+ * take SIGTTIN and stop, and a holder in a pipeline would eat input meant for
+ * something else. Opening it O_RDWR keeps the reader alive across writers
+ * coming and going, so `echo rotate > fifo` works any number of times.
+ *
+ * This channel revokes capture access, so it is held to the same standard as
+ * the session file: a private FIFO owned by this uid, and nothing else.
+ */
+/*
+ * Reject arguments a command does not take.
+ *
+ * Silently ignoring them turns a misplaced option into a run that looks
+ * successful while doing something else: options have to precede the command,
+ * so `hold 1280x720@60 --session-file X` held an output and published nothing,
+ * with no indication that the flag had been dropped.
+ */
+static int reject_extra_arguments(const char *command, int count, char **values)
+{
+	if (count <= 0)
+		return 0;
+
+	fprintf(stderr, "%s does not take '%s'", command, values[0]);
+	if (values[0][0] == '-')
+		fprintf(stderr, "; options must come before the command");
+	fprintf(stderr, "\n");
+	return 2;
+}
+
+static int open_control_fifo(const char *path)
+{
+	struct stat status;
+	int fd;
+
+	if (mkfifo(path, S_IRUSR | S_IWUSR) < 0 && errno != EEXIST)
+		return -1;
+
+	fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return -1;
+	if (fstat(fd, &status) < 0 || !S_ISFIFO(status.st_mode) ||
+	    status.st_uid != geteuid() || (status.st_mode & 077) != 0) {
+		close(fd);
+		errno = EACCES;
+		return -1;
+	}
+
+	return fd;
+}
+
+/*
+ * Republish after a rotation, or clear after a revocation.
+ *
+ * Rotation keeps running consumers bound, so the file is replaced in place and
+ * a reader sees either credential but never a torn one. Revocation cuts
+ * everyone off, so the file is removed instead: leaving a working credential
+ * behind would undo the thing that was just asked for. A later rotate
+ * republishes.
+ */
+static int update_session_file(const char *session_file,
+			       const struct hermes_session_credentials *credentials,
+			       bool revoked)
+{
+	if (!session_file)
+		return 0;
+
+	if (revoked) {
+		if (unlink(session_file) < 0 && errno != ENOENT) {
+			fprintf(stderr, "Could not remove session file %s: %s\n",
+				session_file, strerror(errno));
+			return -1;
+		}
+		printf("session_file_removed=%s\n", session_file);
+		fflush(stdout);
+		return 0;
+	}
+
+	if (hermes_session_replace_file(session_file, credentials) < 0) {
+		fprintf(stderr, "Could not republish session file %s: %s\n",
+			session_file, strerror(errno));
+		return -1;
+	}
+	printf("session_file_rotated=%s\n", session_file);
+	fflush(stdout);
+	return 0;
+}
+
+static void run_control_command(int fd, const char *command,
+				const char *session_file)
+{
+	struct hermes_session_credentials credentials;
+	bool revoke;
+
+	if (!*command)
+		return;
+	if (strcmp(command, "rotate") == 0) {
+		revoke = false;
+	} else if (strcmp(command, "revoke") == 0) {
+		revoke = true;
+	} else {
+		fprintf(stderr, "Unknown control command '%s'; expected rotate or revoke\n",
+			command);
+		return;
+	}
+
+	memset(&credentials, 0, sizeof(credentials));
+	if (hermes_session_refresh_owner_token(fd, revoke, &credentials) < 0) {
+		fprintf(stderr, "SESSION_ACCESS %s: %s\n",
+			revoke ? "REVOKE_BINDINGS" : "ROTATE_TOKEN",
+			strerror(errno));
+		return;
+	}
+	printf("%s session=%llu\n", revoke ? "revoked" : "rotated",
+	       (unsigned long long)credentials.session_id);
+	fflush(stdout);
+	update_session_file(session_file, &credentials, revoke);
+	hermes_session_forget(&credentials);
+}
+
+/*
+ * Drain whatever whole lines have arrived. A line longer than the buffer is a
+ * malformed command, not a command to guess at, so it is discarded rather than
+ * split into two.
+ */
+static void drain_control_fifo(int control_fd, int fd, const char *session_file)
+{
+	static char pending[256];
+	static size_t used;
+	static bool overlong;
+	char buffer[256];
+	ssize_t got;
+	size_t i;
+
+	for (;;) {
+		got = read(control_fd, buffer, sizeof(buffer));
+		if (got < 0) {
+			if (errno == EINTR)
+				continue;
+			return;
+		}
+		if (got == 0)
+			return;
+
+		for (i = 0; i < (size_t)got; i++) {
+			if (buffer[i] != '\n') {
+				if (used < sizeof(pending) - 1)
+					pending[used++] = buffer[i];
+				else
+					overlong = true;
+				continue;
+			}
+			pending[used] = '\0';
+			if (overlong)
+				fprintf(stderr, "Discarding overlong control command\n");
+			else
+				run_control_command(fd, pending, session_file);
+			used = 0;
+			overlong = false;
+		}
+		if ((size_t)got < sizeof(buffer))
+			return;
+	}
+}
+
 static int hold_output(int fd, const char *mode, bool verbose,
-			       const char *session_file)
+			       const char *session_file,
+			       const char *control_path)
 {
 	struct hermes_session_credentials credentials;
 	struct sigaction action, old_int, old_term;
@@ -788,6 +969,8 @@ static int hold_output(int fd, const char *mode, bool verbose,
 	bool term_handler_installed = false;
 	bool output_enabled = false;
 	bool session_published = false;
+	bool control_created = false;
+	int control_fd = -1;
 	int cleanup_ret;
 	int ret = 1;
 
@@ -812,6 +995,17 @@ static int hold_output(int fd, const char *mode, bool verbose,
 		goto out_restore;
 	}
 	term_handler_installed = true;
+
+	if (control_path) {
+		control_fd = open_control_fifo(control_path);
+		if (control_fd < 0) {
+			fprintf(stderr, "Could not open control FIFO %s: %s\n",
+				control_path, strerror(errno));
+			ret = 1;
+			goto out_restore;
+		}
+		control_created = true;
+	}
 
 	ret = set_output(fd, true, mode);
 	if (ret)
@@ -843,13 +1037,39 @@ static int hold_output(int fd, const char *mode, bool verbose,
 	if (mode)
 		printf(" at %s", mode);
 	printf("; press Ctrl+C to disconnect\n");
+	if (control_path)
+		printf("control_fifo=%s\n", control_path);
 	fflush(stdout);
 
 	wait_mask = original_mask;
 	sigdelset(&wait_mask, SIGINT);
 	sigdelset(&wait_mask, SIGTERM);
-	while (!stop_requested)
-		sigsuspend(&wait_mask);
+	while (!stop_requested) {
+		struct pollfd control_poll;
+		int ready;
+
+		if (control_fd < 0) {
+			sigsuspend(&wait_mask);
+			continue;
+		}
+		control_poll.fd = control_fd;
+		control_poll.events = POLLIN;
+		control_poll.revents = 0;
+		/*
+		 * ppoll applies the unblocked mask atomically, so a signal that
+		 * arrives just before the wait still ends it. sigsuspend gave
+		 * the same guarantee before the control channel existed.
+		 */
+		ready = ppoll(&control_poll, 1, NULL, &wait_mask);
+		if (ready < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("ppoll");
+			break;
+		}
+		if (control_poll.revents & POLLIN)
+			drain_control_fifo(control_fd, fd, session_file);
+	}
 	ret = 0;
 
 out_disable:
@@ -867,6 +1087,14 @@ out_disable:
 	}
 
 out_restore:
+	if (control_fd >= 0)
+		close(control_fd);
+	if (control_created && unlink(control_path) < 0 && errno != ENOENT) {
+		fprintf(stderr, "Could not remove control FIFO %s: %s\n",
+			control_path, strerror(errno));
+		if (!ret)
+			ret = 1;
+	}
 	if (sigprocmask(SIG_SETMASK, &original_mask, NULL) < 0) {
 		perror("sigprocmask restore");
 		if (!ret)
@@ -883,6 +1111,7 @@ int main(int argc, char **argv)
 {
 	const char *device = NULL;
 	const char *session_file = NULL;
+	const char *control_path = NULL;
 	const char *command;
 	uint32_t output_number = 1;
 	bool output_selected = false;
@@ -918,6 +1147,13 @@ int main(int argc, char **argv)
 		} else if (strcmp(argv[argi], "--verbose") == 0) {
 			verbose = true;
 			argi++;
+		} else if (strcmp(argv[argi], "--control") == 0) {
+			if (argi + 1 >= argc) {
+				fprintf(stderr, "--control requires a path\n");
+				return 2;
+			}
+			control_path = argv[argi + 1];
+			argi += 2;
 		} else if (strcmp(argv[argi], "--session-file") == 0) {
 			if (argi + 1 >= argc) {
 				fprintf(stderr, "--session-file requires a path\n");
@@ -995,35 +1231,42 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (strcmp(command, "version") == 0)
-		ret = print_version(fd);
-	else if (strcmp(command, "outputs") == 0)
-		ret = print_outputs(fd);
-	else if (strcmp(command, "identity") == 0)
-		ret = print_identity(fd);
-	else if (strcmp(command, "caps") == 0)
-		ret = print_caps(fd);
-	else if (strcmp(command, "status") == 0)
-		ret = print_status(fd);
-	else if (strcmp(command, "metrics") == 0)
-		ret = print_metrics(fd);
-	else if (strcmp(command, "diagnose") == 0)
-		ret = print_diagnose(fd);
-	else if (strcmp(command, "wait") == 0)
+	if (strcmp(command, "wait") == 0) {
 		ret = wait_frame(fd, argc - argi, &argv[argi]);
-	else if (strcmp(command, "frame") == 0)
+	} else if (strcmp(command, "frame") == 0) {
 		ret = print_frame(fd, argc - argi, &argv[argi]);
-	else if (strcmp(command, "enable") == 0) {
-		fprintf(stderr, "note: output ownership is fd-scoped; holding until Ctrl+C\n");
-		ret = hold_output(fd, argi < argc ? argv[argi] : NULL, verbose,
-				  session_file);
-	}
-	else if (strcmp(command, "hold") == 0)
-		ret = hold_output(fd, argi < argc ? argv[argi] : NULL, verbose,
-				  session_file);
-	else if (strcmp(command, "disable") == 0)
+	} else if (strcmp(command, "enable") == 0 ||
+		   strcmp(command, "hold") == 0) {
+		const char *mode = argi < argc ? argv[argi++] : NULL;
+
+		ret = reject_extra_arguments(command, argc - argi, &argv[argi]);
+		if (!ret) {
+			if (strcmp(command, "enable") == 0)
+				fprintf(stderr,
+					"note: output ownership is fd-scoped; holding until Ctrl+C\n");
+			ret = hold_output(fd, mode, verbose, session_file,
+					  control_path);
+		}
+	} else if ((ret = reject_extra_arguments(command, argc - argi,
+						 &argv[argi])) != 0) {
+		/* Reported above. */
+	} else if (strcmp(command, "version") == 0) {
+		ret = print_version(fd);
+	} else if (strcmp(command, "outputs") == 0) {
+		ret = print_outputs(fd);
+	} else if (strcmp(command, "identity") == 0) {
+		ret = print_identity(fd);
+	} else if (strcmp(command, "caps") == 0) {
+		ret = print_caps(fd);
+	} else if (strcmp(command, "status") == 0) {
+		ret = print_status(fd);
+	} else if (strcmp(command, "metrics") == 0) {
+		ret = print_metrics(fd);
+	} else if (strcmp(command, "diagnose") == 0) {
+		ret = print_diagnose(fd);
+	} else if (strcmp(command, "disable") == 0) {
 		ret = set_output(fd, false, NULL);
-	else {
+	} else {
 		usage(argv[0]);
 		ret = 2;
 	}

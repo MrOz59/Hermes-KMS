@@ -165,7 +165,8 @@ an independently developed consumer separate from the Hermes application; see
 - fixed-layout DRM ioctls for frame acquisition, damage, synchronization and
   metrics, including vblank and late-vblank counters;
 - debugfs telemetry at `/sys/kernel/debug/dri/<n>/hermes_kms_stats`;
-- debug/control tool: `tools/hermes-kmsctl/hermes-kmsctl`;
+- debug/control tool: `tools/hermes-kmsctl/hermes-kmsctl`, whose `hold` accepts
+  `--control PATH` to rotate or revoke the session capability while it runs;
 - configurable mode envelope, 640x480 through 7680x4320 at up to 240 Hz by
   default with 1920x1080 preferred, reported through `GET_CAPS` and reflected in
   the synthetic EDID's range limits;
