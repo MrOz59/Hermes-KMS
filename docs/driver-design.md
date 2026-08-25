@@ -216,6 +216,62 @@ broker restart scope, and reboot-required migration. The existing
 two-compositor regression validates direct configured-user socket ownership
 without requiring `seat` group membership.
 
+## Runtime card creation
+
+Every topology above is chosen at module load, which means a host can only draw
+from a pool decided in advance, and changing that pool means reloading a module
+a compositor is holding. configfs removes that constraint, and is the interface
+vkms adopted upstream for the same problem:
+
+```bash
+mkdir  /sys/kernel/config/hermes-kms/stream-1
+echo 1 > /sys/kernel/config/hermes-kms/stream-1/outputs
+echo session > /sys/kernel/config/hermes-kms/stream-1/role
+echo 3 > /sys/kernel/config/hermes-kms/stream-1/session_index
+echo 1 > /sys/kernel/config/hermes-kms/stream-1/enabled
+cat    /sys/kernel/config/hermes-kms/stream-1/card         # cardN
+cat    /sys/kernel/config/hermes-kms/stream-1/render_node  # renderDN
+rmdir  /sys/kernel/config/hermes-kms/stream-1
+```
+
+`outputs`, `role` and `session_index` are writable only while the card is
+disabled, because the KMS object graph is built once at probe; writing them on a
+live card returns `EBUSY`. Everything an identity needs is therefore settled
+before the card exists, so a dynamically created session card lands on the same
+`hermes-kms-N` seat and private broker a pool card would. A `session` role with
+index 0 is refused, since it would match no seat rule. `card` and `render_node`
+report the nodes the card received, letting a controller find what it just
+created without racing udev. `rmdir` on a live card removes it, as a hot-unplug
+would.
+
+This also makes the driver usable without writing any ioctl code: a project that
+only wants a virtual display and already captures through its own pipeline can
+create one with `mkdir` and a couple of writes.
+
+Two consequences follow for consumers, and `HERMES_KMS_CAP_DYNAMIC_DEVICES`
+announces them. `GET_IDENTITY.device_count` is the number of cards that exist
+right now rather than a load-time constant, and `device_index` values are
+neither dense nor stable across a card being removed and recreated. Identify a
+card by its role and session index, or by the node the creating controller
+recorded, rather than by walking indices.
+
+Output names and EDID serials are allocated from a module-wide pool rather than
+derived from `device_index * output_count`, which could only stay unique while
+every card had the same output count and existed from the start. Removal uses
+`drm_dev_unplug()` rather than `drm_dev_unregister()`: a compositor can still
+hold a card open when it goes, and unplug is what makes `drm_ioctl()` answer
+`ENODEV` instead of running against a device being torn down.
+
+The module holds a reference while any configfs group exists, so `rmmod` fails
+until the groups are removed. Statically configured cards and the session pool
+are unaffected and keep working exactly as before.
+
+Status: **Prototype**. `scripts/vm-configfs-test.sh` validates creation and
+removal alongside a static card, role and seat metadata reaching sysfs and
+`GET_IDENTITY`, unique output naming across cards, rejected writes on a live
+card, refused unload, repeated enable/disable cycles, `rmdir` on a live card,
+and a three-card pool created and removed in one run.
+
 ## Public userspace UAPI
 
 Hermes-KMS is controlled through explicit DRM ioctls, not by scraping logs or

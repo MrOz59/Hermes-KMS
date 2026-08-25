@@ -9,7 +9,10 @@
 
 #include <linux/module.h>
 #include <linux/build_bug.h>
+#include <linux/cleanup.h>
 #include <linux/compat.h>
+#include <linux/configfs.h>
+#include <linux/idr.h>
 #include <crypto/algapi.h>
 #include <linux/mutex.h>
 #include <linux/ktime.h>
@@ -225,6 +228,38 @@ MODULE_PARM_DESC(scanout_modifiers,
 
 struct hermes_kms_device;
 
+/*
+ * Per-device topology, handed to probe as platform data. The static devices
+ * created at module load leave it NULL and keep reading the module parameters,
+ * so their behaviour is unchanged; only configfs-created cards carry their own.
+ */
+struct hermes_kms_device_config {
+	unsigned int outputs;
+	unsigned int role;
+	unsigned int session_index;
+};
+
+/*
+ * Device ids and output identities are allocated rather than derived, because
+ * cards now come and go at runtime. Deriving an output name from
+ * device_index * output_count could only stay unique while every device had the
+ * same output count and existed from the start; friendly names and EDID serials
+ * have to remain globally distinct regardless of creation order.
+ */
+static DEFINE_IDA(hermes_kms_device_ida);
+static DEFINE_IDA(hermes_kms_output_ida);
+static atomic_t hermes_kms_live_devices = ATOMIC_INIT(0);
+
+static unsigned int hermes_kms_live_device_count(void)
+{
+	int count = atomic_read(&hermes_kms_live_devices);
+
+	return count > 0 ? (unsigned int)count : 0;
+}
+
+/* Defined with the configfs subsystem, below the KMS and ioctl code. */
+static bool hermes_kms_dynamic_devices_available(void);
+
 struct hermes_kms_export_cache {
 	struct drm_gem_object *obj[4];
 	struct dma_buf *dmabuf[4];
@@ -233,6 +268,8 @@ struct hermes_kms_export_cache {
 struct hermes_kms_output {
 	struct hermes_kms_device *hdev;
 	unsigned int index;
+	/* Globally unique identity from hermes_kms_output_ida, or -1. */
+	int identity;
 	char output_name[HERMES_KMS_NAME_LEN];
 	u8 edid[128];
 	/*
@@ -363,7 +400,6 @@ struct hermes_kms_output {
 struct hermes_kms_device {
 	struct drm_device drm;
 	unsigned int device_index;
-	unsigned int device_count;
 	unsigned int device_role;
 	unsigned int session_index;
 	unsigned int session_device_count;
@@ -530,6 +566,46 @@ static_assert(HERMES_KMS_EDID_OFFSET_MAX_HFREQ ==
 	      DRM_EDID_RANGE_OFFSET_MAX_HFREQ);
 static_assert(HERMES_KMS_EDID_RANGE_LIMITS_ONLY ==
 	      DRM_EDID_RANGE_LIMITS_ONLY_FLAG);
+
+/*
+ * Report the ceiling once, at module load, when the configured envelope is too
+ * wide for an EDID range descriptor to state.
+ *
+ * A generous envelope reaches this easily and it is not an error: the limit is
+ * a hyperbola (CVT's 550 us minimum vertical blanking makes the line count grow
+ * with the refresh rate) while the envelope is a rectangle, so the fast corner
+ * of any large envelope falls outside. Saying so once, with the refresh rate
+ * that is actually representable at the configured height, turns "userspace
+ * quietly refuses my 8K120 mode" into something the log already answered. The
+ * pixel-clock field saturating is harmless by comparison: drm_edid.c reads 255
+ * as "unspecified" and stops filtering on clock entirely.
+ */
+static void __init hermes_kms_report_edid_range_ceiling(void)
+{
+	const struct hermes_kms_edid_config config = {
+		.max_width = max_width,
+		.max_height = max_height,
+		.max_refresh_hz = max_refresh_hz,
+	};
+	u8 descriptor[18] = { };
+	unsigned int representable_hz;
+
+	if (hermes_kms_fill_edid_range(descriptor, &config))
+		return;
+
+	/*
+	 * hfreq = R * H / (1 - 550us * R) <= 510 kHz, solved for R with the
+	 * 550us term folded into the divisor as 0.000550 * 510000 = 280.5.
+	 */
+	representable_hz = HERMES_KMS_EDID_MAX_HFREQ_KHZ * 1000 /
+			   (max_height + 281);
+	if (representable_hz > HERMES_KMS_EDID_MAX_VFREQ_HZ)
+		representable_hz = HERMES_KMS_EDID_MAX_VFREQ_HZ;
+
+	pr_info("%s: mode envelope %ux%u@%u is wider than an EDID range descriptor can state; userspace may filter modes above roughly %u Hz at %u lines\n",
+		HERMES_KMS_DRIVER_NAME, max_width, max_height, max_refresh_hz,
+		representable_hz, max_height);
+}
 
 static bool hermes_kms_build_output_edid(struct hermes_kms_output *output,
 					 u32 serial)
@@ -1530,10 +1606,12 @@ static int hermes_kms_ioctl_get_caps(struct drm_device *drm, void *data,
 			      HERMES_KMS_CAP_CURSOR_CAPTURE |
 			      HERMES_KMS_CAP_ZERO_COPY_TARGET |
 		      HERMES_KMS_CAP_SYNC_FILE;
-	if (hdev->device_count > 1)
+	if (hermes_kms_live_device_count() > 1)
 		caps->flags |= HERMES_KMS_CAP_MULTI_DEVICE;
 	if (session_devices)
 		caps->flags |= HERMES_KMS_CAP_SESSION_DEVICE_POOL;
+	if (hermes_kms_dynamic_devices_available())
+		caps->flags |= HERMES_KMS_CAP_DYNAMIC_DEVICES;
 	caps->min_width = min_width;
 	caps->min_height = min_height;
 	caps->max_width = max_width;
@@ -1793,7 +1871,7 @@ static int hermes_kms_ioctl_get_identity(struct drm_device *drm, void *data,
 	identity->output_index = output->index;
 	identity->output_count = hdev->output_count;
 	identity->device_index = hdev->device_index;
-	identity->device_count = hdev->device_count;
+	identity->device_count = hermes_kms_live_device_count();
 	identity->device_role = hdev->device_role;
 	identity->session_index = hdev->session_index;
 	identity->session_device_count = hdev->session_device_count;
@@ -3650,10 +3728,26 @@ static ssize_t hermes_kms_session_index_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(hermes_kms_session_index);
 
+static void hermes_kms_free_output_identities(struct hermes_kms_device *hdev)
+{
+	unsigned int i;
+
+	for (i = 0; i < hdev->output_count; i++) {
+		struct hermes_kms_output *output = &hdev->outputs[i];
+
+		if (output->identity >= 0) {
+			ida_free(&hermes_kms_output_ida, output->identity);
+			output->identity = -1;
+		}
+	}
+}
+
 static int hermes_kms_probe(struct platform_device *pdev)
 {
 	struct hermes_kms_device *hdev;
 	struct drm_device *drm;
+	const struct hermes_kms_device_config *config =
+		dev_get_platdata(&pdev->dev);
 	unsigned int output_count = outputs;
 	unsigned int i;
 	int ret;
@@ -3666,9 +3760,14 @@ static int hermes_kms_probe(struct platform_device *pdev)
 	drm = &hdev->drm;
 	platform_set_drvdata(pdev, hdev);
 	hdev->device_index = pdev->id >= 0 ? pdev->id : 0;
-	hdev->device_count = registered_device_count;
-	hdev->session_device_count = session_devices;
-	if (session_devices) {
+	if (config) {
+		/* A configfs-created card states its own role and topology. */
+		output_count = config->outputs;
+		hdev->device_role = config->role;
+		hdev->session_index = config->session_index;
+		hdev->session_device_count = session_devices;
+	} else if (session_devices) {
+		hdev->session_device_count = session_devices;
 		hdev->device_role = hdev->device_index == 0 ?
 				      HERMES_KMS_DEVICE_ROLE_HOST :
 				      HERMES_KMS_DEVICE_ROLE_SESSION;
@@ -3690,21 +3789,31 @@ static int hermes_kms_probe(struct platform_device *pdev)
 	}
 	hdev->output_count = output_count;
 
+	for (i = 0; i < hdev->output_count; i++)
+		hdev->outputs[i].identity = -1;
+
 	for (i = 0; i < hdev->output_count; i++) {
 		struct hermes_kms_output *output = &hdev->outputs[i];
-		unsigned int identity;
+		int identity;
 
 		output->hdev = hdev;
 		output->index = i;
-		identity = hdev->device_index * hdev->output_count + i + 1;
+		/*
+		 * Names and EDID serials must stay globally distinct across
+		 * cards that appear and disappear independently, so take them
+		 * from a module-wide allocator rather than computing them from
+		 * this card's index.
+		 */
+		identity = ida_alloc_min(&hermes_kms_output_ida, 1, GFP_KERNEL);
+		if (identity < 0) {
+			ret = identity;
+			goto err_free_identities;
+		}
+		output->identity = identity;
 		snprintf(output->output_name, sizeof(output->output_name),
-			 HERMES_KMS_OUTPUT_NAME_PREFIX "%u", identity);
+			 HERMES_KMS_OUTPUT_NAME_PREFIX "%d", identity);
 
-		if (!hermes_kms_build_output_edid(output, identity))
-			drm_warn(drm,
-				 "%s: mode range %ux%u@%u exceeds what an EDID range descriptor can state; userspace may filter the fastest modes\n",
-				 output->output_name, max_width, max_height,
-				 max_refresh_hz);
+		hermes_kms_build_output_edid(output, (u32)identity);
 
 		mutex_init(&output->state_lock);
 		mutex_init(&output->export_lock);
@@ -3742,10 +3851,12 @@ static int hermes_kms_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_remove_session_index;
 
+	atomic_inc(&hermes_kms_live_devices);
+
 	drm_info(drm,
 		 "registered Hermes-KMS virtual DRM device index=%u/%u role=%u session_index=%u/%u outputs=%u initial_enabled=%d hotplug_events=%d non_desktop=%d initial_mode=%ux%u@%u\n",
 		 hdev->device_index + 1,
-		 hdev->device_count,
+		 hermes_kms_live_device_count(),
 		 hdev->device_role,
 		 hdev->session_index,
 		 hdev->session_device_count,
@@ -3777,6 +3888,8 @@ err_remove_session_index:
 			   &dev_attr_hermes_kms_session_index);
 err_remove_role:
 	device_remove_file(&pdev->dev, &dev_attr_hermes_kms_role);
+err_free_identities:
+	hermes_kms_free_output_identities(hdev);
 	return ret;
 }
 
@@ -3801,7 +3914,16 @@ static void hermes_kms_remove(struct platform_device *pdev)
 		wake_up_interruptible(&output->frame_wait);
 	}
 
-	drm_dev_unregister(&hdev->drm);
+	/*
+	 * configfs makes removal an ordinary runtime operation, so a compositor
+	 * can still hold this card open when it goes. drm_dev_unplug() is what
+	 * makes that safe: it marks the device unplugged, so drm_ioctl() answers
+	 * -ENODEV instead of running against a device that is being torn down,
+	 * and it tears down userspace mappings. Plain drm_dev_unregister() only
+	 * covers a device that nothing can be using any more.
+	 */
+	atomic_dec(&hermes_kms_live_devices);
+	drm_dev_unplug(&hdev->drm);
 	drm_atomic_helper_shutdown(&hdev->drm);
 
 	for (i = 0; i < hdev->output_count; i++) {
@@ -3831,6 +3953,7 @@ static void hermes_kms_remove(struct platform_device *pdev)
 
 	device_remove_file(&pdev->dev, &dev_attr_hermes_kms_session_index);
 	device_remove_file(&pdev->dev, &dev_attr_hermes_kms_role);
+	hermes_kms_free_output_identities(hdev);
 }
 
 static struct platform_driver hermes_kms_platform_driver = {
@@ -3843,6 +3966,466 @@ static struct platform_driver hermes_kms_platform_driver = {
 
 static struct platform_device *
 hermes_kms_platform_devices[HERMES_KMS_MAX_REGISTERED_DEVICES];
+
+/* ------------------------------------------------------------------------- */
+/* configfs: create and remove Hermes cards at runtime                        */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * A virtual display driver whose topology is fixed at module load can only
+ * offer a pre-allocated pool, and changing that pool means reloading a module
+ * a compositor is holding. configfs is how vkms solved the same problem
+ * upstream, and it is what lets a host add exactly the cards it needs, when it
+ * needs them:
+ *
+ *	mkdir  /sys/kernel/config/hermes-kms/stream-1
+ *	echo 1 > /sys/kernel/config/hermes-kms/stream-1/outputs
+ *	echo session > /sys/kernel/config/hermes-kms/stream-1/role
+ *	echo 3 > /sys/kernel/config/hermes-kms/stream-1/session_index
+ *	echo 1 > /sys/kernel/config/hermes-kms/stream-1/enabled
+ *	cat    /sys/kernel/config/hermes-kms/stream-1/card
+ *	rmdir  /sys/kernel/config/hermes-kms/stream-1
+ *
+ * Everything a card's identity needs is settable before it is enabled, so a
+ * dynamically created session card lands on the same udev seat and private
+ * broker as a pool card would. The topology attributes are read-only while the
+ * card exists, because the KMS object graph is built once at probe.
+ *
+ * The card and render_node attributes report the device nodes the card got, so
+ * a controller can find what it just created without racing udev.
+ */
+
+#if IS_ENABLED(CONFIG_CONFIGFS_FS)
+
+#define HERMES_KMS_MAX_DEVICE_ID 255
+
+struct hermes_kms_config_device {
+	struct config_group group;
+	/* Serialises attribute access against create/destroy. */
+	struct mutex lock;
+	struct platform_device *pdev;
+	int device_id;
+	unsigned int outputs;
+	unsigned int role;
+	unsigned int session_index;
+	bool enabled;
+};
+
+static bool hermes_kms_configfs_registered;
+
+static struct hermes_kms_config_device *
+to_hermes_kms_config_device(struct config_item *item)
+{
+	return container_of(to_config_group(item),
+			    struct hermes_kms_config_device, group);
+}
+
+static const char *hermes_kms_role_name(unsigned int role)
+{
+	switch (role) {
+	case HERMES_KMS_DEVICE_ROLE_HOST:
+		return "host";
+	case HERMES_KMS_DEVICE_ROLE_SESSION:
+		return "session";
+	default:
+		return "general";
+	}
+}
+
+static int hermes_kms_parse_role(const char *page, unsigned int *role)
+{
+	if (sysfs_streq(page, "general"))
+		*role = HERMES_KMS_DEVICE_ROLE_GENERAL;
+	else if (sysfs_streq(page, "host"))
+		*role = HERMES_KMS_DEVICE_ROLE_HOST;
+	else if (sysfs_streq(page, "session"))
+		*role = HERMES_KMS_DEVICE_ROLE_SESSION;
+	else
+		return -EINVAL;
+
+	return 0;
+}
+
+/* Caller holds cfg->lock. */
+static int hermes_kms_config_create(struct hermes_kms_config_device *cfg)
+{
+	const struct hermes_kms_device_config data = {
+		.outputs = cfg->outputs,
+		.role = cfg->role,
+		.session_index = cfg->session_index,
+	};
+	struct platform_device *pdev;
+	int id;
+	int ret;
+
+	id = ida_alloc_max(&hermes_kms_device_ida, HERMES_KMS_MAX_DEVICE_ID,
+			   GFP_KERNEL);
+	if (id < 0)
+		return id;
+
+	pdev = platform_device_alloc(HERMES_KMS_DRIVER_NAME, id);
+	if (!pdev) {
+		ret = -ENOMEM;
+		goto err_free_id;
+	}
+
+	ret = platform_device_add_data(pdev, &data, sizeof(data));
+	if (ret)
+		goto err_put_device;
+
+	ret = platform_device_add(pdev);
+	if (ret)
+		goto err_put_device;
+
+	/*
+	 * platform_device_add() succeeds even when probe fails, leaving an
+	 * unbound device and no DRM card. Report that as an error rather than
+	 * an "enabled" card that does not exist.
+	 */
+	if (!pdev->dev.driver) {
+		platform_device_unregister(pdev);
+		ret = -ENODEV;
+		goto err_free_id;
+	}
+
+	cfg->pdev = pdev;
+	cfg->device_id = id;
+	return 0;
+
+err_put_device:
+	platform_device_put(pdev);
+err_free_id:
+	ida_free(&hermes_kms_device_ida, id);
+	return ret;
+}
+
+/* Caller holds cfg->lock. */
+static void hermes_kms_config_destroy(struct hermes_kms_config_device *cfg)
+{
+	if (!cfg->pdev)
+		return;
+
+	platform_device_unregister(cfg->pdev);
+	ida_free(&hermes_kms_device_ida, cfg->device_id);
+	cfg->pdev = NULL;
+	cfg->device_id = -1;
+}
+
+static ssize_t hermes_kms_config_outputs_show(struct config_item *item,
+					      char *page)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	unsigned int value;
+
+	mutex_lock(&cfg->lock);
+	value = cfg->outputs;
+	mutex_unlock(&cfg->lock);
+
+	return sysfs_emit(page, "%u\n", value);
+}
+
+static ssize_t hermes_kms_config_outputs_store(struct config_item *item,
+					       const char *page, size_t count)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	unsigned int value;
+	int ret;
+
+	ret = kstrtouint(page, 0, &value);
+	if (ret)
+		return ret;
+	if (value < 1 || value > HERMES_KMS_MAX_OUTPUTS)
+		return -EINVAL;
+
+	mutex_lock(&cfg->lock);
+	/* The KMS object graph is built once, at probe. */
+	if (cfg->enabled)
+		ret = -EBUSY;
+	else
+		cfg->outputs = value;
+	mutex_unlock(&cfg->lock);
+
+	return ret ? ret : (ssize_t)count;
+}
+
+static ssize_t hermes_kms_config_role_show(struct config_item *item, char *page)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	unsigned int role;
+
+	mutex_lock(&cfg->lock);
+	role = cfg->role;
+	mutex_unlock(&cfg->lock);
+
+	return sysfs_emit(page, "%s\n", hermes_kms_role_name(role));
+}
+
+static ssize_t hermes_kms_config_role_store(struct config_item *item,
+					    const char *page, size_t count)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	unsigned int role;
+	int ret;
+
+	ret = hermes_kms_parse_role(page, &role);
+	if (ret)
+		return ret;
+
+	mutex_lock(&cfg->lock);
+	/* udev reads the role when the DRM card uevent fires. */
+	if (cfg->enabled)
+		ret = -EBUSY;
+	else
+		cfg->role = role;
+	mutex_unlock(&cfg->lock);
+
+	return ret ? ret : (ssize_t)count;
+}
+
+static ssize_t hermes_kms_config_session_index_show(struct config_item *item,
+						    char *page)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	unsigned int value;
+
+	mutex_lock(&cfg->lock);
+	value = cfg->session_index;
+	mutex_unlock(&cfg->lock);
+
+	return sysfs_emit(page, "%u\n", value);
+}
+
+static ssize_t hermes_kms_config_session_index_store(struct config_item *item,
+						     const char *page,
+						     size_t count)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	unsigned int value;
+	int ret;
+
+	ret = kstrtouint(page, 0, &value);
+	if (ret)
+		return ret;
+	if (value > HERMES_KMS_MAX_SESSION_DEVICES)
+		return -EINVAL;
+
+	mutex_lock(&cfg->lock);
+	if (cfg->enabled)
+		ret = -EBUSY;
+	else
+		cfg->session_index = value;
+	mutex_unlock(&cfg->lock);
+
+	return ret ? ret : (ssize_t)count;
+}
+
+static ssize_t hermes_kms_config_enabled_show(struct config_item *item,
+					      char *page)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	bool enabled;
+
+	mutex_lock(&cfg->lock);
+	enabled = cfg->enabled;
+	mutex_unlock(&cfg->lock);
+
+	return sysfs_emit(page, "%d\n", enabled);
+}
+
+static ssize_t hermes_kms_config_enabled_store(struct config_item *item,
+					       const char *page, size_t count)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	bool enabled;
+	int ret = 0;
+
+	if (kstrtobool(page, &enabled))
+		return -EINVAL;
+
+	mutex_lock(&cfg->lock);
+	if (enabled && !cfg->enabled) {
+		if (cfg->role == HERMES_KMS_DEVICE_ROLE_SESSION &&
+		    !cfg->session_index) {
+			/*
+			 * udev maps hermes-kms-<session_index> to a seat and a
+			 * private broker; index 0 would land on none of them.
+			 */
+			ret = -EINVAL;
+		} else {
+			ret = hermes_kms_config_create(cfg);
+		}
+	} else if (!enabled && cfg->enabled) {
+		hermes_kms_config_destroy(cfg);
+	}
+	if (!ret)
+		cfg->enabled = enabled;
+	mutex_unlock(&cfg->lock);
+
+	return ret ? ret : (ssize_t)count;
+}
+
+static ssize_t hermes_kms_config_card_show(struct config_item *item, char *page)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	struct hermes_kms_device *hdev;
+	ssize_t ret;
+
+	mutex_lock(&cfg->lock);
+	hdev = cfg->pdev ? platform_get_drvdata(cfg->pdev) : NULL;
+	ret = hdev ? sysfs_emit(page, "card%d\n", hdev->drm.primary->index) :
+		     sysfs_emit(page, "\n");
+	mutex_unlock(&cfg->lock);
+
+	return ret;
+}
+
+static ssize_t hermes_kms_config_render_node_show(struct config_item *item,
+						  char *page)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	struct hermes_kms_device *hdev;
+	ssize_t ret;
+
+	mutex_lock(&cfg->lock);
+	hdev = cfg->pdev ? platform_get_drvdata(cfg->pdev) : NULL;
+	ret = hdev && hdev->drm.render ?
+		      sysfs_emit(page, "renderD%d\n", hdev->drm.render->index) :
+		      sysfs_emit(page, "\n");
+	mutex_unlock(&cfg->lock);
+
+	return ret;
+}
+
+static ssize_t hermes_kms_config_device_index_show(struct config_item *item,
+						   char *page)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	int value;
+
+	mutex_lock(&cfg->lock);
+	value = cfg->device_id;
+	mutex_unlock(&cfg->lock);
+
+	return sysfs_emit(page, "%d\n", value);
+}
+
+CONFIGFS_ATTR(hermes_kms_config_, outputs);
+CONFIGFS_ATTR(hermes_kms_config_, role);
+CONFIGFS_ATTR(hermes_kms_config_, session_index);
+CONFIGFS_ATTR(hermes_kms_config_, enabled);
+CONFIGFS_ATTR_RO(hermes_kms_config_, card);
+CONFIGFS_ATTR_RO(hermes_kms_config_, render_node);
+CONFIGFS_ATTR_RO(hermes_kms_config_, device_index);
+
+static struct configfs_attribute *hermes_kms_config_attrs[] = {
+	&hermes_kms_config_attr_outputs,
+	&hermes_kms_config_attr_role,
+	&hermes_kms_config_attr_session_index,
+	&hermes_kms_config_attr_enabled,
+	&hermes_kms_config_attr_card,
+	&hermes_kms_config_attr_render_node,
+	&hermes_kms_config_attr_device_index,
+	NULL,
+};
+
+static void hermes_kms_config_release(struct config_item *item)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+
+	/* An rmdir on a live card removes it, as a hot-unplug would. */
+	mutex_lock(&cfg->lock);
+	hermes_kms_config_destroy(cfg);
+	mutex_unlock(&cfg->lock);
+
+	mutex_destroy(&cfg->lock);
+	kfree(cfg);
+}
+
+static struct configfs_item_operations hermes_kms_config_item_ops = {
+	.release = hermes_kms_config_release,
+};
+
+static const struct config_item_type hermes_kms_config_device_type = {
+	.ct_attrs = hermes_kms_config_attrs,
+	.ct_item_ops = &hermes_kms_config_item_ops,
+	.ct_owner = THIS_MODULE,
+};
+
+static struct config_group *hermes_kms_config_make_group(
+	struct config_group *group, const char *name)
+{
+	struct hermes_kms_config_device *cfg;
+
+	cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
+	if (!cfg)
+		return ERR_PTR(-ENOMEM);
+
+	mutex_init(&cfg->lock);
+	cfg->device_id = -1;
+	cfg->outputs = HERMES_KMS_DEFAULT_OUTPUTS;
+	cfg->role = HERMES_KMS_DEVICE_ROLE_GENERAL;
+	config_group_init_type_name(&cfg->group, name,
+				    &hermes_kms_config_device_type);
+
+	return &cfg->group;
+}
+
+static struct configfs_group_operations hermes_kms_config_group_ops = {
+	.make_group = hermes_kms_config_make_group,
+};
+
+static const struct config_item_type hermes_kms_config_root_type = {
+	.ct_group_ops = &hermes_kms_config_group_ops,
+	.ct_owner = THIS_MODULE,
+};
+
+static struct configfs_subsystem hermes_kms_configfs_subsys = {
+	.su_group = {
+		.cg_item = {
+			.ci_namebuf = HERMES_KMS_DRIVER_NAME,
+			.ci_type = &hermes_kms_config_root_type,
+		},
+	},
+	.su_mutex = __MUTEX_INITIALIZER(hermes_kms_configfs_subsys.su_mutex),
+};
+
+static void hermes_kms_configfs_register(void)
+{
+	int ret;
+
+	config_group_init(&hermes_kms_configfs_subsys.su_group);
+	ret = configfs_register_subsystem(&hermes_kms_configfs_subsys);
+	if (ret) {
+		/*
+		 * The statically configured cards still work, so this is a lost
+		 * capability rather than a failed module load.
+		 */
+		pr_warn("%s: cannot register configfs subsystem (%d); runtime card creation is unavailable\n",
+			HERMES_KMS_DRIVER_NAME, ret);
+		return;
+	}
+	hermes_kms_configfs_registered = true;
+}
+
+static void hermes_kms_configfs_unregister(void)
+{
+	if (hermes_kms_configfs_registered)
+		configfs_unregister_subsystem(&hermes_kms_configfs_subsys);
+	hermes_kms_configfs_registered = false;
+}
+
+static bool hermes_kms_dynamic_devices_available(void)
+{
+	return hermes_kms_configfs_registered;
+}
+
+#else /* !CONFIG_CONFIGFS_FS */
+
+static void hermes_kms_configfs_register(void) { }
+static void hermes_kms_configfs_unregister(void) { }
+static bool hermes_kms_dynamic_devices_available(void) { return false; }
+
+#endif /* CONFIG_CONFIGFS_FS */
 
 /*
  * Clamp the mode-range parameters into the hard envelope and keep them
@@ -3891,6 +4474,8 @@ static void __init hermes_kms_sanitize_mode_range(void)
 			requested_max_refresh_hz,
 			min_width, min_height, max_width, max_height,
 			max_refresh_hz);
+
+	hermes_kms_report_edid_range_ceiling();
 }
 
 static int __init hermes_kms_init(void)
@@ -3923,9 +4508,21 @@ static int __init hermes_kms_init(void)
 	hermes_kms_sanitize_mode_range();
 	hermes_kms_init_plane_modifiers();
 
+	/*
+	 * Reserve the ids the statically created cards will use, including the
+	 * PLATFORM_DEVID_NONE case that probe maps to device_index 0, so a
+	 * configfs card can never be handed an index that already identifies
+	 * another card.
+	 */
+	for (i = 0; i < device_count; i++) {
+		ret = ida_alloc_range(&hermes_kms_device_ida, i, i, GFP_KERNEL);
+		if (ret < 0)
+			goto err_free_ids;
+	}
+
 	ret = platform_driver_register(&hermes_kms_platform_driver);
 	if (ret)
-		return ret;
+		goto err_free_ids;
 
 	for (i = 0; i < device_count; i++) {
 		struct platform_device *pdev;
@@ -3950,8 +4547,11 @@ static int __init hermes_kms_init(void)
 		hermes_kms_platform_devices[i] = pdev;
 	}
 
-	pr_info("%s: module loaded devices=%u session_devices=%u outputs_per_device=%u\n",
-		HERMES_KMS_DRIVER_NAME, device_count, session_devices, outputs);
+	hermes_kms_configfs_register();
+
+	pr_info("%s: module loaded devices=%u session_devices=%u outputs_per_device=%u dynamic_devices=%d\n",
+		HERMES_KMS_DRIVER_NAME, device_count, session_devices, outputs,
+		hermes_kms_dynamic_devices_available());
 	return 0;
 
 err_unregister_devices:
@@ -3961,12 +4561,23 @@ err_unregister_devices:
 		hermes_kms_platform_devices[i] = NULL;
 	}
 	platform_driver_unregister(&hermes_kms_platform_driver);
+	i = device_count;
+err_free_ids:
+	while (i > 0)
+		ida_free(&hermes_kms_device_ida, --i);
 	return ret;
 }
 
 static void __exit hermes_kms_exit(void)
 {
 	unsigned int i;
+
+	/*
+	 * Drop the configfs groups first: each one still holding a card removes
+	 * it from its release callback, and the subsystem must be gone before
+	 * the platform driver it creates devices against.
+	 */
+	hermes_kms_configfs_unregister();
 
 	for (i = registered_device_count; i > 0; i--) {
 		if (hermes_kms_platform_devices[i - 1]) {
@@ -3976,6 +4587,11 @@ static void __exit hermes_kms_exit(void)
 		}
 	}
 	platform_driver_unregister(&hermes_kms_platform_driver);
+
+	for (i = registered_device_count; i > 0; i--)
+		ida_free(&hermes_kms_device_ida, i - 1);
+	ida_destroy(&hermes_kms_device_ida);
+	ida_destroy(&hermes_kms_output_ida);
 	pr_info("%s: module unloaded\n", HERMES_KMS_DRIVER_NAME);
 }
 

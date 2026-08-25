@@ -127,6 +127,12 @@ an independently developed consumer separate from the Hermes application; see
 - 1–8 independent outputs on one DRM card (`outputs=`, default 1 for
   compatibility), with separate KMS pipelines, sessions, frame channels, and
   EDID serials;
+- runtime card creation through configfs
+  (`mkdir /sys/kernel/config/hermes-kms/<name>`), so a host adds and removes
+  virtual displays on demand instead of drawing from a pool fixed at module
+  load. Role and session index are settable before the card exists, so a
+  dynamic card lands on the same seat and broker a pool card would, and the
+  `card`/`render_node` attributes report the nodes it received;
 - 1–8 independent DRM cards (`devices=`, default 1), each with its own
   DRM-master domain so separate compositors can back separate graphical
   sessions. The legacy `devices=N outputs=1` layout remains available;
@@ -372,6 +378,10 @@ module, drives a `modetest` producer, and verifies the DMA-BUF/sync_file path.
 
 Other validation scripts (run as root, in the virtme-ng VM or on the host):
 
+- `scripts/vm-configfs-test.sh` — creates and removes cards at runtime through
+  configfs alongside a static card, and verifies role/seat metadata, unique
+  output naming, rejected writes on a live card, refused unload, and clean
+  teardown;
 - `scripts/vm-multi-device-test.sh` — creates two independent DRM cards, gives
   each one a simultaneous DRM master, and verifies distinct owner/frame/DMA-BUF
   channels, exact 854x480 visible geometry with an aligned pitch, and clean

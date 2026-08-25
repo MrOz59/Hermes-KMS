@@ -10,6 +10,8 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KO="$REPO/kernel/hermes-kms/hermes_kms.ko"
+UAPI_VERSION="$(awk '/^#define HERMES_KMS_UAPI_VERSION/ { print $3 }' \
+	"$REPO/include/uapi/drm/hermes_kms_drm.h")"
 CTL="$REPO/tools/hermes-kmsctl/hermes-kmsctl"
 OLD_CTL="${1:-$REPO/tools/hermes-kmsctl/hermes-kmsctl-v0.1.2}"
 TEST_TMP="$(mktemp -d /tmp/hermes-uapi-compat.XXXXXX)"
@@ -105,7 +107,7 @@ LOADED_BY_TEST=1
 sleep 0.5
 
 # These ioctl numbers and struct sizes must remain compatible.
-require_value "$("$OLD_CTL" version)" uapi_version 11
+require_value "$("$OLD_CTL" version)" uapi_version "$UAPI_VERSION"
 require_value "$("$OLD_CTL" identity)" output HERMES-1
 "$OLD_CTL" caps >/dev/null
 "$OLD_CTL" status >/dev/null
@@ -163,4 +165,4 @@ if [ "$FAIL" -ne 0 ]; then
 fi
 
 printf '%s\n' \
-	'PASS: unmodified v0.1.2 owner remains bound to HERMES-1 under secure UAPI v11'
+	'PASS: unmodified v0.1.2 owner remains bound to HERMES-1 under the current secure UAPI'

@@ -33,6 +33,11 @@
 - Installable syscall-note UAPI and MIT-licensed, application-neutral session
   helper for external consumers; the kernel contract contains no Hermes/Steam
   process identity rule.
+- Runtime card creation and removal through configfs
+  (`/sys/kernel/config/hermes-kms/`), matching the interface vkms adopted
+  upstream. Cards no longer have to be drawn from a pool fixed at module load,
+  and a project that only wants a virtual display can create one without
+  writing any ioctl code.
 
 ## Next
 

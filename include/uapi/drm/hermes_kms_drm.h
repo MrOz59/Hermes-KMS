@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define HERMES_KMS_UAPI_VERSION 11
+#define HERMES_KMS_UAPI_VERSION 12
 
 #define HERMES_KMS_NAME_LEN 32
 
@@ -35,6 +35,15 @@ extern "C" {
 #define HERMES_KMS_CAP_SESSION_DEVICE_POOL	(1ULL << 13)
 #define HERMES_KMS_CAP_SESSION_TOKEN		(1ULL << 14)
 #define HERMES_KMS_CAP_CURSOR_CAPTURE		(1ULL << 15)
+/*
+ * Cards can be created and removed at runtime through configfs
+ * (/sys/kernel/config/hermes-kms/). When this is set, GET_IDENTITY's
+ * device_count is the number of cards that exist right now and device_index
+ * values are neither dense nor stable across a card being removed and
+ * recreated. Identify a card by its role and session_index, or by the device
+ * node the creating controller recorded, rather than by walking indices.
+ */
+#define HERMES_KMS_CAP_DYNAMIC_DEVICES		(1ULL << 16)
 #define HERMES_KMS_CAP_DMABUF_EXPORT_PLANNED	(1ULL << 32)
 #define HERMES_KMS_CAP_ZERO_COPY_TARGET		(1ULL << 33)
 #define HERMES_KMS_CAP_WRITEBACK_CONNECTOR	(1ULL << 34)

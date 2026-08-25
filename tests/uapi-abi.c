@@ -28,7 +28,7 @@
 	_Static_assert((unsigned long)(name) == (value), \
 		       "unexpected encoded ioctl value: " #name)
 
-_Static_assert(HERMES_KMS_UAPI_VERSION == 11,
+_Static_assert(HERMES_KMS_UAPI_VERSION == 12,
 	       "update the ABI test when intentionally changing the UAPI");
 
 /*

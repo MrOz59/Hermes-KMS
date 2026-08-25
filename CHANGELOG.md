@@ -26,7 +26,35 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- The private-seat udev rule no longer has its `TAG-="uaccess"` silently undone.
+  systemd's `70-uaccess.rules` adds `TAG+="uaccess"` to every DRM card and sorts
+  after any `70-hermes-*` name, so the removal never survived to
+  `73-seat-late.rules`, which is what runs the uaccess builtin. The file is now
+  `72-hermes-kms-session-seats.rules`, between the two. `make
+  install-runtime-udev` removes the stale `70-` copy from earlier installs.
+- `scripts/hermes-export-stress.c` no longer counts `-ESTALE` as a failure.
+  `ESTALE` is the documented answer when a flip lands between latching frame
+  metadata and installing the fds, and the consumer is expected to retry, which
+  the harness already did. Counting it made a healthy run report roughly twenty
+  failures out of eight million acquires, so the stress test always failed and
+  carried no signal. Stale retries are now reported separately.
+
 ### Added
+
+- Runtime card creation and removal through configfs. `mkdir
+  /sys/kernel/config/hermes-kms/<name>`, set `outputs`, `role` and
+  `session_index`, then write `enabled`; `card` and `render_node` report the
+  nodes the card received. Cards no longer have to come from a pool fixed at
+  module load, and a project that only wants a virtual display can create one
+  without writing ioctl code. Announced as
+  `HERMES_KMS_CAP_DYNAMIC_DEVICES` (UAPI v12, no struct changes): with it set,
+  `GET_IDENTITY.device_count` is the live count and `device_index` values are
+  neither dense nor stable across a card being recreated. Output names and EDID
+  serials are now allocated module-wide so they stay unique across independently
+  created cards, and removal uses `drm_dev_unplug()` so a compositor still
+  holding the card sees `ENODEV` rather than a device being torn down.
 
 - Ten-bit scanout formats. The primary plane now also offers `XRGB2101010`,
   `ARGB2101010`, `XBGR2101010` and `ABGR2101010`, the prerequisite for wide

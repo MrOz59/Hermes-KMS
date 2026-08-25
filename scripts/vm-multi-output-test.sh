@@ -13,6 +13,8 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KO="$REPO/kernel/hermes-kms/hermes_kms.ko"
+UAPI_VERSION="$(awk '/^#define HERMES_KMS_UAPI_VERSION/ { print $3 }' \
+	"$REPO/include/uapi/drm/hermes_kms_drm.h")"
 CTL="$REPO/tools/hermes-kmsctl/hermes-kmsctl"
 TEST_TMP="$(mktemp -d /tmp/hermes-multi-output.XXXXXX)"
 MODETEST_LOG="$TEST_TMP/modetest.log"
@@ -109,7 +111,7 @@ sleep 0.5
 
 VERSION="$("$CTL" version)"
 CAPS="$("$CTL" caps)"
-require_value "$VERSION" uapi_version 11
+require_value "$VERSION" uapi_version "$UAPI_VERSION"
 require_value "$CAPS" output_count 2
 require_value "$CAPS" multi_output true
 
