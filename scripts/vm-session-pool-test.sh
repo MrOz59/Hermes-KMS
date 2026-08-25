@@ -5,7 +5,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KO="$REPO/kernel/hermes-kms/hermes_kms.ko"
 CTL="$REPO/tools/hermes-kmsctl/hermes-kmsctl"
-RUNTIME_RULE=/run/udev/rules.d/70-hermes-kms-session-seats.rules
+RUNTIME_RULE=/run/udev/rules.d/72-hermes-kms-session-seats.rules
 RULE_BACKUP=""
 MODULE_LOADED_BY_TEST=0
 CARDS=()
@@ -64,7 +64,7 @@ if [ -e "$RUNTIME_RULE" ]; then
 	RULE_BACKUP="$(mktemp /tmp/hermes-udev-rule.XXXXXX)"
 	cp -- "$RUNTIME_RULE" "$RULE_BACKUP"
 fi
-install -Dm0644 "$REPO/udev/70-hermes-kms-session-seats.rules" "$RUNTIME_RULE"
+install -Dm0644 "$REPO/udev/72-hermes-kms-session-seats.rules" "$RUNTIME_RULE"
 udevadm control --reload-rules
 DMESG_MARK="$(dmesg | wc -l)"
 insmod "$KO" initial_enabled=0 hotplug_events=0 session_devices=2 outputs=1

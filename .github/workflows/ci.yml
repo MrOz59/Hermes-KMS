@@ -51,7 +51,7 @@ jobs:
           bash -n PKGBUILD
           dash -n scripts/hermes-kms-setup
           xmllint --noout packaging/polkit/io.github.mroz59.hermes-kms.policy
-          udevadm verify udev/70-hermes-kms-session-seats.rules
+          udevadm verify udev/72-hermes-kms-session-seats.rules
           udevadm verify udev/99-hermes-kms-ignore-seat.rules
           sudo install -Dm0755 scripts/hermes-kms-seatd-instance \
             /usr/lib/hermes-kms/hermes-kms-seatd-instance

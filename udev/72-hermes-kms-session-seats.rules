@@ -1,3 +1,9 @@
+# The 72- prefix is load-bearing. systemd's 70-uaccess.rules unconditionally
+# adds TAG+="uaccess" to every DRM card, and it sorts after any 70-hermes-*
+# name, so a TAG-="uaccess" here at 70 was silently undone. 73-seat-late.rules
+# then runs the uaccess builtin on whatever is still tagged, which is why this
+# file has to land between the two.
+#
 # Assign only Hermes-KMS devices whose kernel identity says "session" to
 # private seats. In the packaged session_devices=N pool, device 0 has role
 # "host" and deliberately falls through to the normal seat0 rules. Explicit

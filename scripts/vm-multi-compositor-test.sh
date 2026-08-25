@@ -13,7 +13,7 @@ SESSION_FILES=("$TEST_ROOT/session-1.auth" "$TEST_ROOT/session-2.auth")
 HOLD_PIDS=()
 WESTON_PIDS=()
 SEATD_PIDS=()
-RUNTIME_RULE="/run/udev/rules.d/70-hermes-kms-session-seats.rules"
+RUNTIME_RULE="/run/udev/rules.d/72-hermes-kms-session-seats.rules"
 RULE_BACKUP=""
 MODULE_LOADED_BY_TEST=0
 
@@ -88,7 +88,7 @@ if [ -e "$RUNTIME_RULE" ]; then
 	RULE_BACKUP="$(mktemp /tmp/hermes-udev-rule.XXXXXX)"
 	cp -- "$RUNTIME_RULE" "$RULE_BACKUP"
 fi
-cp "$REPO/udev/70-hermes-kms-session-seats.rules" "$RUNTIME_RULE"
+cp "$REPO/udev/72-hermes-kms-session-seats.rules" "$RUNTIME_RULE"
 udevadm control --reload-rules
 insmod "$KO" initial_enabled=0 hotplug_events=0 devices=2 outputs=1
 MODULE_LOADED_BY_TEST=1

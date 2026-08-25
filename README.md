@@ -316,7 +316,7 @@ sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0 session_devices=4 
 ```
 
 Independent compositors use the packaged
-`70-hermes-kms-session-seats.rules` and one private seat broker per session
+`72-hermes-kms-session-seats.rules` and one private seat broker per session
 device. The udev rule starts those instances as cards appear; users no longer
 enable N units or join the `seat` group manually. `hermes-kms-setup` records
 the Hermes service uid, removes persistent broker enablement left by older

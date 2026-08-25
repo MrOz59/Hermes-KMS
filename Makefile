@@ -235,8 +235,8 @@ install-configs:
 		'$(DESTDIR)/usr/lib/modules-load.d/hermes-kms.conf'
 	install -Dm0644 packaging/modprobe.d/hermes-kms.conf \
 		'$(DESTDIR)/usr/lib/modprobe.d/hermes-kms.conf'
-	install -Dm0644 udev/70-hermes-kms-session-seats.rules \
-		'$(DESTDIR)$(SYSTEM_UDEV_RULE_DIR)/70-hermes-kms-session-seats.rules'
+	install -Dm0644 udev/72-hermes-kms-session-seats.rules \
+		'$(DESTDIR)$(SYSTEM_UDEV_RULE_DIR)/72-hermes-kms-session-seats.rules'
 	install -Dm0755 scripts/hermes-kms-seatd-instance \
 		'$(DESTDIR)/usr/lib/hermes-kms/hermes-kms-seatd-instance'
 	install -Dm0755 scripts/hermes-kms-setup \
@@ -300,6 +300,9 @@ tools/hermes-cursor-probe/hermes_cursor_probe: tools/hermes-cursor-probe/hermes_
 
 install-runtime-udev:
 	$(MAKE) install-configs DESTDIR=
+	@# The rule moved from 70- to 72- so systemd's 70-uaccess.rules cannot
+	@# re-add the tag it removes; drop the stale copy from older installs.
+	$(RM) $(SYSTEM_UDEV_RULE_DIR)/70-hermes-kms-session-seats.rules
 	-systemctl daemon-reload
 	-udevadm control --reload-rules
 	-udevadm trigger --subsystem-match=drm --action=change
@@ -329,6 +332,7 @@ uninstall-runtime-udev:
 	$(RM) -r -- /run/hermes-kms-seatd
 	$(RM) /usr/lib/modules-load.d/hermes-kms.conf
 	$(RM) /usr/lib/modprobe.d/hermes-kms.conf
+	$(RM) $(SYSTEM_UDEV_RULE_DIR)/72-hermes-kms-session-seats.rules
 	$(RM) $(SYSTEM_UDEV_RULE_DIR)/70-hermes-kms-session-seats.rules
 	$(RM) /usr/lib/systemd/system/hermes-kms-seatd@.service
 	$(RM) /usr/lib/hermes-kms/hermes-kms-seatd-instance
