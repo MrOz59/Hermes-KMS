@@ -26,6 +26,13 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Changed
+
+- `insecure_legacy_unbound_access` is load-time only (`0444`) instead of
+  runtime-writable, and logs a warning when set. At `0600` root could widen
+  every output's capture access on a live system mid-session, with nothing in
+  the log to show for it.
+
 ### Fixed
 
 - The private-seat udev rule no longer has its `TAG-="uaccess"` silently undone.

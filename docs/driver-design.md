@@ -552,7 +552,10 @@ Topology, initial mode/state and `non_desktop` are read-only after module load.
 `hotplug_events` remains a runtime diagnostic switch. The root-only
 `insecure_legacy_unbound_access=1` escape hatch restores pre-v11 unbound
 status/capture/wait/metrics access for old diagnostic clients; it weakens local
-capture isolation and must not be enabled in a normal installation.
+capture isolation and must not be enabled in a normal installation. It is
+load-time only and logs a warning when set, because widening every output's
+capture access on a live system, silently and mid-session, is not something an
+escape hatch should be able to do.
 
 The default is `initial_enabled=0`, so the DRM device exists but the connector
 starts disconnected. This prevents the desktop compositor from immediately

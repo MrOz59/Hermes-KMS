@@ -162,9 +162,17 @@ module_param(hotplug_events, bool, 0644);
 MODULE_PARM_DESC(hotplug_events, "Emit DRM hotplug events when output state changes");
 module_param(non_desktop, bool, 0444);
 MODULE_PARM_DESC(non_desktop, "Mark connector as non-desktop. Default false so compositors can manage Hermes as a normal virtual monitor when connected");
-module_param(insecure_legacy_unbound_access, bool, 0600);
+/*
+ * Load-time only, deliberately. At 0600 root could widen every output's capture
+ * access on a live system, silently and mid-session: hermes_kms_file_has_access
+ * starts returning true for every fd and SELECT_OUTPUT starts accepting another
+ * session's active output. An escape hatch for old diagnostic clients does not
+ * need to be reachable without a reload, and a reload is exactly the moment to
+ * reconsider it.
+ */
+module_param(insecure_legacy_unbound_access, bool, 0444);
 MODULE_PARM_DESC(insecure_legacy_unbound_access,
-		 "Allow pre-v11 unbound status/capture/wait/metrics access (unsafe, default false)");
+		 "Allow pre-v11 unbound status/capture/wait/metrics access (unsafe, load-time only, default false)");
 module_param(initial_width, uint, 0444);
 MODULE_PARM_DESC(initial_width, "Initial virtual output width");
 module_param(initial_height, uint, 0444);
@@ -472,16 +480,21 @@ hermes_kms_file_has_access_locked(struct hermes_kms_output *output,
 		atomic64_read(&output->authorization_generation);
 }
 
-/* Return with both locks held, in context -> output order. */
+/*
+ * Return with both locks held, in context -> output order, or -EACCES.
+ *
+ * Every protected ioctl goes through here, and none of them has a public
+ * variant: GET_STATUS is the only call with an unauthenticated path and it
+ * takes the CRTC modeset lock as well, so it does its own check inline.
+ */
 static int
 hermes_kms_lock_scoped_output(struct hermes_kms_device *hdev,
-			      struct drm_file *file, bool allow_public_idle,
+			      struct drm_file *file,
 			      struct hermes_kms_file **context_out,
 			      struct hermes_kms_output **output_out)
 {
 	struct hermes_kms_file *context = file->driver_priv;
 	struct hermes_kms_output *output;
-	bool public_idle;
 
 	if (!context)
 		return -EINVAL;
@@ -489,10 +502,7 @@ hermes_kms_lock_scoped_output(struct hermes_kms_device *hdev,
 	mutex_lock(&context->lock);
 	output = hermes_kms_output_for_context(hdev, context);
 	mutex_lock(&output->state_lock);
-	public_idle = allow_public_idle && !output->owner_file &&
-		      !output->output_enabled && !output->framebuffer;
-	if (!public_idle &&
-	    !hermes_kms_file_has_access_locked(output, file, context)) {
+	if (!hermes_kms_file_has_access_locked(output, file, context)) {
 		mutex_unlock(&output->state_lock);
 		mutex_unlock(&context->lock);
 		return -EACCES;
@@ -1803,7 +1813,7 @@ static int hermes_kms_ioctl_get_metrics(struct drm_device *drm, void *data,
 
 	memset(metrics, 0, sizeof(*metrics));
 
-	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+	ret = hermes_kms_lock_scoped_output(hdev, file,
 					    &context, &output);
 	if (ret)
 		return ret;
@@ -1921,7 +1931,7 @@ static int hermes_kms_finish_wait_timeout(
 	int ret;
 
 	/* Revocation wins over a timeout, as promised by the public UAPI. */
-	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+	ret = hermes_kms_lock_scoped_output(hdev, file,
 					    &context, &selected);
 	if (ret)
 		return ret;
@@ -1961,7 +1971,7 @@ static int hermes_kms_ioctl_wait_frame(struct drm_device *drm, void *data,
 	    memchr_inv(wait->reserved, 0, sizeof(wait->reserved)))
 		return -EINVAL;
 
-	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+	ret = hermes_kms_lock_scoped_output(hdev, file,
 					    &context, &output);
 	if (ret)
 		return ret;
@@ -2002,7 +2012,7 @@ static int hermes_kms_ioctl_wait_frame(struct drm_device *drm, void *data,
 	}
 
 	end_ns = ktime_get_ns();
-	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+	ret = hermes_kms_lock_scoped_output(hdev, file,
 					    &context, &selected);
 	if (ret)
 		return ret;
@@ -2062,7 +2072,7 @@ static int hermes_kms_ioctl_wait_update(struct drm_device *drm, void *data,
 	    memchr_inv(wait->reserved, 0, sizeof(wait->reserved)))
 		return -EINVAL;
 
-	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+	ret = hermes_kms_lock_scoped_output(hdev, file,
 					    &context, &output);
 	if (ret)
 		return ret;
@@ -2108,7 +2118,7 @@ static int hermes_kms_ioctl_wait_update(struct drm_device *drm, void *data,
 	}
 
 	end_ns = ktime_get_ns();
-	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+	ret = hermes_kms_lock_scoped_output(hdev, file,
 					    &context, &selected);
 	if (ret)
 		return ret;
@@ -2411,7 +2421,7 @@ static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 	memset(frame, 0, sizeof(*frame));
 	hermes_kms_init_invalid_frame_fds(frame);
 
-	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+	ret = hermes_kms_lock_scoped_output(hdev, file,
 					    &context, &output);
 	if (ret)
 		return ret;
@@ -2635,7 +2645,7 @@ static int hermes_kms_ioctl_acquire_cursor(struct drm_device *drm, void *data,
 	memset(cursor, 0, sizeof(*cursor));
 	hermes_kms_init_invalid_cursor_fds(cursor);
 
-	ret = hermes_kms_lock_scoped_output(hdev, file, false,
+	ret = hermes_kms_lock_scoped_output(hdev, file,
 					    &context, &output);
 	if (ret)
 		return ret;
@@ -4476,6 +4486,10 @@ static void __init hermes_kms_sanitize_mode_range(void)
 			max_refresh_hz);
 
 	hermes_kms_report_edid_range_ceiling();
+
+	if (insecure_legacy_unbound_access)
+		pr_warn("%s: insecure_legacy_unbound_access=1 lets any file descriptor read every output's capture stream; local capture isolation is disabled\n",
+			HERMES_KMS_DRIVER_NAME);
 }
 
 static int __init hermes_kms_init(void)
