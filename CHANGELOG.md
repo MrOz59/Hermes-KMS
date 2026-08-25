@@ -12,7 +12,7 @@ The canonical version lives in the driver source as three defines in
 
 ```c
 #define HERMES_KMS_DRIVER_MAJOR 0
-#define HERMES_KMS_DRIVER_MINOR 4
+#define HERMES_KMS_DRIVER_MINOR 5
 #define HERMES_KMS_DRIVER_PATCH 0
 ```
 
@@ -24,7 +24,7 @@ tag `vMAJOR.MINOR.PATCH`.
 While the major version is `0`, the UAPI and on-disk/ioctl interfaces are still
 subject to change between minor releases.
 
-## [Unreleased]
+## [0.5.0] - unreleased
 
 ### Changed
 
