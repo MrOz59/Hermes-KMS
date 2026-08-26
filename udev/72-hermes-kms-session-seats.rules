@@ -11,8 +11,21 @@
 #
 # The matching private seatd broker is pulled in automatically by the DRM-card
 # device. Users therefore do not need to enable N service instances manually.
-# Consumers derive the seat name as hermes-kms-<session_index> from the
-# stable UAPI/sysfs session index; no application-specific lookup is required.
+# Consumers derive the seat name as hermes-kms-<session_index> from the stable
+# UAPI/sysfs session index; no application-specific lookup is required.
+#
+# The name deliberately does not start with "seat", which is what systemd-logind
+# requires before it will register a seat. Registering them was tried and had to
+# be undone: a seat logind knows is a seat a multi-seat display manager offers a
+# login on, and SDDM promptly started a greeter on each of these, taking the
+# host's own desktop session down with it. These seats exist for compositors
+# Hermes starts on cards nobody sits in front of.
+#
+# The cost of staying outside logind is that libseat has no real name to report
+# a compositor - wlroots asks libseat_seat_name(), gets seatd's hardcoded
+# "seat0", and points libinput at the host's devices - so wlroots-based
+# compositors cannot yet be used for an isolated session. weston can, because
+# it takes --seat explicitly.
 ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_role}=="session", ATTRS{hermes_kms_session_index}=="1", ENV{ID_SEAT}="hermes-kms-1", TAG+="seat", TAG+="master-of-seat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hermes-kms-seatd@1.service", OWNER="root", GROUP="root", MODE="0600", TAG-="uaccess"
 ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_role}=="session", ATTRS{hermes_kms_session_index}=="2", ENV{ID_SEAT}="hermes-kms-2", TAG+="seat", TAG+="master-of-seat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hermes-kms-seatd@2.service", OWNER="root", GROUP="root", MODE="0600", TAG-="uaccess"
 ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_role}=="session", ATTRS{hermes_kms_session_index}=="3", ENV{ID_SEAT}="hermes-kms-3", TAG+="seat", TAG+="master-of-seat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hermes-kms-seatd@3.service", OWNER="root", GROUP="root", MODE="0600", TAG-="uaccess"
