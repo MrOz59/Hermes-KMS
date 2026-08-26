@@ -1201,8 +1201,9 @@ static int hermes_kms_connector_get_modes(struct drm_connector *connector)
 	 * the connector as a normal monitor (name, manufacturer, range limits)
 	 * instead of warning about a missing EDID. drm_edid_connector_update()
 	 * also records the EDID so userspace can read it back. The EDID's own
-	 * detailed-timing modes are added too, but the CVT mode below is marked
-	 * preferred so the client's exact geometry still wins.
+	 * detailed-timing modes are added too, and its first detailed timing is
+	 * preferred by definition, so the CVT mode below has to clear that flag
+	 * rather than just set its own.
 	 */
 	drm_edid = drm_edid_alloc(output->edid, sizeof(output->edid));
 	if (drm_edid) {
@@ -1225,6 +1226,22 @@ static int hermes_kms_connector_get_modes(struct drm_connector *connector)
 		mode = hermes_kms_exact_cvt_mode(connector->dev, width, height,
 						refresh_hz);
 		if (mode) {
+			struct drm_display_mode *probed;
+
+			/*
+			 * A connector is meant to advertise exactly one
+			 * preferred mode. The EDID above already contributed
+			 * one, so setting the flag here without clearing that
+			 * one leaves two, and userspace picks whichever sorts
+			 * first - drm_mode_sort() orders preferred modes by
+			 * area, so the larger EDID timing wins and the session
+			 * comes up at the wrong geometry. A compositor told to
+			 * pick for itself, as an isolated session's is, has
+			 * nothing else to go on.
+			 */
+			list_for_each_entry(probed, &connector->probed_modes, head)
+				probed->type &= ~DRM_MODE_TYPE_PREFERRED;
+
 			mode->type |= DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER;
 			drm_mode_probed_add(connector, mode);
 			count++;
