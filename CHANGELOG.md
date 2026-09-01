@@ -26,6 +26,19 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- An upgrade no longer leaves a working module reporting itself as unusable
+  without saying why. Render nodes are denied by default and granted by the
+  `90-` rule `hermes-kms-setup` writes; no card in the packaged pool sets
+  `hermes_kms_access_uid`, so nothing else reverses that deny. Until the setup
+  has run, the consumer logs `Couldn't open render node ... Permission denied`
+  and its panel reports Hermes-KMS as not enabled, which sends people to
+  modprobe a module that is already loaded. `post_install` always named the
+  configuration step; `post_upgrade` did not, which is exactly where somebody
+  who reinstalled, or who never ran it, ends up. It now says so, and only when
+  the rule is actually missing.
+
 ### Changed
 
 - The seat broker unit gains `SystemCallFilter=@system-service @mount` and

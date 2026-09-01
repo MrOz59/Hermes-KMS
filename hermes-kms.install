@@ -69,6 +69,43 @@ _remove_managed_setup_state() {
   rmdir /etc/hermes-kms 2>/dev/null || true
 }
 
+# Nothing owns the render nodes until hermes-kms-setup has run.
+#
+# 72-hermes-kms-session-seats.rules denies every Hermes render node by default,
+# and 92- only reverses that for a card whose hermes_kms_access_uid is set -
+# which no card in the packaged pool sets, host or session; the attribute is
+# there and empty. The one thing that grants the consumer access is therefore
+# the 90- rule hermes-kms-setup writes, and until it exists a loaded, healthy
+# module reports itself as unusable: the consumer logs "Couldn't open render
+# node ... Permission denied" and its panel says Hermes-KMS is not enabled,
+# which sends people to modprobe a module that is already loaded.
+#
+# post_install always said to run the setup. An upgrade did not, and an upgrade
+# is where somebody who removed and reinstalled - or who never ran it in the
+# first place - ends up. Say it whenever it is actually missing.
+_hermes_kms_missing_access_rule() {
+  local rule=/etc/udev/rules.d/90-hermes-kms-user.rules
+
+  [ -f "$rule" ] && return 1
+  return 0
+}
+
+_hermes_kms_setup_hint() {
+  _hermes_kms_missing_access_rule || return 0
+
+  cat >&2 <<-EOF
+
+  ==> Hermes-KMS render nodes are root-only until you configure a consumer.
+      Nothing has granted a user access to them, so a loaded module will still
+      report itself as unavailable, with "Permission denied" on /dev/dri/renderD*
+      in the consumer's log.
+
+      Configure it with:
+        sudo /usr/lib/hermes-kms/hermes-kms-setup configure --user auto
+
+	EOF
+}
+
 post_install() {
   _hermes_kms_stale_override
   _runtime_reload
@@ -92,6 +129,8 @@ post_upgrade() {
       'The Arch DKMS post-transaction hook will finish the kernel builds.' \
       'After this transaction completes, load it with: sudo modprobe hermes_kms'
   fi
+
+  _hermes_kms_setup_hint
 }
 
 pre_remove() {
