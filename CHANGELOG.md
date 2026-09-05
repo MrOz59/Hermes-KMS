@@ -26,6 +26,41 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Added
+
+- HDR advertisement from the virtual output. A compositor treats an output as
+  HDR-capable only through a two-gate chain, not a single signal. KWin, for
+  example, sets its `WideColorGamut` capability only when the connector exposes a
+  `Colorspace` property advertising BT2020 and the EDID reports BT2020 support
+  through a Colorimetry Data Block; only with `WideColorGamut` already set does it
+  then set `HighDynamicRange`, which additionally needs the `HDR_OUTPUT_METADATA`
+  property and an EDID HDR Static Metadata Data Block reporting PQ. Hermes
+  advertised none of these, so a virtual output always reported "HDR: incapable"
+  even next to a physical monitor streaming HDR correctly on the same GPU. An
+  earlier attempt that carried only the HDR Static Metadata block and the
+  `HDR_OUTPUT_METADATA` property still left HDR off on hardware, because the
+  BT2020 Colorimetry block and the `Colorspace` property were missing and the
+  `WideColorGamut` gate was therefore never satisfied. HDR now spans three
+  advertisement mechanisms: the EDID CTA-861 extension carries both an HDR Static
+  Metadata Data Block and a BT2020 Colorimetry Data Block, and the connector
+  exposes both the `HDR_OUTPUT_METADATA` property and a `Colorspace` property
+  advertising BT2020. The new `hdr_enable` module parameter (default off) gates
+  all of them as one unit — the CTA extension (both data blocks), the
+  `HDR_OUTPUT_METADATA` property, and the `Colorspace` property are present only
+  when it is set, and never a subset — so enabling HDR stays a deliberate opt-in
+  matching `color_depth`, `non_desktop` and the other load-time parameters.
+  Whether these advertisements alone are enough for KWin to enable HDR, or whether
+  `color_depth=10` must be set at the same time, is an untested-together
+  dependency: the two must be validated as a pair before deployment.
+  `tests/edid.c` covers the generated two-block EDID bytes — including the
+  Colorimetry block — and both block checksums under `make check`.
+  - Adding this parameter may warrant a `HERMES_KMS_DRIVER_MINOR` bump under the
+    versioning policy above, since it is a new load-time capability. The
+    canonical version lives in the three defines in
+    [`kernel/hermes-kms/hermes_kms.c`](kernel/hermes-kms/hermes_kms.c) that DKMS,
+    the PKGBUILD and `GET_VERSION` all read, so the number is left to the
+    maintainer cutting the release rather than fixed here.
+
 ### Fixed
 
 - An upgrade no longer leaves a working module reporting itself as unusable

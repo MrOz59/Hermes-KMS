@@ -103,8 +103,16 @@ the output name prefix is `HERMES-` and the UAPI symbols are prefixed
 `HERMES_KMS_`.
 
 What is currently validated: VAAPI with `XRGB8888`, linear. NVENC/AMF and
-NV12/P010/HDR are not validated yet — see the [Roadmap](#roadmap). Forks and
-contributions extending those paths are welcome under the project's license.
+NV12/P010 are not validated yet — see the [Roadmap](#roadmap). HDR advertisement
+is now implemented but not yet validated end to end: with `hdr_enable=1` the
+synthetic EDID's CTA-861 extension carries both an HDR Static Metadata Data Block
+and a BT2020 Colorimetry Data Block, and the connector exposes both the
+`HDR_OUTPUT_METADATA` and `Colorspace` properties — the three signals a
+compositor needs together, since KWin gates HDR behind a wide-colour-gamut
+prerequisite (the `Colorspace` property plus BT2020 in the EDID) before it will
+enable high dynamic range. Full HDR streaming and the `color_depth=10` dependency
+are still open. Forks and contributions extending those paths are welcome under
+the project's license.
 
 The kernel module is GPL-2.0, while the installed UAPI has the Linux syscall-note
 exception and the optional userspace session helper is MIT-licensed. This keeps
@@ -152,6 +160,14 @@ an independently developed consumer separate from the Hermes application; see
   while keeping the framebuffer pitch independently aligned for DMA-BUF;
 - eight- and ten-bit scanout formats (`XRGB8888`/`ARGB8888` and the `2101010`
   variants), with the advertised EDID depth selected by `color_depth=`;
+- optional HDR advertisement (`hdr_enable=1`, default off), which adds both a
+  CTA-861 HDR Static Metadata Data Block and a BT2020 Colorimetry Data Block to
+  the synthetic EDID and attaches both the `HDR_OUTPUT_METADATA` and `Colorspace`
+  (advertising BT2020) connector properties together, so a compositor sees all
+  three signals it needs to treat the output as HDR-capable — KWin, for example,
+  requires the `Colorspace` property plus BT2020 in the EDID for its
+  wide-colour-gamut prerequisite before it will enable HDR. Untested together
+  with `color_depth=10`; validate that pairing before deployment;
 - scanout modifier pass-through: any tiled or compressed layout the compositor's
   render GPU produces is accepted, and `scanout_modifiers=` publishes the extra
   layouts an `IN_FORMATS`-driven compositor can negotiate;
@@ -327,6 +343,41 @@ sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0 outputs=2
 sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0 devices=2 outputs=1
 sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0 session_devices=4 outputs=1
 ```
+
+`hdr_enable=1` advertises HDR (default off). It gates three mechanisms together —
+the CTA-861 HDR Static Metadata Data Block and the BT2020 Colorimetry Data Block
+in the EDID, and the `HDR_OUTPUT_METADATA` and `Colorspace` connector
+properties — so the output never advertises a subset. All three are needed
+because KWin treats an output HDR-capable through a two-gate chain: it sets
+`WideColorGamut` only when the connector has a `Colorspace` property advertising
+BT2020 and the EDID reports BT2020 (the Colorimetry block), and only then sets
+`HighDynamicRange`, which additionally needs `HDR_OUTPUT_METADATA` and the EDID's
+PQ HDR Static Metadata block. An earlier attempt carrying only the HDR Static
+Metadata block and `HDR_OUTPUT_METADATA` left HDR off on hardware precisely
+because the Colorimetry block and `Colorspace` property were missing. Whether
+these advertisements alone are enough for a compositor to enable HDR, or whether
+ten-bit scanout (`color_depth=10`) must be set at the same time, is not yet
+confirmed; the combination is untested together and must be validated before
+deployment. To load HDR together with ten-bit scanout:
+
+```bash
+sudo modprobe hermes_kms color_depth=10 hdr_enable=1
+```
+
+To apply the same parameters persistently at every module load, drop a file in
+`/etc/modprobe.d`:
+
+```
+# /etc/modprobe.d/hermes-kms-hdr.conf
+options hermes_kms color_depth=10 hdr_enable=1
+```
+
+During verification, compare two configurations to determine empirically whether
+the advertisement alone is sufficient: (a) `hdr_enable=1` without `color_depth=10`,
+and (b) `hdr_enable=1` with `color_depth=10`. If a consumer still reports
+"HDR: incapable" after all three mechanisms are applied and `color_depth=10` is
+set, CRTC color-management properties are the next investigation area — that is
+outside this feature's scope and no further code change is made here.
 
 Independent compositors use the packaged
 `72-hermes-kms-session-seats.rules` and one private seat broker per session

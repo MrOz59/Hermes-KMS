@@ -49,7 +49,53 @@ typedef uint64_t u64;
 #define HERMES_KMS_EDID_FEATURES_OFFSET		24
 #define HERMES_KMS_EDID_DTD_OFFSET		54
 #define HERMES_KMS_EDID_RANGE_OFFSET		90
+#define HERMES_KMS_EDID_EXT_COUNT_OFFSET	126
 #define HERMES_KMS_EDID_CHECKSUM_OFFSET		127
+
+/*
+ * CTA-861 extension header, carried in the second EDID block. A compositor
+ * treats an output as HDR-capable only when both an EDID HDR Static Metadata
+ * Data Block and the HDR_OUTPUT_METADATA connector property are present, and
+ * KWin additionally gates HDR behind a BT2020 Colorimetry Data Block, so the
+ * extension carries both data blocks. Tag 0x02 marks a CTA extension; the DTD
+ * offset says "no detailed timings" and points past the data block collection.
+ *
+ * The DTD offset equals 4 (the CTA header) plus the byte length of the data
+ * block collection: an HDR Static Metadata block (4 bytes) followed by a
+ * Colorimetry block (4 bytes) gives 4 + 8 = 12. With no detailed timings, this
+ * also marks where the zero padding begins.
+ */
+#define HERMES_KMS_CTA_TAG		0x02	/* extension block[0] */
+#define HERMES_KMS_CTA_REVISION		0x03	/* extension block[1] */
+#define HERMES_KMS_CTA_DTD_OFFSET	0x0c	/* extension block[2]: 4 + 8-byte collection */
+
+/*
+ * The HDR Static Metadata Data Block is a CTA "use extended tag" data block:
+ * the top three bits of its tag/length byte select the extended-tag block
+ * type (0x07), and the extended tag byte that follows (0x06) identifies it as
+ * HDR Static Metadata (CTA-861.3).
+ */
+#define HERMES_KMS_CTA_TAG_EXTENDED	0x07	/* tag/length byte, bits 7:5 */
+#define HERMES_KMS_CTA_EXT_TAG_HDR_SM	0x06	/* HDR static metadata */
+
+/*
+ * The Colorimetry Data Block is another CTA "use extended tag" data block
+ * (extended tag 0x05). Its colorimetry byte advertises supported extended
+ * colorimetry encodings; bit 7 signals BT2020 RGB, which is what makes KWin's
+ * edid()->supportsBT2020() return true.
+ */
+#define HERMES_KMS_CTA_EXT_TAG_COLORIMETRY	0x05	/* colorimetry data block */
+#define HERMES_KMS_COLORIMETRY_BT2020_RGB	0x80	/* colorimetry byte, bit 7 */
+
+/*
+ * EOTF support flags in the HDR Static Metadata Data Block. Traditional SDR
+ * gamma and SMPTE ST2084 (PQ) are advertised together so PQ is never offered
+ * without a defined SDR fallback; HERMES_KMS_HDR_SM_TYPE1 declares support for
+ * Static Metadata Descriptor Type 1.
+ */
+#define HERMES_KMS_HDR_EOTF_SDR_GAMMA	0x01	/* traditional gamma SDR */
+#define HERMES_KMS_HDR_EOTF_ST2084_PQ	0x04	/* SMPTE ST2084 (PQ) */
+#define HERMES_KMS_HDR_SM_TYPE1		0x01	/* Static Metadata Descriptor Type 1 */
 
 /*
  * CVT keeps the vertical blanking interval at least 550 us long, so the number
@@ -288,6 +334,117 @@ hermes_kms_build_edid(u8 *edid, u32 serial,
 	edid[HERMES_KMS_EDID_CHECKSUM_OFFSET] = (u8)-checksum;
 
 	return representable;
+}
+
+/*
+ * Build the CTA-861 extension block (the second EDID block) carrying an HDR
+ * Static Metadata Data Block into @block, which must have room for
+ * HERMES_KMS_EDID_SIZE bytes.
+ *
+ * A compositor only treats an output as HDR-capable when it finds an HDR
+ * Static Metadata Data Block in the EDID, and KWin's WideColorGamut gate --
+ * a prerequisite it requires before it will enable HDR at all -- additionally
+ * needs edid()->supportsBT2020() to return true, which comes from a BT2020
+ * Colorimetry Data Block, working alongside the connector's Colorspace
+ * property. So this block carries two data blocks back to back: the HDR
+ * Static Metadata block then the Colorimetry block. The CTA header advertises
+ * no native video formats and a DTD offset of 12, which spans the CTA header
+ * plus both 4-byte data blocks; everything after byte 12 is zero padding to
+ * the checksum.
+ *
+ * The EOTF byte is written from a single combined constant that always sets
+ * the traditional-SDR-gamma bit together with the SMPTE ST2084 (PQ) bit, so
+ * the block can never advertise PQ without a defined SDR fallback -- the one
+ * cross-flag invariant CTA-861.3 expects. The Colorimetry block sets only the
+ * BT2020 RGB bit and no gamut-metadata bits. The checksum at offset 127 is
+ * chosen so all 128 bytes sum to 0 mod 256, matching the base block's own
+ * checksum rule; without it the block is silently dropped by EDID parsers.
+ */
+static inline void hermes_kms_build_edid_hdr_extension(u8 *block)
+{
+	u8 checksum = 0;
+	unsigned int i;
+
+	/* CTA-861 extension header. */
+	block[0] = HERMES_KMS_CTA_TAG;
+	block[1] = HERMES_KMS_CTA_REVISION;
+	block[2] = HERMES_KMS_CTA_DTD_OFFSET;
+	block[3] = 0x00; /* no native formats, no flags */
+
+	/*
+	 * HDR Static Metadata Data Block (bytes 4..7): a use-extended-tag data
+	 * block whose tag/length byte selects the extended-tag type (top three
+	 * bits 0x07) and declares three payload bytes following it, the
+	 * extended tag identifies it as HDR Static Metadata (0x06), the EOTF
+	 * byte offers SDR gamma and ST2084/PQ together, and the descriptor byte
+	 * declares Static Metadata Descriptor Type 1.
+	 */
+	block[4] = (u8)((HERMES_KMS_CTA_TAG_EXTENDED << 5) | 3);
+	block[5] = HERMES_KMS_CTA_EXT_TAG_HDR_SM;
+	block[6] = HERMES_KMS_HDR_EOTF_SDR_GAMMA | HERMES_KMS_HDR_EOTF_ST2084_PQ;
+	block[7] = HERMES_KMS_HDR_SM_TYPE1;
+
+	/*
+	 * Colorimetry Data Block (bytes 8..11): another use-extended-tag data
+	 * block with three payload bytes; the extended tag identifies it as
+	 * Colorimetry (0x05), the colorimetry byte sets only the BT2020 RGB bit,
+	 * and the final gamut-metadata byte sets no bits.
+	 */
+	block[8] = (u8)((HERMES_KMS_CTA_TAG_EXTENDED << 5) | 3);
+	block[9] = HERMES_KMS_CTA_EXT_TAG_COLORIMETRY;
+	block[10] = HERMES_KMS_COLORIMETRY_BT2020_RGB;
+	block[11] = 0x00; /* no gamut-metadata bits */
+
+	/* Zero the padding region up to the checksum byte. */
+	for (i = HERMES_KMS_CTA_DTD_OFFSET; i < HERMES_KMS_EDID_CHECKSUM_OFFSET; i++)
+		block[i] = 0x00;
+
+	for (i = 0; i < HERMES_KMS_EDID_CHECKSUM_OFFSET; i++)
+		checksum += block[i];
+	block[HERMES_KMS_EDID_CHECKSUM_OFFSET] = (u8)-checksum;
+}
+
+/*
+ * Promote a finalized single-block base EDID in @edid into a two-block EDID
+ * that advertises HDR: flip the base block's extension-count byte to 1, fix up
+ * the base checksum, and build the CTA extension block into the second block.
+ * @edid must have room for 2 * HERMES_KMS_EDID_SIZE bytes.
+ *
+ * The base block's extension-count byte (offset 126) tells the EDID parser how
+ * many trailing blocks to read, so it must move from 0 to 1 in lockstep with
+ * the checksum: raising byte 126 by one raises the running sum by one, so the
+ * checksum byte drops by exactly one to keep all 128 bytes summing to 0 mod
+ * 256. Recomputing (rather than blindly decrementing) keeps this correct even
+ * if the base block ever changes, and it stays byte-for-byte equal to
+ * "old checksum - 1 mod 256" because that is the only value that preserves the
+ * invariant.
+ *
+ * Guard first: a valid base block already sums to 0 mod 256, and appending an
+ * extension to a broken base would only produce a broken two-block EDID. So if
+ * the incoming base does not already sum to 0, refuse -- return false and
+ * leave the extension region (edid[128..255]) untouched -- rather than
+ * "finalizing" garbage.
+ */
+static inline bool hermes_kms_append_hdr_extension(u8 *edid)
+{
+	u8 sum = 0;
+	unsigned int i;
+
+	for (i = 0; i < HERMES_KMS_EDID_SIZE; i++)
+		sum += edid[i];
+	if (sum != 0)
+		return false;
+
+	edid[HERMES_KMS_EDID_EXT_COUNT_OFFSET] = 1;
+
+	sum = 0;
+	for (i = 0; i < HERMES_KMS_EDID_CHECKSUM_OFFSET; i++)
+		sum += edid[i];
+	edid[HERMES_KMS_EDID_CHECKSUM_OFFSET] = (u8)-sum;
+
+	hermes_kms_build_edid_hdr_extension(&edid[HERMES_KMS_EDID_SIZE]);
+
+	return true;
 }
 
 #endif /* HERMES_KMS_EDID_H */
