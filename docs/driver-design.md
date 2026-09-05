@@ -48,6 +48,25 @@ accept, and the synthetic EDID advertises eight bits per primary unless
 `color_depth=` says otherwise. Raising it is therefore a deliberate choice, and
 consumers must be prepared for a ten-bit fourcc when it is made.
 
+HDR advertisement itself is implemented, gated behind `hdr_enable` (default off).
+When set, the synthetic EDID gains a CTA-861 extension block carrying both an HDR
+Static Metadata Data Block (PQ) and a BT2020 Colorimetry Data Block, and the
+connector attaches both the `HDR_OUTPUT_METADATA` property and a `Colorspace`
+property advertising BT2020 — the three signals a compositor requires together to
+treat the output as HDR-capable, always enabled or disabled as one unit. Three
+are needed because KWin treats an output HDR-capable through a two-gate chain: it
+sets `WideColorGamut` only when the connector has a `Colorspace` property
+advertising BT2020 and the EDID reports BT2020 (via the Colorimetry block), and
+only then sets `HighDynamicRange`, which additionally needs `HDR_OUTPUT_METADATA`
+and the EDID's PQ HDR Static Metadata block. An earlier iteration carrying only
+the HDR Static Metadata block and `HDR_OUTPUT_METADATA` left HDR off on hardware
+because the Colorimetry block and `Colorspace` property were missing, so the
+`WideColorGamut` gate was never satisfied. This is the advertisement only:
+whether ten-bit scanout (`color_depth=10`) must be set simultaneously for a
+compositor to actually enable HDR is an untested-together dependency, and full
+HDR streaming validation remains open. `hdr_enable` and `color_depth=10` must be
+validated together before deployment.
+
 ### Scanout layouts
 
 The driver never samples a scanout pixel: it latches the framebuffer, holds a
@@ -625,6 +644,10 @@ The module supports these topology and initial-state parameters:
   plus a host card, mutually exclusive with an explicit `devices` topology)
 - `hotplug_events`
 - `non_desktop`
+- `hdr_enable` (advertise HDR; gates a CTA-861 EDID extension carrying both an
+  HDR Static Metadata block and a BT2020 Colorimetry block, plus the
+  `HDR_OUTPUT_METADATA` and `Colorspace` connector properties, all together;
+  default off, load-time only, untested together with `color_depth=10`)
 - `scanout_modifiers` (up to 15 extra `IN_FORMATS` layouts; linear is always
   advertised and every modifier is accepted regardless of this list)
 
@@ -707,6 +730,46 @@ Not yet implemented:
 
 - a real DRM writeback connector;
 - NVENC/AMF import validation (VAAPI is validated);
-- NV12/P010 scanout and HDR (the compositor composes in RGB; the encoder does
-  RGB→NV12 on the real GPU today);
+- NV12/P010 scanout (the compositor composes in RGB; the encoder does RGB→NV12
+  on the real GPU today);
 - full compositor recovery handling beyond owner-fd disconnect and hotplug.
+
+Implemented but not yet validated end to end: HDR advertisement. With
+`hdr_enable=1` the synthetic EDID's CTA-861 extension carries both an HDR Static
+Metadata Data Block (PQ) and a BT2020 Colorimetry Data Block, and the connector
+exposes both the `HDR_OUTPUT_METADATA` property and a `Colorspace` property
+advertising BT2020, so a compositor sees all three signals it needs to treat the
+output as HDR-capable. Three are required because KWin gates HDR behind a
+two-gate chain: `WideColorGamut` (needing the `Colorspace` property advertising
+BT2020 plus EDID BT2020 support from the Colorimetry block) is a prerequisite for
+`HighDynamicRange` (needing `HDR_OUTPUT_METADATA` plus the EDID's PQ HDR Static
+Metadata block). The first iteration, which carried only the HDR Static Metadata
+block and `HDR_OUTPUT_METADATA`, left HDR off on hardware because the Colorimetry
+block and `Colorspace` property were missing. `tests/edid.c` covers the generated
+EDID bytes — including the Colorimetry block — and both block checksums under
+`make check`. What remains open is full HDR streaming validation and the
+`color_depth=10` dependency: it is not yet confirmed whether the EDID and
+property change alone enable HDR in the compositor, or whether ten-bit scanout
+must be set simultaneously.
+
+To load HDR together with ten-bit scanout:
+
+```bash
+sudo modprobe hermes_kms color_depth=10 hdr_enable=1
+```
+
+To apply these parameters persistently at every module load, drop a file in
+`/etc/modprobe.d`:
+
+```
+# /etc/modprobe.d/hermes-kms-hdr.conf
+options hermes_kms color_depth=10 hdr_enable=1
+```
+
+Two configurations must be compared during verification to resolve the
+dependency empirically: (a) `hdr_enable=1` without `color_depth=10`, and (b)
+`hdr_enable=1` with `color_depth=10`. If a Consumer still reports "HDR: incapable"
+after all three mechanisms are applied and `color_depth=10` is set, CRTC
+color-management properties (gamma LUT, degamma LUT, CTM, COLOR_PIPELINE) are the
+next investigation area. That is outside this feature's scope, and no further
+code change is made here in response to that condition.

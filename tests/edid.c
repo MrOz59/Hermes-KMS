@@ -175,6 +175,267 @@ static void check_color_depth(void)
 	}
 }
 
+/*
+ * Validate the CTA-861 extension block (the second EDID block) independently of
+ * the builder, mirroring how an EDID parser would decode it rather than reusing
+ * hermes_kms_build_edid_hdr_extension()'s own constants, so an inconsistent
+ * generator is caught instead of reproduced.
+ *
+ * Exercises Property 2 (the block sums to 0 mod 256), Property 4 (the EOTF byte
+ * sets the traditional-SDR-gamma and SMPTE ST2084/PQ bits together and never PQ
+ * without SDR gamma), and Property 6 (the HDR data block identity: a
+ * use-extended-tag data block with extended tag 0x06 declaring Static Metadata
+ * Descriptor Type 1).
+ *
+ * It also exercises Property 10 (the Colorimetry data block at bytes 8..11 is
+ * well-formed: 0xE3, 0x05, 0x80, 0x00), Property 11 (both data blocks are
+ * present and the DTD offset points past them at 12), and Property 12 (the CTA
+ * checksum sums to 0 mod 256 with both data blocks present -- the checksum
+ * check above now covers both blocks).
+ */
+static void check_cta_extension(const u8 *block, const char *what)
+{
+	unsigned int checksum = 0;
+	u8 tag_length;
+	u8 payload_length;
+	u8 eotf;
+	unsigned int i;
+
+	for (i = 0; i < HERMES_KMS_EDID_SIZE; i++)
+		checksum += block[i];
+	CHECK((checksum & 0xff) == 0,
+	      "%s: CTA extension checksum does not sum to zero", what);
+
+	/*
+	 * CTA-861 extension header: tag 0x02, DTD offset 12 (no detailed
+	 * timings; the offset points past the 4-byte CTA header plus the two
+	 * 4-byte data blocks that make up the 8-byte data block collection).
+	 */
+	CHECK(block[0] == 0x02,
+	      "%s: CTA extension tag is 0x%02x, expected 0x02", what, block[0]);
+	CHECK(block[2] == 0x0c,
+	      "%s: CTA DTD offset is 0x%02x, expected 0x0c (no detailed timings, past both data blocks)",
+	      what, block[2]);
+
+	/*
+	 * The data block collection starts at byte 4. Decode the tag/length
+	 * byte the way CTA-861 specifies: bits 7:5 are the block type and bits
+	 * 4:0 the number of payload bytes that follow.
+	 */
+	tag_length = block[4];
+	payload_length = tag_length & 0x1f;
+	CHECK((tag_length >> 5) == 0x07,
+	      "%s: data block type is %u, expected 0x07 (use extended tag)",
+	      what, tag_length >> 5);
+	CHECK(payload_length == 3,
+	      "%s: HDR data block declares %u payload bytes, expected 3",
+	      what, payload_length);
+
+	/* Extended tag 0x06 identifies the block as HDR Static Metadata. */
+	CHECK(block[5] == 0x06,
+	      "%s: extended tag is 0x%02x, expected 0x06 (HDR static metadata)",
+	      what, block[5]);
+
+	/*
+	 * EOTF byte: bit 0 is traditional SDR gamma, bit 2 is SMPTE ST2084
+	 * (PQ). Both must be set (0x05), and PQ must never appear without SDR
+	 * gamma.
+	 */
+	eotf = block[6];
+	CHECK(eotf == 0x05,
+	      "%s: EOTF byte is 0x%02x, expected 0x05 (SDR gamma + ST2084/PQ)",
+	      what, eotf);
+	CHECK(eotf & 0x01,
+	      "%s: traditional SDR gamma EOTF bit must be set", what);
+	CHECK(eotf & 0x04,
+	      "%s: SMPTE ST2084 (PQ) EOTF bit must be set", what);
+	CHECK(!(eotf & 0x04) || (eotf & 0x01),
+	      "%s: PQ EOTF must never be set without SDR gamma", what);
+
+	/* Descriptor byte declares Static Metadata Descriptor Type 1. */
+	CHECK(block[7] == 0x01,
+	      "%s: descriptor type byte is 0x%02x, expected 0x01",
+	      what, block[7]);
+
+	/*
+	 * The Colorimetry Data Block follows immediately at bytes 8..11.
+	 * Decode its tag/length byte the same way as the HDR block above: bits
+	 * 7:5 are the block type (0x07, use extended tag) and bits 4:0 the
+	 * payload length (3 bytes following).
+	 */
+	tag_length = block[8];
+	payload_length = tag_length & 0x1f;
+	CHECK((tag_length >> 5) == 0x07,
+	      "%s: colorimetry block type is %u, expected 0x07 (use extended tag)",
+	      what, tag_length >> 5);
+	CHECK(payload_length == 3,
+	      "%s: colorimetry block declares %u payload bytes, expected 3",
+	      what, payload_length);
+
+	/* Extended tag 0x05 identifies the block as Colorimetry. */
+	CHECK(block[9] == 0x05,
+	      "%s: colorimetry extended tag is 0x%02x, expected 0x05",
+	      what, block[9]);
+
+	/*
+	 * Colorimetry byte: bit 7 is BT2020 RGB. It must be the only bit set,
+	 * so the whole byte reads 0x80 -- KWin's supportsBT2020() only checks
+	 * for BT2020 RGB and the block advertises nothing else.
+	 */
+	CHECK(block[10] == 0x80,
+	      "%s: colorimetry byte is 0x%02x, expected 0x80 (BT2020 RGB only)",
+	      what, block[10]);
+	CHECK(block[10] & 0x80,
+	      "%s: BT2020 RGB colorimetry bit must be set", what);
+
+	/* Gamut-metadata byte advertises no supported bits. */
+	CHECK(block[11] == 0x00,
+	      "%s: gamut-metadata byte is 0x%02x, expected 0x00",
+	      what, block[11]);
+}
+
+/*
+ * Validate the two-block coupling between the base block and the appended CTA
+ * extension. Build a single-block base EDID, record its pre-append checksum,
+ * then promote it with hermes_kms_append_hdr_extension() and check that the
+ * base block is still well-formed while the extension-count and checksum bytes
+ * moved together.
+ *
+ * Exercises Property 1 (the base block sums to 0 mod 256 both before and after
+ * the extension is appended -- check_structure() re-runs the base-block
+ * checks), Property 3 (base byte 126 becomes 1 and base byte 127 becomes its
+ * pre-append value minus 1 mod 256), and Property 5 (the appended extension
+ * block is exactly HERMES_KMS_EDID_SIZE bytes and the whole buffer is exactly
+ * 2 * HERMES_KMS_EDID_SIZE bytes). check_cta_extension() covers the extension
+ * block's own well-formedness.
+ */
+static void check_base_with_extension(const struct hermes_kms_edid_config *config,
+				      const char *what)
+{
+	u8 edid[2 * HERMES_KMS_EDID_SIZE];
+	u8 pre_append_checksum;
+	bool appended;
+
+	CHECK(sizeof(edid) == 2 * HERMES_KMS_EDID_SIZE,
+	      "%s: EDID buffer must be exactly two blocks", what);
+
+	hermes_kms_build_edid(edid, 1, config);
+
+	/* The base block must be valid before the extension is appended. */
+	check_structure(edid, what);
+	CHECK(edid[HERMES_KMS_EDID_EXT_COUNT_OFFSET] == 0,
+	      "%s: single-block base must have extension count 0", what);
+	pre_append_checksum = edid[HERMES_KMS_EDID_CHECKSUM_OFFSET];
+
+	appended = hermes_kms_append_hdr_extension(edid);
+	CHECK(appended, "%s: appending the extension to a valid base must succeed",
+	      what);
+
+	/* Property 1: the base block is still well-formed after the append. */
+	check_structure(edid, what);
+
+	/* Property 3: extension-count and checksum move together. */
+	CHECK(edid[HERMES_KMS_EDID_EXT_COUNT_OFFSET] == 1,
+	      "%s: base extension count is %u, expected 1", what,
+	      edid[HERMES_KMS_EDID_EXT_COUNT_OFFSET]);
+	CHECK(edid[HERMES_KMS_EDID_CHECKSUM_OFFSET] ==
+		      (u8)(pre_append_checksum - 1),
+	      "%s: base checksum is 0x%02x, expected 0x%02x (pre-append minus 1)",
+	      what, edid[HERMES_KMS_EDID_CHECKSUM_OFFSET],
+	      (u8)(pre_append_checksum - 1));
+
+	/* Property 5 / Property 2,4,6: the appended extension block is valid. */
+	check_cta_extension(&edid[HERMES_KMS_EDID_SIZE], what);
+}
+
+/*
+ * Validate the finalize guard: a base block that does not already sum to 0 mod
+ * 256 is not a valid EDID, and promoting it into a two-block EDID would only
+ * produce a broken result. So hermes_kms_append_hdr_extension() must refuse a
+ * corrupt base and leave the extension region exactly as it found it.
+ *
+ * Build a valid base, paint the extension region (edid[128..255]) with a known
+ * sentinel pattern and snapshot it, then deliberately corrupt one base byte so
+ * the base no longer sums to 0 mod 256. The append must return false and the
+ * extension region must be byte-identical to the snapshot afterwards.
+ *
+ * Exercises Property 7 (finalize refuses an invalid base and does not touch the
+ * extension region).
+ */
+static void check_invalid_base_refused(const struct hermes_kms_edid_config *config,
+				       const char *what)
+{
+	u8 edid[2 * HERMES_KMS_EDID_SIZE];
+	u8 snapshot[HERMES_KMS_EDID_SIZE];
+	unsigned int checksum = 0;
+	bool appended;
+	unsigned int i;
+
+	hermes_kms_build_edid(edid, 1, config);
+
+	/*
+	 * Fill the extension region with a recognisable pattern and snapshot it
+	 * so a refused append is provably a no-op there rather than merely
+	 * leaving zeroes behind.
+	 */
+	for (i = 0; i < HERMES_KMS_EDID_SIZE; i++) {
+		u8 pattern = (u8)(0xa5 ^ i);
+
+		edid[HERMES_KMS_EDID_SIZE + i] = pattern;
+		snapshot[i] = pattern;
+	}
+
+	/*
+	 * Corrupt the base so it no longer sums to 0 mod 256. Flipping the low
+	 * bit of the first byte perturbs the sum by exactly 1, guaranteeing an
+	 * invalid checksum without depending on any other byte.
+	 */
+	edid[0] ^= 0x01;
+	for (i = 0; i < HERMES_KMS_EDID_SIZE; i++)
+		checksum += edid[i];
+	CHECK((checksum & 0xff) != 0,
+	      "%s: corrupted base must not sum to zero", what);
+
+	appended = hermes_kms_append_hdr_extension(edid);
+	CHECK(!appended,
+	      "%s: appending to an invalid base must fail", what);
+
+	/* The extension region must be untouched byte-for-byte. */
+	for (i = 0; i < HERMES_KMS_EDID_SIZE; i++)
+		CHECK(edid[HERMES_KMS_EDID_SIZE + i] == snapshot[i],
+		      "%s: extension byte %u changed to 0x%02x, expected 0x%02x",
+		      what, i, edid[HERMES_KMS_EDID_SIZE + i], snapshot[i]);
+}
+
+/*
+ * Validate the HDR-disabled path. With hdr_enable off the driver never calls
+ * hermes_kms_append_hdr_extension(), so the EDID it publishes is exactly the
+ * single base block hermes_kms_build_edid() produces: extension-count byte 0
+ * and a base block that stands on its own. This check builds precisely that --
+ * the base block with no append -- so it is byte-identical to the pre-feature
+ * output, and confirms the extension-count byte stays 0.
+ *
+ * Exercises Property 8 (the disabled path is byte-identical to the base-only
+ * EDID: a single base block with extension-count byte 0).
+ */
+static void check_hdr_disabled_base_only(const struct hermes_kms_edid_config *config,
+					 const char *what)
+{
+	u8 edid[HERMES_KMS_EDID_SIZE];
+
+	/*
+	 * This is the disabled path exactly: build the base block and stop.
+	 * No hermes_kms_append_hdr_extension() call, matching what the driver
+	 * hands DRM when hdr_enable is off.
+	 */
+	hermes_kms_build_edid(edid, 1, config);
+
+	check_structure(edid, what);
+	CHECK(edid[HERMES_KMS_EDID_EXT_COUNT_OFFSET] == 0,
+	      "%s: disabled path must leave extension count 0, got %u", what,
+	      edid[HERMES_KMS_EDID_EXT_COUNT_OFFSET]);
+}
+
 static void check_serials_differ(void)
 {
 	const struct hermes_kms_edid_config config = {
@@ -263,6 +524,45 @@ int main(void)
 	check_serials_differ();
 	check_physical_size();
 	check_color_depth();
+
+	{
+		u8 cta[HERMES_KMS_EDID_SIZE];
+
+		hermes_kms_build_edid_hdr_extension(cta);
+		check_cta_extension(cta, "CTA HDR extension");
+	}
+
+	/*
+	 * Sweep the two-block HDR checks across a small table of distinct
+	 * configs the same way check_envelope() sweeps envelopes[], so the
+	 * base/extension invariants (Properties 1-8) hold across the input
+	 * space rather than for a single hand-picked resolution.
+	 */
+	{
+		static const struct {
+			const char *what;
+			struct hermes_kms_edid_config config;
+		} hdr_configs[] = {
+#define HDR_CONFIG(w, h, hz) \
+	{ .max_width = (w), .max_height = (h), .max_refresh_hz = (hz) }
+			{ "hdr 1080p60", HDR_CONFIG(1920, 1080, 60) },
+			{ "hdr 1440p144", HDR_CONFIG(2560, 1440, 144) },
+			{ "hdr 4k120", HDR_CONFIG(3840, 2160, 120) },
+			{ "hdr 4k240", HDR_CONFIG(3840, 2160, 240) },
+#undef HDR_CONFIG
+		};
+		unsigned int j;
+
+		for (j = 0; j < sizeof(hdr_configs) / sizeof(hdr_configs[0]);
+		     j++) {
+			check_base_with_extension(&hdr_configs[j].config,
+						  hdr_configs[j].what);
+			check_invalid_base_refused(&hdr_configs[j].config,
+						   hdr_configs[j].what);
+			check_hdr_disabled_base_only(&hdr_configs[j].config,
+						     hdr_configs[j].what);
+		}
+	}
 
 	if (failures) {
 		fprintf(stderr, "%d EDID check(s) failed\n", failures);
