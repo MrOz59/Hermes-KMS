@@ -725,11 +725,21 @@ static bool hermes_kms_build_output_edid(struct hermes_kms_output *output,
 	/*
 	 * When HDR advertisement is enabled, promote the single base block into
 	 * a two-block EDID by flipping the base extension count and appending a
-	 * CTA-861 HDR Static Metadata extension. This is a side effect on the
-	 * buffer; the return value stays the base builder's representable flag.
+	 * CTA-861 extension carrying the HDR Static Metadata and BT2020
+	 * Colorimetry data blocks. This is a side effect on the buffer; the
+	 * return value stays the base builder's representable flag.
+	 *
+	 * The append refuses a base that does not already checksum, which cannot
+	 * happen for a block hermes_kms_build_edid() just finalized -- so a
+	 * refusal is a driver bug and worth saying out loud rather than
+	 * discarding. Nothing has to unwind: a refused append leaves the
+	 * extension-count byte at 0, so hermes_kms_edid_size() keeps reporting a
+	 * single block and the output degrades to advertising SDR.
 	 */
-	if (hdr_enable)
-		hermes_kms_append_hdr_extension(output->edid);
+	if (hdr_enable && !hermes_kms_append_hdr_extension(output->edid))
+		drm_warn(&output->hdev->drm,
+			 "%s: HDR extension refused an invalid base EDID; advertising SDR only\n",
+			 output->output_name);
 
 	return representable;
 }
@@ -4890,14 +4900,15 @@ static void __init hermes_kms_sanitize_mode_range(void)
 	}
 
 	/*
-	 * HDR advertisement and ten-bit scanout are an untested-together
-	 * dependency: it is not yet confirmed whether the EDID/property change
-	 * alone enables HDR in the compositor or whether color_depth=10 must be
-	 * set at the same time. Surface the pairing without forcing it -- the
-	 * user's color_depth choice is left exactly as configured.
+	 * hdr_enable only advertises the capability; it does not activate HDR,
+	 * and the capture UAPI carries no colorspace or HDR metadata either way
+	 * (see README.md). Whether a compositor needs ten-bit scanout set at the
+	 * same time before it will enable HDR is untested. Surface the pairing
+	 * without forcing it -- the user's color_depth choice is left exactly as
+	 * configured.
 	 */
 	if (hdr_enable && color_depth < 10)
-		pr_info("%s: hdr_enable=1 with color_depth=%u (<10); HDR advertisement and ten-bit scanout are untested together, validate the pairing before deployment\n",
+		pr_info("%s: hdr_enable=1 advertises HDR only, with color_depth=%u (<10); the pairing is untested and consumers still receive no colorspace or HDR metadata\n",
 			HERMES_KMS_DRIVER_NAME, color_depth);
 
 	if (min_width != requested_min_width ||
