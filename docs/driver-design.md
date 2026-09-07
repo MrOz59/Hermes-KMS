@@ -52,20 +52,73 @@ HDR advertisement itself is implemented, gated behind `hdr_enable` (default off)
 When set, the synthetic EDID gains a CTA-861 extension block carrying both an HDR
 Static Metadata Data Block (PQ) and a BT2020 Colorimetry Data Block, and the
 connector attaches both the `HDR_OUTPUT_METADATA` property and a `Colorspace`
-property advertising BT2020 — the three signals a compositor requires together to
-treat the output as HDR-capable, always enabled or disabled as one unit. Three
-are needed because KWin treats an output HDR-capable through a two-gate chain: it
-sets `WideColorGamut` only when the connector has a `Colorspace` property
+property advertising BT2020 — the signals a compositor requires together to
+treat the output as HDR-capable, always enabled or disabled as one unit. All of
+them are needed because KWin treats an output as HDR-capable through a two-gate
+chain: it sets `WideColorGamut` only when the connector has a `Colorspace` property
 advertising BT2020 and the EDID reports BT2020 (via the Colorimetry block), and
 only then sets `HighDynamicRange`, which additionally needs `HDR_OUTPUT_METADATA`
 and the EDID's PQ HDR Static Metadata block. An earlier iteration carrying only
 the HDR Static Metadata block and `HDR_OUTPUT_METADATA` left HDR off on hardware
 because the Colorimetry block and `Colorspace` property were missing, so the
-`WideColorGamut` gate was never satisfied. This is the advertisement only:
-whether ten-bit scanout (`color_depth=10`) must be set simultaneously for a
-compositor to actually enable HDR is an untested-together dependency, and full
-HDR streaming validation remains open. `hdr_enable` and `color_depth=10` must be
-validated together before deployment.
+`WideColorGamut` gate was never satisfied.
+
+This is advertisement only, and the feature is incomplete beyond it. `hdr_enable`
+does not activate HDR; it tells a compositor the output *can* do HDR. The gap
+that matters is on the capture side: Hermes' capture UAPI reports the framebuffer
+format but carries no colorspace, EOTF or HDR metadata alongside a captured
+frame, so a consumer reading only that interface cannot determine the frame's
+colour encoding. If the compositor switches to PQ/BT.2020 and the consumer keeps
+treating the frame as SDR, the colours are wrong. `color_depth=10` does not close
+this — ten-bit frames carry no more colour signalling than eight-bit ones.
+
+DRM does hold the negotiated state: `Colorspace` and `HDR_OUTPUT_METADATA` live
+on the connector, and a consumer with the primary KMS node can query them. That
+is not a substitute. Those properties are unreachable through the render node
+that consumers actually hold, and querying them separately does not associate the
+metadata atomically with a given captured frame — the compositor can change
+colorimetry between the query and the frame. Carrying colour metadata in the
+capture UAPI, associated with the frame, is the real fix and is follow-up work;
+it needs an agreed representation before it is worth implementing.
+
+Whether a compositor additionally needs ten-bit scanout (`color_depth=10`) set
+before it will enable HDR is untested; the two have not been validated as a pair.
+
+#### EDID conformity
+
+The generated EDID decodes correctly and both block checksums are valid:
+`edid-decode` reports the HDR Static Metadata and BT2020 Colorimetry blocks as
+intended, with no checksum errors. That is not the same as a clean conformity
+check, and `edid-decode --check` does not pass. The findings below were recorded
+by running it over the generated EDID at default parameters.
+
+These findings predate `hdr_enable` and are present on the base block alone, at
+default parameters:
+
+| Finding | Kind |
+| --- | --- |
+| The serial number is one of the known dummy values | warning |
+| The chromaticities match sRGB, but sRGB is not signaled | failure |
+| The DTD max image size is set, but the display size is not specified | failure |
+
+The last one disappears when `physical_width_mm=` and `physical_height_mm=` are
+set; it reflects the default of leaving the panel size undefined.
+
+Adding the CTA-861 extension introduces these, because a CTA block brings
+CTA-861's own conformity rules with it. They are absent when `hdr_enable=0`:
+
+| Finding | Kind |
+| --- | --- |
+| Required 640x480p60 timings missing in established timings and the SVD list (VIC 1) | failure |
+| Missing VCDB, needed for Set Selectable RGB Quantization | failure |
+| DTD #1 is identical to VIC 16, which is not present in the CTA Ext Block | warning |
+| IT Video Formats are overscanned by default, but should normally be underscanned | warning |
+
+None of them stopped KWin from recognising the output as HDR-capable, and no
+parser is known to reject the block over them. They are recorded here rather than
+fixed because closing the VIC 1 failure means publishing a Video Data Block, and
+that adds CEA modes to the connector's mode list — a change to what the output
+advertises, not just to how it describes itself.
 
 ### Scanout layouts
 
@@ -734,42 +787,10 @@ Not yet implemented:
   on the real GPU today);
 - full compositor recovery handling beyond owner-fd disconnect and hotplug.
 
-Implemented but not yet validated end to end: HDR advertisement. With
-`hdr_enable=1` the synthetic EDID's CTA-861 extension carries both an HDR Static
-Metadata Data Block (PQ) and a BT2020 Colorimetry Data Block, and the connector
-exposes both the `HDR_OUTPUT_METADATA` property and a `Colorspace` property
-advertising BT2020, so a compositor sees all three signals it needs to treat the
-output as HDR-capable. Three are required because KWin gates HDR behind a
-two-gate chain: `WideColorGamut` (needing the `Colorspace` property advertising
-BT2020 plus EDID BT2020 support from the Colorimetry block) is a prerequisite for
-`HighDynamicRange` (needing `HDR_OUTPUT_METADATA` plus the EDID's PQ HDR Static
-Metadata block). The first iteration, which carried only the HDR Static Metadata
-block and `HDR_OUTPUT_METADATA`, left HDR off on hardware because the Colorimetry
-block and `Colorspace` property were missing. `tests/edid.c` covers the generated
-EDID bytes — including the Colorimetry block — and both block checksums under
-`make check`. What remains open is full HDR streaming validation and the
-`color_depth=10` dependency: it is not yet confirmed whether the EDID and
-property change alone enable HDR in the compositor, or whether ten-bit scanout
-must be set simultaneously.
-
-To load HDR together with ten-bit scanout:
-
-```bash
-sudo modprobe hermes_kms color_depth=10 hdr_enable=1
-```
-
-To apply these parameters persistently at every module load, drop a file in
-`/etc/modprobe.d`:
-
-```
-# /etc/modprobe.d/hermes-kms-hdr.conf
-options hermes_kms color_depth=10 hdr_enable=1
-```
-
-Two configurations must be compared during verification to resolve the
-dependency empirically: (a) `hdr_enable=1` without `color_depth=10`, and (b)
-`hdr_enable=1` with `color_depth=10`. If a Consumer still reports "HDR: incapable"
-after all three mechanisms are applied and `color_depth=10` is set, CRTC
-color-management properties (gamma LUT, degamma LUT, CTM, COLOR_PIPELINE) are the
-next investigation area. That is outside this feature's scope, and no further
-code change is made here in response to that condition.
+Implemented but not yet validated end to end: HDR advertisement. `hdr_enable=1`
+makes a compositor recognise the output as HDR-capable, but the capture UAPI
+carries no colour metadata, so a consumer cannot interpret an HDR frame. See
+[Scanout formats](#scanout-formats) above for the
+mechanisms, the capture-side gap, and the EDID conformity findings. `tests/edid.c`
+covers the generated bytes, both checksums and the published EDID length under
+`make check`.
