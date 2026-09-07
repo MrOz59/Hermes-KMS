@@ -3902,9 +3902,15 @@ static int hermes_kms_output_modeset_init(struct hermes_kms_output *output)
 	 * always enabled together.
 	 */
 	if (hdr_enable) {
-		ret = drm_connector_attach_hdr_output_metadata_property(&output->connector);
-		if (ret)
-			return ret;
+		/*
+		 * Deliberately called for its effect only. This helper returned
+		 * int through 7.1 and returns void from 7.2 on, so assigning the
+		 * result is a compile error on current kernels and testing it
+		 * would not build across the range the driver supports. It has no
+		 * failure path worth branching on either way: it attaches a
+		 * property the DRM core created at init.
+		 */
+		drm_connector_attach_hdr_output_metadata_property(&output->connector);
 
 		/*
 		 * KWin gates HDR behind Capability::WideColorGamut, which needs a
@@ -3912,11 +3918,14 @@ static int hermes_kms_output_modeset_init(struct hermes_kms_output *output)
 		 * the EDID's BT2020 Colorimetry block) before it will set
 		 * HighDynamicRange. Create and attach it here so all three HDR
 		 * advertisement mechanisms flip together with hdr_enable.
+		 *
+		 * Only BT2020_RGB is requested: drm_mode_create_colorspace_property()
+		 * ORs in BIT(DRM_MODE_COLORIMETRY_DEFAULT) itself, so naming Default
+		 * here would just restate what the helper already guarantees.
 		 */
 		ret = drm_mode_create_hdmi_colorspace_property(
 			&output->connector,
-			BIT(DRM_MODE_COLORIMETRY_BT2020_RGB) |
-			BIT(DRM_MODE_COLORIMETRY_DEFAULT));
+			BIT(DRM_MODE_COLORIMETRY_BT2020_RGB));
 		if (ret)
 			return ret;
 
