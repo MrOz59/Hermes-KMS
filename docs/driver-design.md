@@ -89,8 +89,9 @@ before it will enable HDR is untested; the two have not been validated as a pair
 The generated EDID decodes correctly and both block checksums are valid:
 `edid-decode` reports the HDR Static Metadata and BT2020 Colorimetry blocks as
 intended, with no checksum errors. That is not the same as a clean conformity
-check, and `edid-decode --check` does not pass. The findings below were recorded
-by running it over the generated EDID at default parameters.
+check, and `edid-decode --check` does not pass. `scripts/check-edid-conformity.sh`
+runs that check against a recorded baseline, so the finding set below stays a
+tracked artifact rather than a snapshot that quietly goes stale.
 
 These findings predate `hdr_enable` and are present on the base block alone, at
 default parameters:
