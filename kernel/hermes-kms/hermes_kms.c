@@ -1227,7 +1227,7 @@ static int hermes_kms_connector_get_modes(struct drm_connector *connector)
 	 * preferred by definition, so the CVT mode below has to clear that flag
 	 * rather than just set its own.
 	 */
-	drm_edid = drm_edid_alloc(output->edid, sizeof(output->edid));
+	drm_edid = drm_edid_alloc(output->edid, hermes_kms_edid_size(output->edid));
 	if (drm_edid) {
 		drm_edid_connector_update(connector, drm_edid);
 		count += drm_edid_connector_add_modes(connector);

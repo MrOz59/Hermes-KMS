@@ -346,6 +346,17 @@ static void check_base_with_extension(const struct hermes_kms_edid_config *confi
 
 	/* Property 5 / Property 2,4,6: the appended extension block is valid. */
 	check_cta_extension(&edid[HERMES_KMS_EDID_SIZE], what);
+
+	/*
+	 * Property 9: the published length follows the extension count. This is
+	 * the length the driver hands drm_edid_alloc(), so the enabled path must
+	 * report both blocks -- truncating here would drop the CTA extension out
+	 * of the blob userspace reads back.
+	 */
+	CHECK(hermes_kms_edid_size(edid) == 2 * HERMES_KMS_EDID_SIZE,
+	      "%s: published size is %u, expected %u (base + extension)", what,
+	      hermes_kms_edid_size(edid),
+	      (unsigned int)(2 * HERMES_KMS_EDID_SIZE));
 }
 
 /*
@@ -405,23 +416,48 @@ static void check_invalid_base_refused(const struct hermes_kms_edid_config *conf
 		CHECK(edid[HERMES_KMS_EDID_SIZE + i] == snapshot[i],
 		      "%s: extension byte %u changed to 0x%02x, expected 0x%02x",
 		      what, i, edid[HERMES_KMS_EDID_SIZE + i], snapshot[i]);
+
+	/*
+	 * Property 9 on the failure path: a refused append leaves the
+	 * extension-count byte at 0, so the published length must stay at one
+	 * block. Otherwise the driver would hand DRM the sentinel pattern above
+	 * as if it were a CTA extension.
+	 */
+	CHECK(hermes_kms_edid_size(edid) == HERMES_KMS_EDID_SIZE,
+	      "%s: refused append reports size %u, expected %u (base only)", what,
+	      hermes_kms_edid_size(edid), (unsigned int)HERMES_KMS_EDID_SIZE);
 }
 
 /*
  * Validate the HDR-disabled path. With hdr_enable off the driver never calls
  * hermes_kms_append_hdr_extension(), so the EDID it publishes is exactly the
  * single base block hermes_kms_build_edid() produces: extension-count byte 0
- * and a base block that stands on its own. This check builds precisely that --
- * the base block with no append -- so it is byte-identical to the pre-feature
- * output, and confirms the extension-count byte stays 0.
+ * and a base block that stands on its own.
+ *
+ * Build it in a full two-block buffer, which is the buffer the driver actually
+ * has. A one-block buffer here would test a shape the driver never has and
+ * would miss the failure that matters: publishing the buffer's capacity rather
+ * than the EDID's own length, which appends 128 zero bytes to a blob whose base
+ * block says there is no second block.
  *
  * Exercises Property 8 (the disabled path is byte-identical to the base-only
- * EDID: a single base block with extension-count byte 0).
+ * EDID: a single base block with extension-count byte 0) and Property 9 (the
+ * published length is one block, independent of the buffer's size).
  */
 static void check_hdr_disabled_base_only(const struct hermes_kms_edid_config *config,
 					 const char *what)
 {
-	u8 edid[HERMES_KMS_EDID_SIZE];
+	u8 edid[2 * HERMES_KMS_EDID_SIZE];
+	u8 base_only[HERMES_KMS_EDID_SIZE];
+	unsigned int i;
+
+	/*
+	 * Paint the whole buffer first, so a base block written into it can be
+	 * shown to leave the second block alone rather than merely finding
+	 * zeroes that were already there.
+	 */
+	for (i = 0; i < sizeof(edid); i++)
+		edid[i] = (u8)(0x5a ^ i);
 
 	/*
 	 * This is the disabled path exactly: build the base block and stop.
@@ -434,6 +470,28 @@ static void check_hdr_disabled_base_only(const struct hermes_kms_edid_config *co
 	CHECK(edid[HERMES_KMS_EDID_EXT_COUNT_OFFSET] == 0,
 	      "%s: disabled path must leave extension count 0, got %u", what,
 	      edid[HERMES_KMS_EDID_EXT_COUNT_OFFSET]);
+
+	/*
+	 * The length the driver publishes must be one block even though the
+	 * buffer holds two. This is the check that catches handing
+	 * drm_edid_alloc() sizeof(output->edid).
+	 */
+	CHECK(hermes_kms_edid_size(edid) == HERMES_KMS_EDID_SIZE,
+	      "%s: disabled path publishes %u bytes, expected %u (base only)",
+	      what, hermes_kms_edid_size(edid),
+	      (unsigned int)HERMES_KMS_EDID_SIZE);
+
+	/*
+	 * And those published bytes must be byte-identical to building the base
+	 * block on its own -- the pre-feature output. Compare against a
+	 * separately built one-block EDID rather than against remembered bytes,
+	 * so the two paths are shown to agree rather than assumed to.
+	 */
+	hermes_kms_build_edid(base_only, 1, config);
+	for (i = 0; i < HERMES_KMS_EDID_SIZE; i++)
+		CHECK(edid[i] == base_only[i],
+		      "%s: disabled-path byte %u is 0x%02x, expected 0x%02x",
+		      what, i, edid[i], base_only[i]);
 }
 
 static void check_serials_differ(void)

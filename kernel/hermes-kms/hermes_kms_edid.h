@@ -447,4 +447,33 @@ static inline bool hermes_kms_append_hdr_extension(u8 *edid)
 	return true;
 }
 
+/*
+ * The number of EDID bytes to publish for @edid: one block, plus one more for
+ * each block the base block's extension-count byte declares.
+ *
+ * This exists because the two lengths in play are not the same. The buffer is
+ * sized for the largest EDID the driver can build (base plus one CTA
+ * extension), but the EDID it actually built may be shorter. DRM limits *mode
+ * parsing* using the extension count, so an oversized buffer parses correctly
+ * either way -- but drm_edid_alloc() publishes exactly the number of bytes it
+ * is handed, so passing the buffer capacity would put 128 trailing zero bytes
+ * into the blob userspace reads back from the connector's EDID property, in a
+ * blob whose own base block says there is no second block. edid-decode and
+ * anything else parsing that property sees the contradiction.
+ *
+ * Derive the length from the extension-count byte rather than tracking it in a
+ * separate field, so the published length and the block the EDID claims to
+ * have cannot drift apart. That also makes the failure path correct for free:
+ * when hermes_kms_append_hdr_extension() refuses an invalid base it leaves the
+ * count at 0, and this keeps reporting a single block.
+ *
+ * The count is only ever 0 (the template's own value) or 1 (written by the
+ * append helper), so the result never exceeds a two-block buffer.
+ */
+static inline unsigned int hermes_kms_edid_size(const u8 *edid)
+{
+	return HERMES_KMS_EDID_SIZE *
+	       (1u + edid[HERMES_KMS_EDID_EXT_COUNT_OFFSET]);
+}
+
 #endif /* HERMES_KMS_EDID_H */
