@@ -103,19 +103,6 @@ findings_for()
 	' "$generated"
 }
 
-# How many findings enabling HDR adds, measured by diffing two runs of the *same*
-# edid-decode binary. This is the assertion worth running anywhere: it compares
-# like with like, so it holds whatever version of edid-decode is installed, while
-# the exact wording of any individual finding does not.
-hdr_introduced_count()
-{
-	local base hdr
-
-	base="$(findings_for base-defaults | wc -l)"
-	hdr="$(findings_for hdr-eight-bit | wc -l)"
-	printf '%s\n' "$((hdr - base))"
-}
-
 for variant in "${variants[@]}"; do
 	name="${variant%%:*}"
 	args="${variant#*:}"
@@ -132,6 +119,12 @@ for variant in "${variants[@]}"; do
 	# status end the run.
 	edid-decode --check < "$TMP/$name.bin" > "$TMP/$name.report" 2>&1 || true
 	normalize < "$TMP/$name.report" >> "$generated"
+
+	# The plain decode is a separate artifact from the conformity report: it
+	# describes the bytes, where --check applies a rule set. Tier 1 below
+	# reads this one precisely because it does not depend on which rules a
+	# given edid-decode version happens to implement.
+	edid-decode < "$TMP/$name.bin" > "$TMP/$name.decode" 2>&1 || true
 done
 
 if [ "$UPDATE" -eq 1 ]; then
@@ -143,7 +136,6 @@ if [ "$UPDATE" -eq 1 ]; then
 		printf '# docs/driver-design.md, not a baseline to rubber-stamp.\n'
 		printf '#\n'
 		printf '# Recorded with: %s\n' "$(edid-decode --version 2>&1 | head -1)"
-		printf '# hdr-introduced-findings: %s\n' "$(hdr_introduced_count)"
 		printf '\n'
 		cat "$generated"
 	} > "$BASELINE"
@@ -161,15 +153,52 @@ fi
 # but keep the "### variant" markers: they are what attributes each finding to
 # a configuration, so a finding moving between variants has to show as a diff.
 # ---------------------------------------------------------------------------
-# Tier 1: invariants that hold whatever edid-decode version is installed.
-# These are what make the check worth running in CI, where the parser version is
-# whatever the runner image ships and will not match the recording below.
+# Tier 1: what the parser DECODES, always enforced.
+#
+# This tier deliberately reads edid-decode's plain decode rather than its
+# --check findings. Which conformity rules a given edid-decode implements varies
+# by version -- an older build simply does not report some of them -- so a
+# finding set, or even a count of findings, is not a stable thing to assert
+# across machines. What the parser reports about the bytes themselves is far
+# more stable, and it is also the thing worth guarding: that the EDID says what
+# the driver meant it to say.
+#
+# These block and value names come from CTA-861 and have been spelled this way
+# in edid-decode for a long time, but they are not guaranteed forever. If one
+# drifts, this fails loudly and names the version it saw, which is the right
+# failure mode -- unlike silently comparing rule sets that do not exist on the
+# machine running the check.
 # ---------------------------------------------------------------------------
 tier1_failed=0
 
+expect_in_decode()
+{
+	local name="$1" what="$2" needle="$3"
+
+	if grep -qF -- "$needle" "$TMP/$name.decode"; then
+		printf 'ok: %s: %s\n' "$name" "$what"
+	else
+		printf 'FAIL: %s: %s (no "%s" in the decode)\n' \
+			"$name" "$what" "$needle" >&2
+		tier1_failed=1
+	fi
+}
+
+expect_absent_from_decode()
+{
+	local name="$1" what="$2" needle="$3"
+
+	if grep -qF -- "$needle" "$TMP/$name.decode"; then
+		printf 'FAIL: %s: %s ("%s" present, expected absent)\n' \
+			"$name" "$what" "$needle" >&2
+		tier1_failed=1
+	else
+		printf 'ok: %s: %s\n' "$name" "$what"
+	fi
+}
+
 # A checksum error makes a block vanish silently from every parser that reads
-# it, which is the one EDID mistake with no visible symptom. No variant may
-# have one.
+# it, which is the one EDID mistake with no visible symptom.
 for variant in "${variants[@]}"; do
 	name="${variant%%:*}"
 	if grep -qiE 'checksum.*(error|mismatch)' "$TMP/$name.report"; then
@@ -180,18 +209,34 @@ done
 [ "$tier1_failed" -eq 0 ] &&
 	printf 'ok: no checksum errors in any variant\n'
 
-expected_introduced="$(sed -n 's/^# hdr-introduced-findings: //p' "$BASELINE" 2>/dev/null)"
-actual_introduced="$(hdr_introduced_count)"
-if [ -n "$expected_introduced" ] &&
-	[ "$actual_introduced" != "$expected_introduced" ]; then
-	printf 'FAIL: enabling HDR now adds %s findings, expected %s\n' \
-		"$actual_introduced" "$expected_introduced" >&2
-	printf '      (both counts come from this machine'"'"'s own edid-decode, so\n' >&2
-	printf '       this is a real change in the EDID, not a version difference)\n' >&2
-	tier1_failed=1
-else
-	printf 'ok: enabling HDR adds %s findings, as recorded\n' "$actual_introduced"
-fi
+for variant in "${variants[@]}"; do
+	name="${variant%%:*}"
+	args="${variant#*:}"
+
+	case "$args" in
+	*--hdr*)
+		# The whole point of hdr_enable: a parser must find both data
+		# blocks, with PQ and BT2020 RGB specifically.
+		expect_in_decode "$name" "CTA-861 extension block present" \
+			"CTA-861 Extension Block"
+		expect_in_decode "$name" "HDR Static Metadata block" \
+			"HDR Static Metadata Data Block"
+		expect_in_decode "$name" "advertises SMPTE ST2084 (PQ)" \
+			"SMPTE ST2084"
+		expect_in_decode "$name" "Colorimetry block" \
+			"Colorimetry Data Block"
+		expect_in_decode "$name" "advertises BT2020 RGB" "BT2020RGB"
+		;;
+	*)
+		# And with it off, none of that may appear: the disabled path has
+		# to stay a plain single-block EDID.
+		expect_absent_from_decode "$name" "no CTA extension block" \
+			"CTA-861 Extension Block"
+		expect_absent_from_decode "$name" "no HDR metadata block" \
+			"HDR Static Metadata Data Block"
+		;;
+	esac
+done
 
 [ "$tier1_failed" -eq 0 ] || exit 1
 
