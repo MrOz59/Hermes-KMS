@@ -48,6 +48,78 @@ accept, and the synthetic EDID advertises eight bits per primary unless
 `color_depth=` says otherwise. Raising it is therefore a deliberate choice, and
 consumers must be prepared for a ten-bit fourcc when it is made.
 
+HDR advertisement itself is implemented, gated behind `hdr_enable` (default off).
+When set, the synthetic EDID gains a CTA-861 extension block carrying both an HDR
+Static Metadata Data Block (PQ) and a BT2020 Colorimetry Data Block, and the
+connector attaches both the `HDR_OUTPUT_METADATA` property and a `Colorspace`
+property advertising BT2020 — the signals a compositor requires together to
+treat the output as HDR-capable, always enabled or disabled as one unit. All of
+them are needed because KWin treats an output as HDR-capable through a two-gate
+chain: it sets `WideColorGamut` only when the connector has a `Colorspace` property
+advertising BT2020 and the EDID reports BT2020 (via the Colorimetry block), and
+only then sets `HighDynamicRange`, which additionally needs `HDR_OUTPUT_METADATA`
+and the EDID's PQ HDR Static Metadata block. An earlier iteration carrying only
+the HDR Static Metadata block and `HDR_OUTPUT_METADATA` left HDR off on hardware
+because the Colorimetry block and `Colorspace` property were missing, so the
+`WideColorGamut` gate was never satisfied.
+
+This is advertisement only, and the feature is incomplete beyond it. `hdr_enable`
+does not activate HDR; it tells a compositor the output *can* do HDR. The gap
+that matters is on the capture side: Hermes' capture UAPI reports the framebuffer
+format but carries no colorspace, EOTF or HDR metadata alongside a captured
+frame, so a consumer reading only that interface cannot determine the frame's
+colour encoding. If the compositor switches to PQ/BT.2020 and the consumer keeps
+treating the frame as SDR, the colours are wrong. `color_depth=10` does not close
+this — ten-bit frames carry no more colour signalling than eight-bit ones.
+
+DRM does hold the negotiated state: `Colorspace` and `HDR_OUTPUT_METADATA` live
+on the connector, and a consumer with the primary KMS node can query them. That
+is not a substitute. Those properties are unreachable through the render node
+that consumers actually hold, and querying them separately does not associate the
+metadata atomically with a given captured frame — the compositor can change
+colorimetry between the query and the frame. Carrying colour metadata in the
+capture UAPI, associated with the frame, is the real fix and is follow-up work;
+it needs an agreed representation before it is worth implementing.
+
+Whether a compositor additionally needs ten-bit scanout (`color_depth=10`) set
+before it will enable HDR is untested; the two have not been validated as a pair.
+
+#### EDID conformity
+
+The generated EDID decodes correctly and both block checksums are valid:
+`edid-decode` reports the HDR Static Metadata and BT2020 Colorimetry blocks as
+intended, with no checksum errors. That is not the same as a clean conformity
+check, and `edid-decode --check` does not pass. The findings below were recorded
+by running it over the generated EDID at default parameters.
+
+These findings predate `hdr_enable` and are present on the base block alone, at
+default parameters:
+
+| Finding | Kind |
+| --- | --- |
+| The serial number is one of the known dummy values | warning |
+| The chromaticities match sRGB, but sRGB is not signaled | failure |
+| The DTD max image size is set, but the display size is not specified | failure |
+
+The last one disappears when `physical_width_mm=` and `physical_height_mm=` are
+set; it reflects the default of leaving the panel size undefined.
+
+Adding the CTA-861 extension introduces these, because a CTA block brings
+CTA-861's own conformity rules with it. They are absent when `hdr_enable=0`:
+
+| Finding | Kind |
+| --- | --- |
+| Required 640x480p60 timings missing in established timings and the SVD list (VIC 1) | failure |
+| Missing VCDB, needed for Set Selectable RGB Quantization | failure |
+| DTD #1 is identical to VIC 16, which is not present in the CTA Ext Block | warning |
+| IT Video Formats are overscanned by default, but should normally be underscanned | warning |
+
+None of them stopped KWin from recognising the output as HDR-capable, and no
+parser is known to reject the block over them. They are recorded here rather than
+fixed because closing the VIC 1 failure means publishing a Video Data Block, and
+that adds CEA modes to the connector's mode list — a change to what the output
+advertises, not just to how it describes itself.
+
 ### Scanout layouts
 
 The driver never samples a scanout pixel: it latches the framebuffer, holds a
@@ -625,6 +697,10 @@ The module supports these topology and initial-state parameters:
   plus a host card, mutually exclusive with an explicit `devices` topology)
 - `hotplug_events`
 - `non_desktop`
+- `hdr_enable` (advertise HDR; gates a CTA-861 EDID extension carrying both an
+  HDR Static Metadata block and a BT2020 Colorimetry block, plus the
+  `HDR_OUTPUT_METADATA` and `Colorspace` connector properties, all together;
+  default off, load-time only, untested together with `color_depth=10`)
 - `scanout_modifiers` (up to 15 extra `IN_FORMATS` layouts; linear is always
   advertised and every modifier is accepted regardless of this list)
 
@@ -707,6 +783,14 @@ Not yet implemented:
 
 - a real DRM writeback connector;
 - NVENC/AMF import validation (VAAPI is validated);
-- NV12/P010 scanout and HDR (the compositor composes in RGB; the encoder does
-  RGB→NV12 on the real GPU today);
+- NV12/P010 scanout (the compositor composes in RGB; the encoder does RGB→NV12
+  on the real GPU today);
 - full compositor recovery handling beyond owner-fd disconnect and hotplug.
+
+Implemented but not yet validated end to end: HDR advertisement. `hdr_enable=1`
+makes a compositor recognise the output as HDR-capable, but the capture UAPI
+carries no colour metadata, so a consumer cannot interpret an HDR frame. See
+[Scanout formats](#scanout-formats) above for the
+mechanisms, the capture-side gap, and the EDID conformity findings. `tests/edid.c`
+covers the generated bytes, both checksums and the published EDID length under
+`make check`.

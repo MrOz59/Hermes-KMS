@@ -147,6 +147,7 @@
 static bool initial_enabled;
 static bool hotplug_events = true;
 static bool non_desktop;
+static bool hdr_enable;
 static bool insecure_legacy_unbound_access;
 static unsigned int initial_width = HERMES_KMS_DEFAULT_WIDTH;
 static unsigned int initial_height = HERMES_KMS_DEFAULT_HEIGHT;
@@ -162,6 +163,9 @@ module_param(hotplug_events, bool, 0644);
 MODULE_PARM_DESC(hotplug_events, "Emit DRM hotplug events when output state changes");
 module_param(non_desktop, bool, 0444);
 MODULE_PARM_DESC(non_desktop, "Mark connector as non-desktop. Default false so compositors can manage Hermes as a normal virtual monitor when connected");
+module_param(hdr_enable, bool, 0444);
+MODULE_PARM_DESC(hdr_enable,
+		 "Advertise HDR via a CTA-861 EDID extension (HDR Static Metadata + BT2020 Colorimetry data blocks) plus the HDR_OUTPUT_METADATA and Colorspace connector properties. Default false. Untested together with color_depth=10; validate that pairing before deployment");
 /*
  * Load-time only, deliberately. At 0600 root could widen every output's capture
  * access on a live system, silently and mid-session: hermes_kms_file_has_access
@@ -286,7 +290,7 @@ struct hermes_kms_output {
 	/* Globally unique identity from hermes_kms_output_ida, or -1. */
 	int identity;
 	char output_name[HERMES_KMS_NAME_LEN];
-	u8 edid[128];
+	u8 edid[2 * HERMES_KMS_EDID_SIZE];
 	/*
 	 * Explicit KMS objects (CRTC + encoder + primary plane), rather than
 	 * drm_simple_display_pipe, so we can drive a software vblank timer the
@@ -707,9 +711,37 @@ static bool hermes_kms_build_output_edid(struct hermes_kms_output *output,
 		.color_depth = color_depth,
 	};
 
-	static_assert(sizeof(output->edid) == HERMES_KMS_EDID_SIZE);
+	bool representable;
 
-	return hermes_kms_build_edid(output->edid, serial, &config);
+	/*
+	 * The buffer holds a base block plus one CTA-861 extension block, so it
+	 * must be exactly two EDID blocks wide. This guards the HDR extension
+	 * append below against a buffer that is too small to hold both blocks.
+	 */
+	static_assert(sizeof(output->edid) == 2 * HERMES_KMS_EDID_SIZE);
+
+	representable = hermes_kms_build_edid(output->edid, serial, &config);
+
+	/*
+	 * When HDR advertisement is enabled, promote the single base block into
+	 * a two-block EDID by flipping the base extension count and appending a
+	 * CTA-861 extension carrying the HDR Static Metadata and BT2020
+	 * Colorimetry data blocks. This is a side effect on the buffer; the
+	 * return value stays the base builder's representable flag.
+	 *
+	 * The append refuses a base that does not already checksum, which cannot
+	 * happen for a block hermes_kms_build_edid() just finalized -- so a
+	 * refusal is a driver bug and worth saying out loud rather than
+	 * discarding. Nothing has to unwind: a refused append leaves the
+	 * extension-count byte at 0, so hermes_kms_edid_size() keeps reporting a
+	 * single block and the output degrades to advertising SDR.
+	 */
+	if (hdr_enable && !hermes_kms_append_hdr_extension(output->edid))
+		drm_warn(&output->hdev->drm,
+			 "%s: HDR extension refused an invalid base EDID; advertising SDR only\n",
+			 output->output_name);
+
+	return representable;
 }
 
 static bool hermes_kms_hotplug_event(struct hermes_kms_output *output)
@@ -1205,7 +1237,7 @@ static int hermes_kms_connector_get_modes(struct drm_connector *connector)
 	 * preferred by definition, so the CVT mode below has to clear that flag
 	 * rather than just set its own.
 	 */
-	drm_edid = drm_edid_alloc(output->edid, sizeof(output->edid));
+	drm_edid = drm_edid_alloc(output->edid, hermes_kms_edid_size(output->edid));
 	if (drm_edid) {
 		drm_edid_connector_update(connector, drm_edid);
 		count += drm_edid_connector_add_modes(connector);
@@ -3872,6 +3904,47 @@ static int hermes_kms_output_modeset_init(struct hermes_kms_output *output)
 	drm_connector_attach_edid_property(&output->connector);
 
 	/*
+	 * HDR advertisement needs the EDID CTA extension (HDR Static Metadata +
+	 * BT2020 Colorimetry blocks, built when hdr_enable is set) together with
+	 * two connector properties: HDR_OUTPUT_METADATA, so a compositor has
+	 * somewhere to write HDR output state, and Colorspace, so it can select
+	 * BT2020. Gated by the same hdr_enable flag so all three mechanisms are
+	 * always enabled together.
+	 */
+	if (hdr_enable) {
+		/*
+		 * Deliberately called for its effect only. This helper returned
+		 * int through 7.1 and returns void from 7.2 on, so assigning the
+		 * result is a compile error on current kernels and testing it
+		 * would not build across the range the driver supports. It has no
+		 * failure path worth branching on either way: it attaches a
+		 * property the DRM core created at init.
+		 */
+		drm_connector_attach_hdr_output_metadata_property(&output->connector);
+
+		/*
+		 * KWin gates HDR behind Capability::WideColorGamut, which needs a
+		 * connector "Colorspace" property advertising BT2020 (together with
+		 * the EDID's BT2020 Colorimetry block) before it will set
+		 * HighDynamicRange. Create and attach it here so all three HDR
+		 * advertisement mechanisms flip together with hdr_enable.
+		 *
+		 * Only BT2020_RGB is requested: drm_mode_create_colorspace_property()
+		 * ORs in BIT(DRM_MODE_COLORIMETRY_DEFAULT) itself, so naming Default
+		 * here would just restate what the helper already guarantees.
+		 */
+		ret = drm_mode_create_hdmi_colorspace_property(
+			&output->connector,
+			BIT(DRM_MODE_COLORIMETRY_BT2020_RGB));
+		if (ret)
+			return ret;
+
+		ret = drm_connector_attach_colorspace_property(&output->connector);
+		if (ret)
+			return ret;
+	}
+
+	/*
 	 * Do not set the connector PATH property here. That property is
 	 * reserved for DP-MST tunnelled connectors: drm_connector_set_path_property()
 	 * returns -EINVAL on a plain DRM_MODE_CONNECTOR_VIRTUAL connector, and a
@@ -4825,6 +4898,18 @@ static void __init hermes_kms_sanitize_mode_range(void)
 			HERMES_KMS_DEFAULT_COLOR_DEPTH);
 		color_depth = HERMES_KMS_DEFAULT_COLOR_DEPTH;
 	}
+
+	/*
+	 * hdr_enable only advertises the capability; it does not activate HDR,
+	 * and the capture UAPI carries no colorspace or HDR metadata either way
+	 * (see README.md). Whether a compositor needs ten-bit scanout set at the
+	 * same time before it will enable HDR is untested. Surface the pairing
+	 * without forcing it -- the user's color_depth choice is left exactly as
+	 * configured.
+	 */
+	if (hdr_enable && color_depth < 10)
+		pr_info("%s: hdr_enable=1 advertises HDR only, with color_depth=%u (<10); the pairing is untested and consumers still receive no colorspace or HDR metadata\n",
+			HERMES_KMS_DRIVER_NAME, color_depth);
 
 	if (min_width != requested_min_width ||
 	    min_height != requested_min_height ||

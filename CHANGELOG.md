@@ -26,6 +26,24 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Added
+
+- HDR advertisement from the virtual output, behind the new `hdr_enable` module
+  parameter (default off, load-time only). A compositor needs several signals
+  together before it treats an output as HDR-capable, so `hdr_enable` gates them
+  as one unit and never a subset: the synthetic EDID gains a CTA-861 extension
+  carrying an HDR Static Metadata Data Block (PQ) and a BT2020 Colorimetry Data
+  Block, and the connector gains the `HDR_OUTPUT_METADATA` and `Colorspace`
+  properties. [`docs/driver-design.md`](docs/driver-design.md) explains why each
+  one is required and how KWin's two-gate chain consumes them.
+
+  This is advertisement only. It does not activate HDR, and Hermes' capture UAPI
+  still carries no colorspace, EOTF or HDR metadata alongside a captured frame,
+  so a consumer reading only that interface cannot tell how to interpret the
+  pixels it receives. End-to-end HDR streaming is therefore incomplete, including
+  with `color_depth=10`. `tests/edid.c` covers the generated EDID bytes, both
+  block checksums and the published EDID length under `make check`.
+
 ### Fixed
 
 - An upgrade no longer leaves a working module reporting itself as unusable

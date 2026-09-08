@@ -103,8 +103,12 @@ the output name prefix is `HERMES-` and the UAPI symbols are prefixed
 `HERMES_KMS_`.
 
 What is currently validated: VAAPI with `XRGB8888`, linear. NVENC/AMF and
-NV12/P010/HDR are not validated yet — see the [Roadmap](#roadmap). Forks and
-contributions extending those paths are welcome under the project's license.
+NV12/P010 are not validated yet — see the [Roadmap](#roadmap). HDR is
+*advertised* but not deliverable end to end: `hdr_enable=1` makes a compositor
+recognise the output as HDR-capable, but the capture UAPI carries no colour
+metadata, so a consumer cannot interpret an HDR frame correctly — see
+[HDR advertisement](#hdr-advertisement). Forks and contributions extending those
+paths are welcome under the project's license.
 
 The kernel module is GPL-2.0, while the installed UAPI has the Linux syscall-note
 exception and the optional userspace session helper is MIT-licensed. This keeps
@@ -152,6 +156,11 @@ an independently developed consumer separate from the Hermes application; see
   while keeping the framebuffer pitch independently aligned for DMA-BUF;
 - eight- and ten-bit scanout formats (`XRGB8888`/`ARGB8888` and the `2101010`
   variants), with the advertised EDID depth selected by `color_depth=`;
+- optional HDR *advertisement* (`hdr_enable=1`, default off), which adds a
+  CTA-861 EDID extension (HDR Static Metadata + BT2020 Colorimetry data blocks)
+  and the `HDR_OUTPUT_METADATA` and `Colorspace` connector properties as one
+  unit. Advertisement only — the capture UAPI carries no colour metadata, so
+  end-to-end HDR is incomplete; see [HDR advertisement](#hdr-advertisement);
 - scanout modifier pass-through: any tiled or compressed layout the compositor's
   render GPU produces is accepted, and `scanout_modifiers=` publishes the extra
   layouts an `IN_FORMATS`-driven compositor can negotiate;
@@ -327,6 +336,51 @@ sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0 outputs=2
 sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0 devices=2 outputs=1
 sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=0 session_devices=4 outputs=1
 ```
+
+### HDR advertisement
+
+`hdr_enable=1` (default off, load-time only) makes the output advertise HDR. It
+gates every mechanism together, so the output never advertises a subset: the
+CTA-861 HDR Static Metadata and BT2020 Colorimetry data blocks in the EDID, and
+the `HDR_OUTPUT_METADATA` and `Colorspace` connector properties. All of them are
+needed because compositors gate HDR behind a chain rather than a single signal;
+[`docs/driver-design.md`](docs/driver-design.md) walks through KWin's version of
+that chain and why each mechanism is load-bearing.
+
+```bash
+sudo modprobe hermes_kms hdr_enable=1
+```
+
+To apply it at every module load, drop a file in `/etc/modprobe.d`:
+
+```
+# /etc/modprobe.d/hermes-kms-hdr.conf
+options hermes_kms hdr_enable=1
+```
+
+**This feature is incomplete.** `hdr_enable=1` advertises HDR capability to
+compositors. Hermes does not yet include colorspace, EOTF, or HDR metadata in its
+capture UAPI. Consumers relying only on that interface cannot determine the
+captured frame's colour encoding. End-to-end HDR streaming remains incomplete,
+including with `color_depth=10`.
+
+Concretely, that means:
+
+- `hdr_enable=1` only advertises support — it does not itself activate HDR.
+- If the compositor switches to PQ/BT.2020 and the consumer keeps interpreting
+  the frame as SDR, colours will be wrong. This applies to ten-bit frames too;
+  `color_depth=10` does not supply the missing signalling.
+- DRM does store the negotiated `Colorspace` and `HDR_OUTPUT_METADATA` on the
+  connector, and a consumer holding the primary KMS node can read them. That is
+  not reachable through the render node, and it does not associate the metadata
+  atomically with a captured frame.
+- Whether a given compositor needs `color_depth=10` set alongside `hdr_enable=1`
+  is untested. If one still reports "HDR: incapable" with both set, CRTC
+  colour-management properties are the next area to look at; that is outside this
+  feature's scope.
+
+Carrying colour metadata alongside the captured frame is a capture-UAPI change
+and is deliberately left to follow-up work.
 
 Independent compositors use the packaged
 `72-hermes-kms-session-seats.rules` and one private seat broker per session
