@@ -37,6 +37,16 @@ jobs:
             pkg-config \
             udev
 
+      # Optional: make check runs the EDID conformity check against a real
+      # parser when one is present and skips it cleanly when it is not. The
+      # runner's edid-decode will not be the version the baseline was recorded
+      # with, so that check enforces its version-independent tier here (no
+      # checksum errors, and the number of findings HDR adds is unchanged) and
+      # reports the exact finding set as informational.
+      - name: Install edid-decode (optional, for EDID conformity)
+        continue-on-error: true
+        run: sudo apt-get install --no-install-recommends -y edid-decode
+
       - name: Run userspace regression checks
         run: make check
 

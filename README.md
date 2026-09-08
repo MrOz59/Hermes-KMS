@@ -466,6 +466,11 @@ Other validation scripts (run as root, in the virtme-ng VM or on the host):
   packaged unit's hardening plus configured-user socket ownership;
 - `scripts/vm-uapi-v7-compat-test.sh` — verifies an unmodified v0.1.2 control
   client remains confined to the first output under the current UAPI;
+- `scripts/vm-hdr-test.sh` — loads with `hdr_enable=0`, `hdr_enable=1` and
+  `hdr_enable=1 color_depth=10`, and verifies the published EDID length (128 vs
+  256 bytes), the CTA extension's HDR Static Metadata and BT2020 Colorimetry
+  blocks, and that `HDR_OUTPUT_METADATA` and `Colorspace` appear on the
+  connector only when enabled. Needs no GPU or compositor;
 - `scripts/vm-pacing-test.sh` — asserts the vblank timer fires at exactly
   60/120/144 Hz with no missed vblanks (uses `hermes-vblank-meter.c`);
 - `scripts/vm-export-stress.sh` — hammers `ACQUIRE_FRAME` from many threads
