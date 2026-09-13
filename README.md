@@ -143,7 +143,7 @@ an independently developed consumer separate from the Hermes application; see
   load. Role and session index are settable before the card exists, so a
   dynamic card lands on the same seat and broker a pool card would, and the
   `card`/`render_node` attributes report the nodes it received;
-- per-card render-node ownership (`access_uid`), so several mutually untrusted
+- per-card render-node ACLs (`access_uid`), so several mutually untrusted
   consumers can each hold their own card instead of sharing the one uid the
   packaged pool grants every Hermes node;
 - 1–8 independent DRM cards (`devices=`, default 1), each with its own
@@ -231,25 +231,31 @@ compiler is available; `check-edid-conformity` SKIPs cleanly when `edid-decode`
 
 ### Install
 
-The Arch/CachyOS package installs DKMS, `seatd`, module-load/modprobe defaults,
-the role-aware udev rule, and the private broker units together:
+The Arch/CachyOS build produces a DKMS package with the host access policy and
+an optional `seatd` package for private session cards:
 
 ```bash
 makepkg -si
 ```
 
-The package loads one host card plus a four-card private session pool on boot.
-Hermes' Audio/Video page can configure broker ownership for its current user
-with one administrator prompt. The equivalent command is:
+The default load creates one seat0 host card. Its render node remains owned by
+root and gets a logind `uaccess` ACL for the active local desktop user. For a
+private pool, install the optional broker package and configure the intended
+consumer. The setup helper stores that UID and grants it only the private
+render-node ACLs, without udev's deprecated non-system `OWNER` assignment:
 
 ```bash
 sudo /usr/lib/hermes-kms/hermes-kms-setup configure --user auto
 ```
 
-For a source installation, `sudo make dkms-install` now installs the same
-runtime files. If an older module topology is already loaded, the helper saves
-the new configuration and asks for one reboot instead of forcibly unloading a
-card that a compositor may still have open.
+For a source installation, `sudo make dkms-install` installs the core policy.
+Use `sudo make INSTALL_BROKER=1 dkms-install` to install the optional private-seat
+helper. If an older module topology is already loaded, the helper saves the new
+configuration and asks for one reboot instead of forcibly unloading a card a
+compositor may hold.
+If you installed the temporary `99-hermes-kms-uaccess.rules` workaround from
+issue #6, remove it; it matches private render nodes too and would override
+their restricted access policy.
 
 ### Image-based systems (Bazzite, Silverblue, SteamOS)
 
@@ -322,8 +328,16 @@ ls -l /dev/dri/
 modetest -c
 drm_info
 journalctl -k -g hermes-kms
-sudo rmmod hermes_kms
+sudo scripts/hermes-kms-unload
 ```
+
+A desktop compositor or Xwayland may keep the DRM card open after Hermes exits,
+even when its connector is disconnected. `hermes-kms-unload` first unbinds the
+cards (which sends a device-removal event), waits briefly, and then removes the
+module. If a process keeps an old descriptor open, the script leaves the cards
+detached and reports the earlier openers; close that process and rerun it. Use
+`sudo hermes-kms-rebind` to restore detached cards without rebooting. Configfs
+cards must be removed by their creator before unloading.
 
 Active output state and capture are capability-protected. For command-line
 diagnostics, keep an owner running in one terminal and publish its credential
@@ -462,6 +476,8 @@ module, drives a `modetest` producer, and verifies the DMA-BUF/sync_file path.
 
 Other validation scripts (run as root, in the virtme-ng VM or on the host):
 
+- `scripts/vm-access-unload-test.sh` — checks host/private render-node access,
+  a DRM descriptor held after client exit, safe detach, rebind, and unload;
 - `scripts/vm-session-lifecycle-test.sh` — checks token rotation, one-shot
   binding revocation, binding accounting, and that a blocked `WAIT_FRAME` on a
   revoked descriptor is woken with `EACCES` rather than left to time out;

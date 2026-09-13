@@ -53,16 +53,13 @@ subject to change between minor releases.
   gains `hermes_session_replace_file()`, `hermes_session_refresh_owner_token()`
   and `hermes_session_unbind()`.
 
-- Per-card render-node ownership. A card created through configfs can name the
+- Per-card render-node access. A card created through configfs can name the
   uid it belongs to with `access_uid`; the driver publishes it as the
   `hermes_kms_access_uid` sysfs attribute and the packaged
-  `92-hermes-kms-access.rules` turns it into ownership of that card's render
-  node. Until now the access rule `hermes-kms-setup` writes granted one
-  configured uid *every* Hermes render node, so the pool's private cards were
-  private from the desktop but not from each other — whoever held that uid could
-  open any card and claim any unowned output. The rule denies before it grants,
-  so a card naming an account that does not exist ends up root-only rather than
-  falling back to the broader grant.
+  `92-hermes-kms-access.rules` keeps that card root-only while a short-lived
+  udev helper grants only the named account a read/write ACL. The packaged pool
+  grants its configured consumer the same ACL on private render nodes. An
+  unresolvable account remains denied, and no numeric `OWNER` is assigned.
 
 - UAPI v13 session-capability lifecycle. `SESSION_ACCESS(ROTATE_TOKEN)` replaces
   a session's token while every existing binding keeps working, and
@@ -178,13 +175,14 @@ subject to change between minor releases.
   validate a candidate node with core `DRM_IOCTL_VERSION` before private ioctls,
   and can install the syscall-note UAPI plus the application-neutral,
   MIT-licensed session helper without installing Hermes application code.
-- The Arch/CachyOS package now depends on `seatd`, installs all runtime files
-  together, and defaults to one host card plus four disconnected private
-  cards. No scanout memory is allocated until a client owns a card.
+- The Arch/CachyOS build now splits the DKMS driver from the optional `seatd`
+  broker. The driver defaults to one disconnected host card; configuring the
+  broker creates the requested private pool. No scanout memory is allocated
+  until a client owns a card.
 - Role-aware udev rules keep the host card on seat0 and automatically start
   only the broker instances corresponding to private cards.
-- `make dkms-install` now installs module-load/modprobe defaults, udev rules,
-  broker units, and the setup helper instead of leaving those as manual steps.
+- `make dkms-install` now installs module-load/modprobe defaults and core udev
+  rules; `INSTALL_BROKER=1` also installs the broker units and setup helper.
   It detects an already-loaded older module and asks for a reboot instead of
   implying that the new DKMS build is active.
 - Private broker sockets can be owned directly by the configured Hermes user,
@@ -192,16 +190,15 @@ subject to change between minor releases.
 
 ### Fixed
 
-- An upgrade no longer leaves a working module reporting itself as unusable
-  without saying why. Render nodes are denied by default and granted by the
-  `90-` rule `hermes-kms-setup` writes; no card in the packaged pool sets
-  `hermes_kms_access_uid`, so nothing else reverses that deny. Until the setup
-  has run, the consumer logs `Couldn't open render node ... Permission denied`
-  and its panel reports Hermes-KMS as not enabled, which sends people to
-  modprobe a module that is already loaded. `post_install` always named the
-  configuration step; `post_upgrade` did not, which is exactly where somebody
-  who reinstalled, or who never ran it, ends up. It now says so, and only when
-  the rule is actually missing.
+- A default DKMS install no longer leaves the host render node inaccessible to
+  Hermes. The root-owned host node gets the active local session's `uaccess`
+  ACL; private cards remain restricted to the configured consumer. The setup
+  helper and package upgrade remove the old numeric `OWNER` rule, which udev
+  warns is deprecated for non-system accounts.
+- `hermes-kms-unload` detaches static cards before trying `modprobe -r`, so
+  desktop processes receive a removal event and can release DRM descriptors
+  held after Hermes exits. If an opener ignores removal, it reports the blocker
+  and leaves the cards detached; `hermes-kms-rebind` restores them on request.
 
 - `hermes-kmsctl` no longer ignores arguments a command does not take. Options
   have to precede the command, so `hold 1280x720@60 --session-file X` held an

@@ -1,3 +1,5 @@
-# Capture/control render nodes default to root-only access. Projects grant
-# access through their own udev policy or per-card access_uid in configfs.
+# Private capture/control render nodes start root-only. The active local user
+# may open the seat0 host card; a private session card instead gets only the
+# configured consumer's ACL from hermes-kms-render-acl.
 ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", DEVPATH=="*/platform/hermes-kms*/drm/renderD*", OWNER="root", GROUP="root", MODE="0600", TAG-="uaccess"
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", DEVPATH=="*/platform/hermes-kms*/drm/renderD*", RUN+="/usr/lib/hermes-kms/hermes-kms-render-acl %p"

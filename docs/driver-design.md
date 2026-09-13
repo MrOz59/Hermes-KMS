@@ -271,21 +271,25 @@ creates one host-role card plus N session-role cards. The host card remains on
 seat0 for KWin/GNOME and normal shared-desktop streaming. Each session card
 reports a stable 1-based `session_index`; udev maps that index to
 `hermes-kms-N` and requests the matching private seat broker.
-Session-role primary nodes and unconfigured render nodes are root-only mode
-0600. The root broker opens the primary node and passes access over its
+Session-role primary nodes and unconfigured private render nodes are root-only
+mode 0600. The host render node is also root-owned but gets a `uaccess` ACL for
+the active local seat0 user. The root broker opens the primary node and passes access over its
 per-session socket. It creates its own private mount namespace rather than
 requiring the caller to supply one, which is what lets it bind its per-instance
 runtime directory over `/run` without any risk to the host's, and it runs under
-a syscall filter with a reduced capability set; global `video` membership and active-seat `uaccess` ACLs do
-not bypass that boundary. The setup helper grants only the configured consumer
-UID access to render nodes for capability-protected control and capture.
+a syscall filter with a reduced capability set; global `video` membership and
+host-seat `uaccess` ACLs do not bypass that boundary. The setup helper grants
+the configured consumer an ACL on private render nodes for capability-protected
+control and capture. The nodes stay owned by root; no non-system UID is assigned
+as their udev `OWNER`.
 
 The role and session metadata replace reserved identity words, so the ioctl
 struct size and all older fields remain unchanged. The new
 `HERMES_KMS_CAP_SESSION_DEVICE_POOL` capability gates interpretation of those
 fields. Old UAPI clients continue to see globally unique cards and outputs.
 
-The packaged default is `session_devices=4 outputs=1 initial_enabled=0`.
+The core packaged default is one seat0 card with `session_devices=0`. The
+optional setup helper defaults to `session_devices=4 outputs=1 initial_enabled=0`.
 Disconnected cards have KMS object state but no active scanout framebuffer, so
 the pool does not preallocate four display-sized buffers. A setup helper stores
 the configured service uid for broker socket ownership. If the loaded topology
@@ -321,29 +325,26 @@ cat    /sys/kernel/config/hermes-kms/stream-1/render_node  # renderDN
 rmdir  /sys/kernel/config/hermes-kms/stream-1
 ```
 
-### Per-card render-node ownership
+### Per-card render-node access
 
 The packaged pool's private cards are private from the desktop — dedicated seat,
 private broker, root-only primary node — but not from each other. The access
-rule `hermes-kms-setup` writes grants one configured uid *every* Hermes render
-node, so whoever holds that uid can open any card in the pool and claim any
-unowned output. That is fine for the single-consumer host the pool was designed
-for and wrong for anything else.
+policy gives one configured uid an ACL on every private render node in the
+pool, so whoever holds that uid can open any unowned private card. The host
+render node instead follows the active seat0 session. This pool is designed for
+one consumer, not mutually untrusted consumers.
 
 `access_uid` closes it. A card created through configfs can name the uid it
 belongs to; the driver publishes that as the `hermes_kms_access_uid` sysfs
 attribute on the platform device and does not interpret it further, keeping
 device-node policy where the rest of it already lives. The packaged
-`92-hermes-kms-access.rules` turns it into ownership of that card's render
-node, and its number is deliberate: it runs after the broader `90-` grant, so a
-card that names a uid overrides it while a card that names none keeps the
-existing behaviour.
+`92-hermes-kms-access.rules` keeps an explicitly assigned card root-only and
+removes the host `uaccess` tag; the short-lived udev ACL helper grants only that
+UID read/write access after the node has been created.
 
-The uid must resolve to a real local account. udev refuses to apply an `OWNER`
-it cannot resolve and simply moves on, which on its own would leave the node
-with whatever the broader grant had already set — so the rule denies first and
-grants second, and a card naming an account that does not exist ends up
-root-only rather than falling back to a wider grant.
+The UID must resolve to a real account. The ACL helper removes stale entries on
+change and checks the account before granting access, so a card naming a UID
+that does not exist remains root-only rather than falling back to a wider grant.
 
 Primary nodes keep their role-based policy: a session card's `card*` node stays
 root-only and is reached through its private seat broker.
@@ -379,6 +380,13 @@ hold a card open when it goes, and unplug is what makes `drm_ioctl()` answer
 The module holds a reference while any configfs group exists, so `rmmod` fails
 until the groups are removed. Statically configured cards and the session pool
 are unaffected and keep working exactly as before.
+
+Compositors and Xwayland can also hold static cards open while disconnected.
+`hermes-kms-unload` unbinds those cards before calling `modprobe -r`, giving
+userspace a removal event and a chance to close its descriptors. If a process
+keeps a stale descriptor open, the kernel still protects the module from unload;
+the helper reports the earlier openers and leaves the cards detached until the
+process exits or `hermes-kms-rebind` restores them.
 
 Status: **Prototype**. `scripts/vm-configfs-test.sh` validates creation and
 removal alongside a static card, role and seat metadata reaching sysfs and

@@ -1,0 +1,36 @@
+#!/bin/sh
+# Applied by udev after the node's root-only owner and mode have been set.
+set -eu
+
+case "${1:-}" in
+	/devices/platform/hermes-kms*/drm/renderD[0-9]*) ;;
+	*) exit 1 ;;
+esac
+
+platform=${1%/drm/renderD*}
+node=/dev/dri/${1##*/}
+[ -c "$node" ] || exit 0
+role=$(cat "/sys${platform}/hermes_kms_role")
+uid=$(cat "/sys${platform}/hermes_kms_access_uid")
+
+if [ -z "$uid" ]; then
+	if [ "$role" != session ]; then
+		# logind owns the active-seat ACL on host/general cards.
+		exit 0
+	fi
+	user_file=/etc/hermes-kms/session-user
+	[ ! -e "$user_file" ] || [ ! -L "$user_file" ] || exit 1
+	if [ -f "$user_file" ]; then
+		uid=$(cat "$user_file")
+	fi
+fi
+
+# A change event must revoke an old configured user's ACL before granting a
+# new one. chmod 0600 alone only masks old entries; setfacl -b removes them.
+setfacl -b -- "$node"
+[ -n "$uid" ] || exit 0
+case "$uid" in
+	*[!0-9]*) exit 1 ;;
+esac
+getent passwd "$uid" >/dev/null || exit 0
+setfacl -m "u:${uid}:rw" -- "$node"

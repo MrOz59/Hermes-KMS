@@ -60,6 +60,11 @@ for path in "${CONFIG_FILES[@]}"; do
 done
 RESTORE_CONFIGS=1
 
+# The test guest is disposable. Exercise the installed udev policy and ACL
+# helper, not just the setup script's file output.
+make -C "$REPO" install-core-configs DESTDIR=/ >/dev/null
+udevadm control --reload-rules
+
 printf '%s\n' \
 	'#!/bin/sh' \
 	'printf "%s\n" "$*" >>"$HERMES_TEST_SYSTEMCTL_LOG"' \
@@ -67,6 +72,10 @@ printf '%s\n' \
 chmod 0755 "$STUB_ROOT/systemctl"
 
 target_uid="$(id -u nobody 2>/dev/null || printf '0')"
+printf '%s\n' \
+	'# Managed by hermes-kms-setup. Grants one configured UID render-node access.' \
+	"ACTION==\"add|change\", SUBSYSTEM==\"drm\", KERNEL==\"renderD[0-9]*\", OWNER=\"${target_uid}\"" \
+	>/etc/udev/rules.d/90-hermes-kms-user.rules
 DMESG_MARK="$(dmesg | wc -l)"
 insmod "$KO" initial_enabled=0 hotplug_events=0 session_devices=2 outputs=1
 LOADED_BY_TEST=1
@@ -86,11 +95,43 @@ grep -qx 'options hermes_kms initial_enabled=0 outputs=1 session_devices=2' \
 	printf 'FAIL: helper did not persist the requested module topology\n' >&2
 	FAIL=1
 }
-grep -q "OWNER=\"${target_uid}\".*MODE=\"0600\".*TAG-=\"uaccess\"" \
-	/etc/udev/rules.d/90-hermes-kms-user.rules || {
-	printf 'FAIL: helper did not restrict render nodes to the target uid\n' >&2
+[ ! -e /etc/udev/rules.d/90-hermes-kms-user.rules ] || {
+	printf 'FAIL: helper left the deprecated numeric OWNER rule installed\n' >&2
 	FAIL=1
 }
+for index in 1 2; do
+	for sysnode in /sys/devices/platform/hermes-kms."$index"/drm/renderD*; do
+		[ -e "$sysnode" ] || continue
+		node="/dev/dri/${sysnode##*/}"
+		getfacl -cpn "$node" | grep -q "^user:${target_uid}:rw-$" || {
+			printf 'FAIL: %s lacks configured-user ACL\n' "$node" >&2
+			FAIL=1
+		}
+		runuser -u nobody -- python3 -c \
+			'import os,sys; fd=os.open(sys.argv[1], os.O_RDWR); os.close(fd)' \
+			"$node" || {
+			printf 'FAIL: configured user cannot open %s read/write\n' "$node" >&2
+			FAIL=1
+		}
+	done
+done
+
+alternate_uid="$(id -u bin)"
+env HERMES_TEST_SYSTEMCTL_LOG="$SYSTEMCTL_LOG" PATH="$STUB_ROOT:$PATH" \
+	"$HELPER" configure --user "$alternate_uid" --session-devices 2 >/dev/null
+for sysnode in /sys/devices/platform/hermes-kms.1/drm/renderD*; do
+	[ -e "$sysnode" ] || continue
+	node="/dev/dri/${sysnode##*/}"
+	acl="$(getfacl -cpn "$node")"
+	printf '%s\n' "$acl" | grep -q "^user:${alternate_uid}:rw-$" || {
+		printf 'FAIL: updated consumer lacks ACL on %s\n' "$node" >&2
+		FAIL=1
+	}
+	if printf '%s\n' "$acl" | grep -q "^user:${target_uid}:"; then
+		printf 'FAIL: old consumer retained ACL on %s\n' "$node" >&2
+		FAIL=1
+	fi
+done
 grep -qx 'restart hermes-kms-seatd@1.service' "$SYSTEMCTL_LOG" || {
 	printf 'FAIL: broker 1 was not restarted\n' >&2
 	FAIL=1

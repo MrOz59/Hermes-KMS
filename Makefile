@@ -253,6 +253,14 @@ install-core-configs:
 		'$(DESTDIR)$(SYSTEM_UDEV_RULE_DIR)/72-hermes-kms-render-access.rules'
 	install -Dm0644 udev/92-hermes-kms-access.rules \
 		'$(DESTDIR)$(SYSTEM_UDEV_RULE_DIR)/92-hermes-kms-access.rules'
+	install -Dm0644 udev/95-hermes-kms-host-access.rules \
+		'$(DESTDIR)$(SYSTEM_UDEV_RULE_DIR)/95-hermes-kms-host-access.rules'
+	install -Dm0755 scripts/hermes-kms-render-acl \
+		'$(DESTDIR)/usr/lib/hermes-kms/hermes-kms-render-acl'
+	install -Dm0755 scripts/hermes-kms-unload \
+		'$(DESTDIR)/usr/bin/hermes-kms-unload'
+	install -Dm0755 scripts/hermes-kms-rebind \
+		'$(DESTDIR)/usr/bin/hermes-kms-rebind'
 
 install-broker-configs:
 	install -Dm0644 udev/72-hermes-kms-session-seats.rules \
@@ -326,6 +334,11 @@ install-runtime-udev:
 	@# The rule moved from 70- to 72- so systemd's 70-uaccess.rules cannot
 	@# re-add the tag it removes; drop the stale copy from older installs.
 	$(RM) $(SYSTEM_UDEV_RULE_DIR)/70-hermes-kms-session-seats.rules
+	@if [ -f /etc/udev/rules.d/90-hermes-kms-user.rules ] && \
+		grep -qx '# Managed by hermes-kms-setup. Grants one configured UID render-node access.' \
+			/etc/udev/rules.d/90-hermes-kms-user.rules; then \
+		$(RM) /etc/udev/rules.d/90-hermes-kms-user.rules; \
+	fi
 	-systemctl daemon-reload
 	-udevadm control --reload-rules
 	-udevadm trigger --subsystem-match=drm --action=change
@@ -344,6 +357,10 @@ uninstall-core-configs:
 	$(RM) /usr/lib/modprobe.d/hermes-kms.conf
 	$(RM) $(SYSTEM_UDEV_RULE_DIR)/72-hermes-kms-render-access.rules
 	$(RM) $(SYSTEM_UDEV_RULE_DIR)/92-hermes-kms-access.rules
+	$(RM) $(SYSTEM_UDEV_RULE_DIR)/95-hermes-kms-host-access.rules
+	$(RM) /usr/lib/hermes-kms/hermes-kms-render-acl
+	$(RM) /usr/bin/hermes-kms-unload
+	$(RM) /usr/bin/hermes-kms-rebind
 
 uninstall-broker-configs:
 	-systemctl stop 'hermes-kms-seatd@*.service'

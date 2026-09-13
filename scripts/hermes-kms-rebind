@@ -1,0 +1,16 @@
+#!/bin/sh
+# Restore static platform cards left detached by hermes-kms-unload.
+set -eu
+
+[ "$(id -u)" -eq 0 ] || {
+	printf 'run hermes-kms-rebind as root\n' >&2
+	exit 1
+}
+modprobe hermes_kms
+driver=/sys/bus/platform/drivers/hermes-kms
+for device in /sys/bus/platform/devices/hermes-kms*; do
+	[ -d "$device" ] || continue
+	[ -L "$device/driver" ] && continue
+	printf '%s\n' "${device##*/}" > "$driver/bind"
+done
+printf 'Hermes-KMS cards are bound.\n'

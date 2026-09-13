@@ -79,6 +79,14 @@ command -v udevadm >/dev/null || {
 	printf 'udevadm is required\n' >&2
 	exit 3
 }
+command -v setfacl >/dev/null || {
+	printf 'setfacl is required for private render-node access (install acl)\n' >&2
+	exit 3
+}
+[ -x /usr/lib/hermes-kms/hermes-kms-render-acl ] || {
+	printf 'Hermes-KMS core ACL helper is not installed; install the updated driver runtime first\n' >&2
+	exit 3
+}
 if [ -L /etc/hermes-kms ]; then
 	printf 'refusing symlink configuration directory: /etc/hermes-kms\n' >&2
 	exit 3
@@ -89,9 +97,8 @@ install -d -o root -g root -m 0755 \
 tmp_config=
 tmp_user=
 tmp_modules=
-tmp_access_rule=
 cleanup_tmp() {
-	for tmp_file in "$tmp_config" "$tmp_user" "$tmp_modules" "$tmp_access_rule"; do
+	for tmp_file in "$tmp_config" "$tmp_user" "$tmp_modules"; do
 		[ -n "$tmp_file" ] && rm -f -- "$tmp_file"
 	done
 }
@@ -100,7 +107,6 @@ trap 'exit 1' HUP INT TERM
 tmp_config="$(mktemp "${MODPROBE_CONFIG}.XXXXXX")"
 tmp_user="$(mktemp "${SESSION_USER_FILE}.XXXXXX")"
 tmp_modules="$(mktemp "${MODULES_CONFIG}.XXXXXX")"
-tmp_access_rule="$(mktemp "${ACCESS_RULE}.XXXXXX")"
 {
 	printf '%s\n' \
 		'# Managed by hermes-kms-setup. Connectors stay disabled until owned.' \
@@ -109,22 +115,21 @@ tmp_access_rule="$(mktemp "${ACCESS_RULE}.XXXXXX")"
 } >"$tmp_config"
 printf '%s\n' "$TARGET_UID" >"$tmp_user"
 printf '%s\n' hermes_kms >"$tmp_modules"
-{
-	printf '%s\n' \
-		'# Managed by hermes-kms-setup. Grants one configured UID render-node access.' \
-		'# Numeric non-system OWNER is deprecated by udev; use is temporary until a managed group/ACL design replaces it.' \
-		"ACTION==\"add|change\", SUBSYSTEM==\"drm\", KERNEL==\"renderD[0-9]*\", DEVPATH==\"*/platform/hermes-kms*/drm/renderD*\", OWNER=\"${TARGET_UID}\", GROUP=\"root\", MODE=\"0600\", TAG-=\"uaccess\""
-} >"$tmp_access_rule"
-chmod 0644 "$tmp_config" "$tmp_user" "$tmp_modules" "$tmp_access_rule"
+chmod 0644 "$tmp_config" "$tmp_user" "$tmp_modules"
 mv -fT -- "$tmp_config" "$MODPROBE_CONFIG"
 mv -fT -- "$tmp_user" "$SESSION_USER_FILE"
 mv -fT -- "$tmp_modules" "$MODULES_CONFIG"
-mv -fT -- "$tmp_access_rule" "$ACCESS_RULE"
 tmp_config=
 tmp_user=
 tmp_modules=
-tmp_access_rule=
 trap - EXIT HUP INT TERM
+
+# The old helper wrote a numeric OWNER rule. Remove only that managed rule;
+# udev's core ACL helper now reads session-user for private cards directly.
+if [ -f "$ACCESS_RULE" ] &&
+   grep -qx '# Managed by hermes-kms-setup. Grants one configured UID render-node access.' "$ACCESS_RULE"; then
+	rm -f -- "$ACCESS_RULE"
+fi
 
 # Repair the ownership left by launcher versions that made this common root
 # writable by the session user. /run itself is root-owned, so this path cannot

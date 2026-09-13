@@ -37,9 +37,10 @@ package_hermes-kms-dkms-git() {
   cd "$srcdir/Hermes-KMS"
 
   pkgdesc="Reusable virtual display DRM/KMS driver and public UAPI (DKMS)"
-  depends=('dkms')
+  depends=('dkms' 'acl')
   provides=('hermes-kms')
   conflicts=('hermes-kms')
+  install="${_pkgbase}-core.install"
 
   local _dest="$pkgdir/usr/src/${_pkgbase}-${pkgver}"
   install -dm755 "$_dest"

@@ -1,0 +1,8 @@
+# After all packaged deny rules, give only unassigned host/general render nodes
+# to the active desktop seat. Explicit access_uid cards and private session
+# cards keep their root-only base policy and receive their own ACL separately.
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", DEVPATH=="*/platform/hermes-kms*/drm/renderD*", ATTRS{hermes_kms_role}=="host", ATTRS{hermes_kms_access_uid}=="", OWNER="root", GROUP="root", MODE="0600", TAG+="uaccess", RUN{builtin}+="uaccess"
+# The legacy single static card has no numeric platform suffix. A configfs-only
+# general card can also have index 0, but its path is hermes-kms.0 and must not
+# gain seat0 access merely because its creator did not set access_uid.
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", DEVPATH=="*/platform/hermes-kms/drm/renderD*", ATTRS{hermes_kms_role}=="general", ATTRS{hermes_kms_access_uid}=="", OWNER="root", GROUP="root", MODE="0600", TAG+="uaccess", RUN{builtin}+="uaccess"

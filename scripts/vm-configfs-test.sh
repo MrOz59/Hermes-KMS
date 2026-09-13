@@ -100,6 +100,8 @@ hermes_cards()
 	exit 1
 }
 
+make -C "$REPO" install-runtime-udev >/dev/null 2>&1
+
 install -Dm0644 "$REPO/udev/92-hermes-kms-access.rules" "$ACCESS_RULE"
 RULE_INSTALLED=1
 udevadm control --reload-rules
@@ -265,9 +267,8 @@ done
 sleep 0.5
 check "card count after removing the pool" 1 "$(hermes_cards)"
 
-# A card can name the uid that owns its render node. Without this the packaged
-# pool grants one configured uid every Hermes render node, so its private cards
-# are private from the desktop but not from each other.
+# A card can name the UID that receives a render-node ACL. A different card's
+# consumer must not gain access through the broad session-pool configuration.
 mkdir "$CONFIGFS/tenant-a"
 mkdir "$CONFIGFS/tenant-b"
 mkdir "$CONFIGFS/tenant-none"
@@ -286,26 +287,35 @@ udevadm trigger --subsystem-match=drm --action=change
 udevadm settle
 sleep 0.3
 
-check "tenant-a render node owner" 1 \
+check "tenant-a render node owner" 0 \
 	"$(stat -c %u "/dev/dri/$(cat "$CONFIGFS/tenant-a/render_node")")"
-check "tenant-b render node owner" 2 \
+check "tenant-b render node owner" 0 \
 	"$(stat -c %u "/dev/dri/$(cat "$CONFIGFS/tenant-b/render_node")")"
-check "tenant-a render node mode" 600 \
-	"$(stat -c %a "/dev/dri/$(cat "$CONFIGFS/tenant-a/render_node")")"
+for spec in 'tenant-a:1' 'tenant-b:2'; do
+	name=${spec%:*}
+	uid=${spec#*:}
+	node="/dev/dri/$(cat "$CONFIGFS/$name/render_node")"
+	getfacl -cpn "$node" | grep -q "^user:${uid}:rw-$" || {
+		printf 'FAIL: %s lacks UID %s ACL\n' "$node" "$uid" >&2
+		FAIL=1
+	}
+done
 # An access_uid that resolves to no account must deny rather than fall back to
 # whatever broader grant the installation already has.
 check "unresolvable access_uid denies" 0 \
 	"$(stat -c %u "/dev/dri/$(cat "$CONFIGFS/tenant-ghost/render_node")")"
+if getfacl -cpn "/dev/dri/$(cat "$CONFIGFS/tenant-ghost/render_node")" | grep -q '^user:[0-9]'; then
+	printf 'FAIL: unresolvable access_uid received an ACL\n' >&2
+	FAIL=1
+fi
 # A card that names no uid must fall through to whatever policy already exists,
 # not be assigned to root by this rule.
-NONE_OWNER="$(stat -c %u "/dev/dri/$(cat "$CONFIGFS/tenant-none/render_node")")"
-if [ "$NONE_OWNER" = 4001 ] || [ "$NONE_OWNER" = 4002 ]; then
-	printf 'FAIL: a card naming no uid picked up another card owner (%s)\n' \
-		"$NONE_OWNER" >&2
+check "unassigned configfs card stays root-owned" 0 \
+	"$(stat -c %u "/dev/dri/$(cat "$CONFIGFS/tenant-none/render_node")")"
+if udevadm info --query=property --name="/dev/dri/$(cat "$CONFIGFS/tenant-none/render_node")" |
+	grep -Eq '^(TAGS|CURRENT_TAGS)=.*uaccess'; then
+	printf 'FAIL: unassigned configfs card gained host-seat access\n' >&2
 	FAIL=1
-else
-	printf 'ok: a card naming no uid was left alone (owner %s)\n' \
-		"$NONE_OWNER"
 fi
 # The primary node keeps its role-based policy regardless.
 check "tenant-a card node owner" 0 \

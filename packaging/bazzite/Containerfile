@@ -38,7 +38,10 @@ COPY packaging/systemd ./packaging/systemd
 COPY udev/72-hermes-kms-session-seats.rules ./udev/72-hermes-kms-session-seats.rules
 COPY udev/72-hermes-kms-render-access.rules ./udev/72-hermes-kms-render-access.rules
 COPY udev/92-hermes-kms-access.rules ./udev/92-hermes-kms-access.rules
-COPY scripts/hermes-kms-seatd-instance scripts/hermes-kms-setup ./scripts/
+COPY udev/95-hermes-kms-host-access.rules ./udev/95-hermes-kms-host-access.rules
+COPY scripts/hermes-kms-seatd-instance scripts/hermes-kms-setup \
+     scripts/hermes-kms-render-acl scripts/hermes-kms-unload \
+     scripts/hermes-kms-rebind ./scripts/
 
 RUN --mount=type=secret,id=module_sign_key,required=false \
     --mount=type=secret,id=module_sign_cert,required=false \
@@ -84,6 +87,7 @@ ARG WITH_SEAT_BROKER=1
 # packages so rpm-ostree does not reject an already-present package request.
 RUN set -eux; \
     missing=; \
+    rpm -q acl >/dev/null 2>&1 || missing="${missing} acl"; \
     if [ "${WITH_SEAT_BROKER}" = 1 ]; then \
         rpm -q seatd >/dev/null 2>&1 || missing="${missing} seatd"; \
         rpm -q polkit >/dev/null 2>&1 || missing="${missing} polkit"; \

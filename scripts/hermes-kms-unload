@@ -1,0 +1,66 @@
+#!/bin/sh
+# Detach static DRM cards before trying to unload the module. A compositor can
+# keep a disconnected card open long after the capture client has exited.
+set -eu
+
+[ "$(id -u)" -eq 0 ] || {
+	printf 'run hermes-kms-unload as root\n' >&2
+	exit 1
+}
+[ -d /sys/module/hermes_kms ] || exit 0
+
+configfs=/sys/kernel/config/hermes-kms
+if [ -d "$configfs" ]; then
+	for group in "$configfs"/*; do
+		[ -d "$group" ] || continue
+		printf 'remove the configfs card %s before unloading hermes_kms\n' "$group" >&2
+		exit 1
+	done
+fi
+
+# Record openers while the device nodes still exist; after unbind, fuser can no
+# longer resolve their names even if a process keeps a stale descriptor open.
+openers=
+set --
+for platform in /sys/devices/platform/hermes-kms*; do
+	[ -L "$platform/driver" ] || continue
+	for sysnode in "$platform"/drm/card[0-9]* "$platform"/drm/renderD[0-9]*; do
+		[ -e "$sysnode" ] || continue
+		node="/dev/dri/${sysnode##*/}"
+		[ -c "$node" ] && set -- "$@" "$node"
+	done
+done
+if command -v fuser >/dev/null 2>&1; then
+	[ "$#" -eq 0 ] || openers=$(fuser -v "$@" 2>&1 || true)
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+	systemctl stop 'hermes-kms-seatd@*.service' 2>/dev/null || true
+fi
+
+driver=/sys/bus/platform/drivers/hermes-kms
+if [ -w "$driver/unbind" ]; then
+	for device in "$driver"/hermes-kms*; do
+		[ -L "$device" ] || continue
+		printf '%s\n' "${device##*/}" > "$driver/unbind"
+	done
+fi
+if command -v udevadm >/dev/null 2>&1; then
+	udevadm settle
+fi
+
+attempt=0
+while [ "$attempt" -lt 5 ]; do
+	if error=$(modprobe -r hermes_kms 2>&1); then
+		printf 'Hermes-KMS unloaded.\n'
+		exit 0
+	fi
+	attempt=$((attempt + 1))
+	[ "$attempt" -lt 5 ] && sleep 1
+done
+
+printf 'Hermes-KMS cards were detached, but the module is still in use: %s\n' "$error" >&2
+[ -z "$openers" ] || printf 'Openers seen before detaching:\n%s\n' "$openers" >&2
+printf 'Close processes still holding Hermes-KMS resources, then run this command again.\n' >&2
+printf 'To restore the cards instead, run hermes-kms-rebind.\n' >&2
+exit 1
