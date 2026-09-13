@@ -6,7 +6,8 @@
 # This is a -git PKGBUILD: it builds from the latest commit on the default
 # branch. Once tagged releases exist, a versioned PKGBUILD can pin a tag.
 
-pkgname=hermes-kms-dkms-git
+pkgname=(hermes-kms-dkms-git hermes-kms-seatd-git)
+pkgbase=hermes-kms-git
 _pkgbase=hermes-kms
 pkgver=0.4.0
 pkgrel=1
@@ -14,13 +15,7 @@ pkgdesc="Hermes-KMS zero-copy virtual display DRM/KMS driver (DKMS)"
 arch=('any')
 url="https://github.com/MrOz59/Hermes-KMS"
 license=('GPL2' 'MIT')
-depends=('dkms' 'seatd')
 makedepends=('git')
-optdepends=('polkit: authorize hermes-kms-setup through pkexec')
-provides=('hermes-kms')
-conflicts=('hermes-kms')
-# Reports a stale /etc/modprobe.d override that masks the shipped default.
-install="${_pkgbase}.install"
 source=("git+https://github.com/MrOz59/Hermes-KMS.git")
 sha256sums=('SKIP')
 
@@ -38,8 +33,13 @@ pkgver() {
     "$(git rev-parse --short HEAD)"
 }
 
-package() {
+package_hermes-kms-dkms-git() {
   cd "$srcdir/Hermes-KMS"
+
+  pkgdesc="Reusable virtual display DRM/KMS driver and public UAPI (DKMS)"
+  depends=('dkms')
+  provides=('hermes-kms')
+  conflicts=('hermes-kms')
 
   local _dest="$pkgdir/usr/src/${_pkgbase}-${pkgver}"
   install -dm755 "$_dest"
@@ -54,5 +54,15 @@ package() {
   # Keep package and image-based installs on the same runtime manifest.
   make DESTDIR="$pkgdir" \
     HERMES_LICENSE_DIR="/usr/share/licenses/$pkgname" \
-    install-configs install-uapi
+    install-core-configs install-uapi
+}
+
+package_hermes-kms-seatd-git() {
+  cd "$srcdir/Hermes-KMS"
+
+  pkgdesc="Optional private seat broker for Hermes-KMS virtual displays"
+  depends=('hermes-kms-dkms-git' 'seatd')
+  optdepends=('polkit: authorize hermes-kms-setup through pkexec')
+  install="${_pkgbase}.install"
+  make DESTDIR="$pkgdir" install-broker-configs
 }

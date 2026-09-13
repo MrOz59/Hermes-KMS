@@ -23,8 +23,11 @@
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-		"usage: %s [--hdr] [--color-depth N] [--width N] [--height N]\n"
-		"          [--refresh N] [--physical-width-mm N] [--physical-height-mm N]\n"
+		"usage: %s [--hdr] [--generic] [--color-depth N] [--min-width N]\n"
+		"          [--min-height N] [--width N] [--height N]\n"
+		"          [--refresh N] [--preferred-width N] [--preferred-height N]\n"
+		"          [--preferred-refresh N] [--physical-width-mm N]\n"
+		"          [--physical-height-mm N]\n"
 		"\n"
 		"Writes the generated EDID to stdout as raw bytes.\n"
 		"Defaults match the module's own defaults with hdr_enable=0.\n",
@@ -56,6 +59,7 @@ int main(int argc, char **argv)
 		.color_depth = 8,
 	};
 	bool hdr = false;
+	u32 serial = 1;
 	int i;
 
 	for (i = 1; i < argc; i++) {
@@ -64,6 +68,12 @@ int main(int argc, char **argv)
 
 		if (!strcmp(arg, "--hdr")) {
 			hdr = true;
+			continue;
+		}
+		if (!strcmp(arg, "--generic")) {
+			memcpy(config.manufacturer, "VRT", 4);
+			memcpy(config.monitor_name, "Virtual KMS", 12);
+			serial = 123456;
 			continue;
 		}
 		if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -79,12 +89,22 @@ int main(int argc, char **argv)
 
 		if (!strcmp(arg, "--color-depth"))
 			config.color_depth = parse_u32(arg, value);
+		else if (!strcmp(arg, "--min-width"))
+			config.min_width = parse_u32(arg, value);
+		else if (!strcmp(arg, "--min-height"))
+			config.min_height = parse_u32(arg, value);
 		else if (!strcmp(arg, "--width"))
 			config.max_width = parse_u32(arg, value);
 		else if (!strcmp(arg, "--height"))
 			config.max_height = parse_u32(arg, value);
 		else if (!strcmp(arg, "--refresh"))
 			config.max_refresh_hz = parse_u32(arg, value);
+		else if (!strcmp(arg, "--preferred-width"))
+			config.preferred_width = parse_u32(arg, value);
+		else if (!strcmp(arg, "--preferred-height"))
+			config.preferred_height = parse_u32(arg, value);
+		else if (!strcmp(arg, "--preferred-refresh"))
+			config.preferred_refresh_hz = parse_u32(arg, value);
 		else if (!strcmp(arg, "--physical-width-mm"))
 			config.physical_width_mm = parse_u32(arg, value);
 		else if (!strcmp(arg, "--physical-height-mm"))
@@ -96,7 +116,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	hermes_kms_build_edid(edid, 1, &config);
+	hermes_kms_build_edid(edid, serial, &config);
 
 	/*
 	 * Mirror the driver: append only when HDR is on, and refuse to emit a

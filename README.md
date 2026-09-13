@@ -56,8 +56,10 @@ or your own tool — can use it by talking the same UAPI, with no fork required:
    `DRM_IOCTL_VERSION` ioctl (or libdrm's `drmGetVersion()`); require the exact
    driver name `hermes-kms` before issuing any Hermes-KMS private ioctl. Private
    DRM command numbers are driver-local and are not safe device probes. Then use
-   `GET_VERSION` / `GET_CAPS`. The current interface is UAPI v11; require
-   `HERMES_KMS_CAP_SESSION_TOKEN` before using the protected capture path.
+   `GET_VERSION` / `GET_CAPS`. The current interface is UAPI v13; require
+   `HERMES_KMS_CAP_SESSION_TOKEN` before using the protected capture path, and
+   `HERMES_KMS_CAP_SESSION_LIFECYCLE` before relying on token rotation or
+   binding revocation.
 2. For UAPI v8 multi-output discovery/control, select an available output on
    the prospective owner fd with `SELECT_OUTPUT`; use one owner fd per
    simultaneous virtual display. An unselected fd is scoped to the first
@@ -83,8 +85,12 @@ or your own tool — can use it by talking the same UAPI, with no fork required:
    acquires the current primary frame and cursor with `ACQUIRE_FRAME` and
    `ACQUIRE_CURSOR`, waits on their sync_file fds, and composites the cursor.
    `GET_STATUS` and `GET_METRICS` use the same binding.
-8. Disable the output or close its owner fd to revoke the capability and end
-   the session.
+8. To cut off access without ending the stream, the owner calls
+   `SESSION_ACCESS(ROTATE_TOKEN)` — which retires the token while every bound
+   consumer keeps running — or `SESSION_ACCESS(REVOKE_BINDINGS)`, which also
+   drops every binding at once; both need `HERMES_KMS_CAP_SESSION_LIFECYCLE`.
+   Disabling the output or closing the owner fd still revokes everything and
+   ends the session.
 
 The capability is deliberately generic: the driver neither knows nor accepts
 an executable name, Steam application ID, UID, TGID, or Hermes-specific
@@ -205,6 +211,23 @@ Clean:
 ```bash
 make clean
 ```
+
+The userspace regression checks run without loading the driver — no kernel
+build, no root and no hardware — and are what CI runs on every push:
+
+```bash
+make check
+```
+
+That covers `check-uapi` (public struct sizes, alignment-sensitive offsets and
+encoded ioctl values, so a newly compiled 32-bit client sees the same ABI as a
+64-bit one), `check-session` (the file-backed CLI credential transport),
+`check-edid` (the generated EDID bytes, both block checksums and the published
+EDID length) and `check-edid-conformity` (the same bytes through a real
+parser). Each can also be run on its own. `check-uapi` and `check-session` need
+libdrm's pkg-config metadata, and both SKIP their 32-bit half when no multilib
+compiler is available; `check-edid-conformity` SKIPs cleanly when `edid-decode`
+(v4l-utils) is not installed.
 
 ### Install
 
@@ -471,6 +494,10 @@ Other validation scripts (run as root, in the virtme-ng VM or on the host):
   256 bytes), the CTA extension's HDR Static Metadata and BT2020 Colorimetry
   blocks, and that `HDR_OUTPUT_METADATA` and `Colorspace` appear on the
   connector only when enabled. Needs no GPU or compositor;
+- `scripts/vm-cursor-gnome-test.sh` — starts a GNOME/Mutter session against a
+  Hermes card, moves the pointer, and records whether Mutter uses the cursor
+  plane and whether the independent cursor DMA-BUF stream reports coherent
+  metadata and visible pixel content;
 - `scripts/vm-pacing-test.sh` — asserts the vblank timer fires at exactly
   60/120/144 Hz with no missed vblanks (uses `hermes-vblank-meter.c`);
 - `scripts/vm-export-stress.sh` — hammers `ACQUIRE_FRAME` from many threads
@@ -530,7 +557,7 @@ name `hermes-kms`. Do not use a private ioctl as the initial probe: private DRM
 command numbers have meaning only after the core driver identity is known and
 can overlap with another driver's commands.
 
-The current interface is UAPI v11. Its ioctls are:
+The current interface is UAPI v13. Its ioctls are:
 
 - `DRM_IOCTL_HERMES_KMS_GET_VERSION`
 - `DRM_IOCTL_HERMES_KMS_GET_IDENTITY`
@@ -559,6 +586,11 @@ were previously reserved. Consumers must check
 `HERMES_KMS_CAP_MULTI_DEVICE` means the module can create multiple independent
 DRM devices with `devices=N`; every device has its own DRM-master ownership
 domain and contains `output_count` selectable outputs.
+`HERMES_KMS_CAP_DYNAMIC_DEVICES` (UAPI v12) means cards can also be created and
+removed at runtime through configfs, so a consumer should enumerate cards rather
+than assume the set fixed at module load.
+`HERMES_KMS_CAP_SESSION_LIFECYCLE` (UAPI v13) means the owner can rotate the
+session token and revoke bindings without ending the session.
 
 UAPI v11 advertises `HERMES_KMS_CAP_SESSION_TOKEN` and protects active output
 state, frame capture, waits and metrics with a generic session capability.
@@ -574,6 +606,26 @@ fields cleared; a preceding `SELECT_OUTPUT` is neither needed nor valid for
 another session's active output. `UNBIND` removes access from that fd. Disabling
 the output or closing the owner fd invalidates every binding for the old
 session.
+
+UAPI v13 adds `HERMES_KMS_CAP_SESSION_LIFECYCLE` and two owner-only operations
+that make that authorization manageable rather than all-or-nothing.
+`SESSION_ACCESS(ROTATE_TOKEN)` replaces the token while the session and every
+existing binding stay intact, so a token that may have leaked stops granting new
+binds without interrupting the consumers already running.
+`SESSION_ACCESS(REVOKE_BINDINGS)` additionally drops every binding at once:
+bound descriptors fail their next protected ioctl with `EACCES`, blocked waits
+are woken to the same error, and ownership, the session ID and the scanout all
+survive. It rotates the token as part of the same operation, because leaving the
+old token usable would let the same holder simply bind again. Both return the
+new token, and an owner blocked in its own `WAIT_FRAME` on another thread sees
+that wait fail with `EACCES` across a revocation and should reissue it. Without
+these, the only way to cut off a consumer was to disable the output, which ends
+the stream.
+
+`GET_STATUS.bound_fd_count` reports how many descriptors are bound to the live
+session, excluding the owner; `GET_METRICS` adds `bind_count`,
+`bind_reject_count`, `unbind_count` and `binding_revoke_count`. A broker that
+handed its capability to one worker and sees two is looking at a leak.
 
 Token transport and policy belong to userspace. The kernel does not key access
 to Hermes, Steam, an executable name, UID or process relationship; any project

@@ -26,6 +26,7 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             build-essential \
             dash \
+            edid-decode \
             gcc-multilib \
             libc6-dev-i386 \
             libdrm-dev \
@@ -36,16 +37,6 @@ jobs:
             libxml2-utils \
             pkg-config \
             udev
-
-      # Optional: make check runs the EDID conformity check against a real
-      # parser when one is present and skips it cleanly when it is not. The
-      # runner's edid-decode will not be the version the baseline was recorded
-      # with, so that check enforces its version-independent tier here (no
-      # checksum errors, and the number of findings HDR adds is unchanged) and
-      # reports the exact finding set as informational.
-      - name: Install edid-decode (optional, for EDID conformity)
-        continue-on-error: true
-        run: sudo apt-get install --no-install-recommends -y edid-decode
 
       - name: Run userspace regression checks
         run: make check
@@ -62,6 +53,7 @@ jobs:
           dash -n scripts/hermes-kms-setup
           xmllint --noout packaging/polkit/io.github.mroz59.hermes-kms.policy
           udevadm verify udev/72-hermes-kms-session-seats.rules
+          udevadm verify udev/72-hermes-kms-render-access.rules
           udevadm verify udev/92-hermes-kms-access.rules
           udevadm verify udev/99-hermes-kms-ignore-seat.rules
           sudo install -Dm0755 scripts/hermes-kms-seatd-instance \
@@ -73,10 +65,21 @@ jobs:
 
       - name: Smoke-test staged runtime installation
         run: |
-          make install-configs install-uapi \
-            DESTDIR="$RUNNER_TEMP/stage" \
+          make install-core-configs install-uapi \
+            DESTDIR="$RUNNER_TEMP/core-stage" \
             SYSTEM_UDEV_RULE_DIR=/usr/lib/udev/rules.d
-          test -f "$RUNNER_TEMP/stage/usr/lib/modprobe.d/hermes-kms.conf"
+          test -f "$RUNNER_TEMP/core-stage/usr/lib/modprobe.d/hermes-kms.conf"
+          test -f "$RUNNER_TEMP/core-stage/usr/lib/udev/rules.d/72-hermes-kms-render-access.rules"
+          test ! -e "$RUNNER_TEMP/core-stage/usr/lib/hermes-kms/hermes-kms-setup"
+          make install-broker-configs \
+            DESTDIR="$RUNNER_TEMP/broker-stage" \
+            SYSTEM_UDEV_RULE_DIR=/usr/lib/udev/rules.d
+          test ! -e "$RUNNER_TEMP/broker-stage/usr/lib/modprobe.d/hermes-kms.conf"
+          test -x "$RUNNER_TEMP/broker-stage/usr/lib/hermes-kms/hermes-kms-setup"
+          test -f "$RUNNER_TEMP/broker-stage/usr/lib/systemd/system/hermes-kms-seatd@.service"
+          mkdir -p "$RUNNER_TEMP/stage/usr"
+          cp -a "$RUNNER_TEMP/core-stage/usr/." "$RUNNER_TEMP/stage/usr/"
+          cp -a "$RUNNER_TEMP/broker-stage/usr/." "$RUNNER_TEMP/stage/usr/"
           test -x "$RUNNER_TEMP/stage/usr/lib/hermes-kms/hermes-kms-setup"
           test -f "$RUNNER_TEMP/stage/usr/lib/systemd/system/hermes-kms-seatd@.service"
           test -f "$RUNNER_TEMP/stage/usr/include/drm/hermes_kms_drm.h"
@@ -147,3 +150,36 @@ jobs:
         run: |
           make clean KDIR="$KDIR" KERNELRELEASE="$KERNELRELEASE"
           test ! -e kernel/hermes-kms/hermes_kms.ko
+
+  kernel-module-ubuntu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ubuntu LTS kernel headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential linux-headers-generic
+      - name: Build against Ubuntu LTS kernel
+        run: |
+          kdir="$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*-generic' | sort -V | tail -n 1)"
+          test -n "$kdir"
+          kver="$(make -s -C "$kdir" kernelrelease)"
+          make -j2 KDIR="$kdir" KERNELRELEASE="$kver" modules
+          test -f kernel/hermes-kms/hermes_kms.ko
+
+  kernel-module-fedora:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    container: fedora:latest
+    steps:
+      - name: Install Fedora kernel build dependencies
+        run: dnf install -y gcc make kernel-devel elfutils-libelf-devel openssl-devel git
+      - uses: actions/checkout@v4
+      - name: Build against Fedora kernel
+        run: |
+          kdir="$(find /usr/src/kernels -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          test -n "$kdir"
+          kver="$(make -s -C "$kdir" kernelrelease)"
+          make -j2 KDIR="$kdir" KERNELRELEASE="$kver" modules
+          test -f kernel/hermes-kms/hermes_kms.ko

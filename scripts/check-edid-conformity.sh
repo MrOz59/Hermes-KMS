@@ -6,11 +6,8 @@
 # actually asked for, because the test and the generator share an author. So run
 # a real parser over the same bytes and pin its verdict instead.
 #
-# The point is not a clean bill of health -- the EDID does not currently pass
-# edid-decode --check, and docs/driver-design.md records why. The point is that
-# the set of findings is a tracked artifact: a change that quietly adds a new
-# conformity failure shows up here as a diff instead of surviving into a release
-# and being discovered by someone else's parser.
+# Every variant must pass edid-decode --check. Its remaining warnings are
+# recorded so a changed parser verdict is visible during review.
 #
 # Needs edid-decode (v4l-utils). SKIPs cleanly when it is absent, so this can sit
 # in "make check" on machines and CI images that do not have it.
@@ -85,8 +82,12 @@ normalize()
 variants=(
 	"base-defaults:"
 	"base-ten-bit:--color-depth 10"
+	"generic:--generic"
+	"profile-720p:--width 1280 --height 720 --refresh 60 --preferred-width 1280 --preferred-height 720 --preferred-refresh 60"
 	"hdr-eight-bit:--hdr"
 	"hdr-ten-bit:--hdr --color-depth 10"
+	"generic-hdr:--generic --hdr"
+	"profile-720p-hdr:--width 1280 --height 720 --refresh 60 --preferred-width 1280 --preferred-height 720 --preferred-refresh 60 --hdr"
 )
 
 generated="$TMP/generated"
@@ -113,10 +114,8 @@ for variant in "${variants[@]}"; do
 	printf '### %s (%s bytes)\n' "$name" "$(stat -c%s "$TMP/$name.bin")" \
 		>> "$generated"
 
-	# edid-decode exits non-zero when conformity fails, which is the expected
-	# verdict here -- the findings are the output we want, not an error. So
-	# capture the report and judge it below rather than letting its exit
-	# status end the run.
+	# Capture the complete report so failures can be explained with the
+	# parser's findings rather than only its exit status.
 	edid-decode --check < "$TMP/$name.bin" > "$TMP/$name.report" 2>&1 || true
 	normalize < "$TMP/$name.report" >> "$generated"
 
@@ -125,6 +124,12 @@ for variant in "${variants[@]}"; do
 	# reads this one precisely because it does not depend on which rules a
 	# given edid-decode version happens to implement.
 	edid-decode < "$TMP/$name.bin" > "$TMP/$name.decode" 2>&1 || true
+	if ! grep -q '^EDID conformity: PASS' "$TMP/$name.report" ||
+	   findings_for "$name" | grep -q '^failure|'; then
+		printf 'FAIL: %s synthetic EDID is non-conformant\n' "$name" >&2
+		findings_for "$name" >&2
+		exit 1
+	fi
 done
 
 if [ "$UPDATE" -eq 1 ]; then

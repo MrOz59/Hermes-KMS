@@ -25,6 +25,7 @@ ARG BASE_TAG=latest
 # stage. COPY is deliberately allow-listed; .containerignore is an additional
 # guard against sending repository metadata or local key material to a builder.
 FROM ${BASE_IMAGE}:${BASE_TAG} AS hermes-build
+ARG WITH_SEAT_BROKER=1
 
 WORKDIR /src/hermes-kms
 COPY Makefile ./Makefile
@@ -35,6 +36,7 @@ COPY packaging/modules-load.d ./packaging/modules-load.d
 COPY packaging/polkit ./packaging/polkit
 COPY packaging/systemd ./packaging/systemd
 COPY udev/72-hermes-kms-session-seats.rules ./udev/72-hermes-kms-session-seats.rules
+COPY udev/72-hermes-kms-render-access.rules ./udev/72-hermes-kms-render-access.rules
 COPY udev/92-hermes-kms-access.rules ./udev/92-hermes-kms-access.rules
 COPY scripts/hermes-kms-seatd-instance scripts/hermes-kms-setup ./scripts/
 
@@ -65,21 +67,27 @@ RUN --mount=type=secret,id=module_sign_key,required=false \
     else \
         echo 'WARNING: hermes_kms.ko is unsigned; Secure Boot must be disabled' >&2; \
     fi; \
-    make modules-install install-configs \
+    make modules-install install-core-configs \
         KERNELRELEASE="${kver}" \
         DESTDIR=/out; \
+    if [ "${WITH_SEAT_BROKER}" = 1 ]; then \
+        make install-broker-configs DESTDIR=/out; \
+    fi; \
     modinfo kernel/hermes-kms/hermes_kms.ko >/dev/null
 
 # Start again from the clean base. No compiler, source checkout, .git directory
 # or private signing material can be inherited from hermes-build.
 FROM ${BASE_IMAGE}:${BASE_TAG}
+ARG WITH_SEAT_BROKER=1
 
 # The base normally includes polkit; install only genuinely missing runtime
 # packages so rpm-ostree does not reject an already-present package request.
 RUN set -eux; \
     missing=; \
-    rpm -q seatd >/dev/null 2>&1 || missing="${missing} seatd"; \
-    rpm -q polkit >/dev/null 2>&1 || missing="${missing} polkit"; \
+    if [ "${WITH_SEAT_BROKER}" = 1 ]; then \
+        rpm -q seatd >/dev/null 2>&1 || missing="${missing} seatd"; \
+        rpm -q polkit >/dev/null 2>&1 || missing="${missing} polkit"; \
+    fi; \
     if [ -n "${missing}" ]; then \
         rpm-ostree install -y ${missing}; \
     fi
@@ -94,7 +102,9 @@ RUN set -eux; \
     test -f "/usr/lib/modules/${kver}/extra/hermes-kms/hermes_kms.ko"; \
     depmod -a "${kver}"; \
     modinfo "/usr/lib/modules/${kver}/extra/hermes-kms/hermes_kms.ko" >/dev/null; \
-    test -x /usr/lib/hermes-kms/hermes-kms-setup; \
-    test -f /usr/share/polkit-1/actions/io.github.mroz59.hermes-kms.policy; \
-    test -x /usr/bin/seatd; \
+    if [ "${WITH_SEAT_BROKER}" = 1 ]; then \
+        test -x /usr/lib/hermes-kms/hermes-kms-setup; \
+        test -f /usr/share/polkit-1/actions/io.github.mroz59.hermes-kms.policy; \
+        test -x /usr/bin/seatd; \
+    fi; \
     ostree container commit

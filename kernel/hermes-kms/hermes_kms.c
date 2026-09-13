@@ -8,6 +8,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/bitops.h>
 #include <linux/build_bug.h>
 #include <linux/cleanup.h>
 #include <linux/compat.h>
@@ -186,7 +187,7 @@ MODULE_PARM_DESC(initial_refresh_hz, "Initial virtual output refresh rate");
 module_param(outputs, uint, 0444);
 MODULE_PARM_DESC(outputs, "Number of virtual outputs on the DRM device (1-8, default 1)");
 module_param(devices, uint, 0444);
-MODULE_PARM_DESC(devices, "Number of independent virtual DRM devices (1-8, default 1)");
+MODULE_PARM_DESC(devices, "Number of initial virtual DRM devices (0-8, default 1); 0 uses configfs only");
 module_param(session_devices, uint, 0444);
 MODULE_PARM_DESC(session_devices, "Number of private session devices (0-8). When non-zero, also creates one seat0 host device");
 
@@ -232,13 +233,25 @@ MODULE_PARM_DESC(physical_width_mm, "Reported physical panel width in mm (0 leav
 module_param(physical_height_mm, uint, 0444);
 MODULE_PARM_DESC(physical_height_mm, "Reported physical panel height in mm (0 leaves it undefined)");
 module_param(color_depth, uint, 0444);
-MODULE_PARM_DESC(color_depth, "Bits per primary colour channel advertised in the EDID: 6, 8, 10, 12, 14 or 16 (default 8)");
+MODULE_PARM_DESC(color_depth, "Bits per primary colour channel advertised in the EDID: 8 or 10 (default 8)");
 
 module_param_array(scanout_modifiers, ullong, &scanout_modifier_count, 0444);
 MODULE_PARM_DESC(scanout_modifiers,
 		 "Extra DRM format modifiers to advertise for scanout, beyond linear (up to 15). Any modifier is accepted regardless; this list is what IN_FORMATS-driven compositors can choose from");
 
 struct hermes_kms_device;
+
+struct hermes_kms_display_config {
+	u32 min_width, min_height, max_width, max_height, max_refresh_hz;
+	u32 initial_width, initial_height, initial_refresh_hz;
+	u32 physical_width_mm, physical_height_mm, color_depth;
+	bool initial_enabled, non_desktop, hdr_enable;
+	u32 serial_base;
+	char manufacturer[4];
+	char monitor_name[14];
+	char output_prefix[21];
+	u64 modifiers[HERMES_KMS_PLANE_MODIFIER_SLOTS];
+};
 
 /*
  * Per-device topology, handed to probe as platform data. The static devices
@@ -249,6 +262,7 @@ struct hermes_kms_device_config {
 	unsigned int outputs;
 	unsigned int role;
 	unsigned int session_index;
+	struct hermes_kms_display_config display;
 	/*
 	 * uid that should own this card's render node, or 0 for none. The
 	 * kernel neither enforces nor interprets it: it is published as a sysfs
@@ -267,6 +281,8 @@ struct hermes_kms_device_config {
  */
 static DEFINE_IDA(hermes_kms_device_ida);
 static DEFINE_IDA(hermes_kms_output_ida);
+static DEFINE_MUTEX(hermes_kms_session_lock);
+static unsigned long hermes_kms_session_indices;
 static atomic_t hermes_kms_live_devices = ATOMIC_INIT(0);
 
 static unsigned int hermes_kms_live_device_count(void)
@@ -431,6 +447,8 @@ struct hermes_kms_output {
 
 struct hermes_kms_device {
 	struct drm_device drm;
+	struct hermes_kms_display_config display;
+	u64 plane_modifiers[HERMES_KMS_PLANE_MODIFIER_SLOTS];
 	unsigned int device_index;
 	unsigned int device_role;
 	unsigned int session_index;
@@ -702,15 +720,22 @@ static void __init hermes_kms_report_edid_range_ceiling(void)
 static bool hermes_kms_build_output_edid(struct hermes_kms_output *output,
 					 u32 serial)
 {
-	const struct hermes_kms_edid_config config = {
-		.max_width = max_width,
-		.max_height = max_height,
-		.max_refresh_hz = max_refresh_hz,
-		.physical_width_mm = physical_width_mm,
-		.physical_height_mm = physical_height_mm,
-		.color_depth = color_depth,
+	const struct hermes_kms_display_config *display = &output->hdev->display;
+	struct hermes_kms_edid_config config = {
+		.min_width = display->min_width,
+		.min_height = display->min_height,
+		.max_width = display->max_width,
+		.max_height = display->max_height,
+		.max_refresh_hz = display->max_refresh_hz,
+		.preferred_width = display->initial_width,
+		.preferred_height = display->initial_height,
+		.preferred_refresh_hz = display->initial_refresh_hz,
+		.physical_width_mm = display->physical_width_mm,
+		.physical_height_mm = display->physical_height_mm,
+		.color_depth = display->color_depth,
+		.manufacturer = { display->manufacturer[0], display->manufacturer[1],
+				  display->manufacturer[2], 0 },
 	};
-
 	bool representable;
 
 	/*
@@ -720,6 +745,8 @@ static bool hermes_kms_build_output_edid(struct hermes_kms_output *output,
 	 */
 	static_assert(sizeof(output->edid) == 2 * HERMES_KMS_EDID_SIZE);
 
+	strscpy(config.monitor_name, display->monitor_name,
+		sizeof(config.monitor_name));
 	representable = hermes_kms_build_edid(output->edid, serial, &config);
 
 	/*
@@ -736,7 +763,7 @@ static bool hermes_kms_build_output_edid(struct hermes_kms_output *output,
 	 * extension-count byte at 0, so hermes_kms_edid_size() keeps reporting a
 	 * single block and the output degrades to advertising SDR.
 	 */
-	if (hdr_enable && !hermes_kms_append_hdr_extension(output->edid))
+	if (display->hdr_enable && !hermes_kms_append_hdr_extension(output->edid))
 		drm_warn(&output->hdev->drm,
 			 "%s: HDR extension refused an invalid base EDID; advertising SDR only\n",
 			 output->output_name);
@@ -775,8 +802,8 @@ static void hermes_kms_reprobe_modes(struct hermes_kms_output *output)
 
 	mutex_lock(&drm->mode_config.mutex);
 	drm_helper_probe_single_connector_modes(&output->connector,
-						max_width,
-						max_height);
+						output->hdev->display.max_width,
+						output->hdev->display.max_height);
 	mutex_unlock(&drm->mode_config.mutex);
 }
 
@@ -1217,7 +1244,7 @@ static int hermes_kms_connector_get_modes(struct drm_connector *connector)
 	struct hermes_kms_output *output =
 		container_of(connector, struct hermes_kms_output, connector);
 	const struct drm_edid *drm_edid;
-	struct drm_display_mode *mode;
+	struct drm_display_mode *mode, *next;
 	u32 width;
 	u32 height;
 	u32 refresh_hz;
@@ -1294,8 +1321,28 @@ static int hermes_kms_connector_get_modes(struct drm_connector *connector)
 	 * resolution without a SET_OUTPUT round-trip, and so the connector is
 	 * never left with zero modes if CVT synthesis fails.
 	 */
-	count += drm_add_modes_noedid(connector, max_width,
-				      max_height);
+	count += drm_add_modes_noedid(connector,
+				      output->hdev->display.max_width,
+				      output->hdev->display.max_height);
+
+	/* EDID and the standard ladder may include modes outside this card's
+	 * configured minimum or refresh ceiling. Keep the userspace mode list in
+	 * the same envelope that atomic_check and SET_OUTPUT enforce.
+	 */
+	list_for_each_entry_safe(mode, next, &connector->probed_modes, head) {
+		const struct hermes_kms_display_config *display =
+			&output->hdev->display;
+
+		if (mode->hdisplay >= display->min_width &&
+		    mode->vdisplay >= display->min_height &&
+		    mode->hdisplay <= display->max_width &&
+		    mode->vdisplay <= display->max_height &&
+		    drm_mode_vrefresh(mode) <= display->max_refresh_hz)
+			continue;
+		list_del(&mode->head);
+		drm_mode_destroy(connector->dev, mode);
+		count--;
+	}
 
 	return count;
 }
@@ -1364,7 +1411,8 @@ static const struct drm_crtc_funcs hermes_kms_crtc_funcs = {
 };
 
 static enum drm_mode_status
-hermes_kms_plane_mode_valid(const struct drm_display_mode *mode);
+hermes_kms_plane_mode_valid(const struct hermes_kms_display_config *display,
+			    const struct drm_display_mode *mode);
 
 static int hermes_kms_crtc_atomic_check(struct drm_crtc *crtc,
 					struct drm_atomic_commit *state)
@@ -1383,7 +1431,9 @@ static int hermes_kms_crtc_atomic_check(struct drm_crtc *crtc,
 	 * single plane is the primary, so an enabled+active CRTC must drive a
 	 * framebuffer; refuse an active CRTC with nothing to scan out.
 	 */
-	if (hermes_kms_plane_mode_valid(&crtc_state->mode) != MODE_OK) {
+	if (hermes_kms_plane_mode_valid(
+			&to_hermes_kms(crtc->dev)->display,
+			&crtc_state->mode) != MODE_OK) {
 		drm_dbg_kms(crtc->dev,
 			    "atomic_check: rejecting mode %ux%u@%d (out of range)\n",
 			    crtc_state->mode.hdisplay,
@@ -1514,17 +1564,18 @@ static const struct drm_crtc_helper_funcs hermes_kms_crtc_helper_funcs = {
 };
 
 static enum drm_mode_status
-hermes_kms_plane_mode_valid(const struct drm_display_mode *mode)
+hermes_kms_plane_mode_valid(const struct hermes_kms_display_config *display,
+			    const struct drm_display_mode *mode)
 {
-	if (mode->hdisplay < min_width ||
-	    mode->vdisplay < min_height)
+	if (mode->hdisplay < display->min_width ||
+	    mode->vdisplay < display->min_height)
 		return MODE_BAD;
 
-	if (mode->hdisplay > max_width ||
-	    mode->vdisplay > max_height)
+	if (mode->hdisplay > display->max_width ||
+	    mode->vdisplay > display->max_height)
 		return MODE_VIRTUAL_X;
 
-	if (drm_mode_vrefresh(mode) > max_refresh_hz)
+	if (drm_mode_vrefresh(mode) > display->max_refresh_hz)
 		return MODE_CLOCK_HIGH;
 
 	return MODE_OK;
@@ -1552,7 +1603,9 @@ static int hermes_kms_plane_atomic_check(struct drm_plane *plane,
 
 	if (new_state->fb) {
 		enum drm_mode_status status =
-			hermes_kms_plane_mode_valid(&crtc_state->mode);
+			hermes_kms_plane_mode_valid(
+				&to_hermes_kms(plane->dev)->display,
+				&crtc_state->mode);
 
 		if (status != MODE_OK)
 			return -EINVAL;
@@ -1758,13 +1811,13 @@ static int hermes_kms_ioctl_get_caps(struct drm_device *drm, void *data,
 		caps->flags |= HERMES_KMS_CAP_SESSION_DEVICE_POOL;
 	if (hermes_kms_dynamic_devices_available())
 		caps->flags |= HERMES_KMS_CAP_DYNAMIC_DEVICES;
-	caps->min_width = min_width;
-	caps->min_height = min_height;
-	caps->max_width = max_width;
-	caps->max_height = max_height;
-	caps->preferred_width = HERMES_KMS_DEFAULT_WIDTH;
-	caps->preferred_height = HERMES_KMS_DEFAULT_HEIGHT;
-	caps->max_refresh_hz = max_refresh_hz;
+	caps->min_width = hdev->display.min_width;
+	caps->min_height = hdev->display.min_height;
+	caps->max_width = hdev->display.max_width;
+	caps->max_height = hdev->display.max_height;
+	caps->preferred_width = hdev->display.initial_width;
+	caps->preferred_height = hdev->display.initial_height;
+	caps->max_refresh_hz = hdev->display.max_refresh_hz;
 	caps->output_count = hdev->output_count;
 
 	return 0;
@@ -2952,37 +3005,44 @@ out_unlock_context:
 	return ret;
 }
 
-static bool hermes_kms_valid_requested_mode(u32 width, u32 height,
-					    u32 refresh_hz)
+static bool hermes_kms_valid_requested_mode(
+	const struct hermes_kms_display_config *display,
+	u32 width, u32 height, u32 refresh_hz)
 {
-	return width >= min_width &&
-	       height >= min_height &&
-	       width <= max_width &&
-	       height <= max_height &&
+	return width >= display->min_width &&
+	       height >= display->min_height &&
+	       width <= display->max_width &&
+	       height <= display->max_height &&
 	       refresh_hz > 0 &&
-	       refresh_hz <= max_refresh_hz;
+	       refresh_hz <= display->max_refresh_hz;
 }
 
 static void hermes_kms_init_output_state(struct drm_device *drm,
 					 struct hermes_kms_output *output)
 {
-	u32 width = initial_width;
-	u32 height = initial_height;
-	u32 refresh_hz = initial_refresh_hz;
+	const struct hermes_kms_display_config *display = &output->hdev->display;
+	u32 width = display->initial_width;
+	u32 height = display->initial_height;
+	u32 refresh_hz = display->initial_refresh_hz;
 
-	if (!hermes_kms_valid_requested_mode(width, height, refresh_hz)) {
+	if (!hermes_kms_valid_requested_mode(display, width, height, refresh_hz)) {
+		u32 fallback_width = clamp_t(u32, HERMES_KMS_DEFAULT_WIDTH,
+					      display->min_width, display->max_width);
+		u32 fallback_height = clamp_t(u32, HERMES_KMS_DEFAULT_HEIGHT,
+					       display->min_height, display->max_height);
+		u32 fallback_refresh = min_t(u32, HERMES_KMS_DEFAULT_REFRESH_HZ,
+						     display->max_refresh_hz);
+
 		drm_warn(drm,
 			 "invalid initial mode %ux%u@%u, falling back to %ux%u@%u\n",
 			 width, height, refresh_hz,
-			 HERMES_KMS_DEFAULT_WIDTH,
-			 HERMES_KMS_DEFAULT_HEIGHT,
-			 HERMES_KMS_DEFAULT_REFRESH_HZ);
-		width = HERMES_KMS_DEFAULT_WIDTH;
-		height = HERMES_KMS_DEFAULT_HEIGHT;
-		refresh_hz = HERMES_KMS_DEFAULT_REFRESH_HZ;
+			 fallback_width, fallback_height, fallback_refresh);
+		width = fallback_width;
+		height = fallback_height;
+		refresh_hz = fallback_refresh;
 	}
 
-	output->output_enabled = initial_enabled;
+	output->output_enabled = display->initial_enabled;
 	output->requested_width = width;
 	output->requested_height = height;
 	output->requested_refresh_hz = refresh_hz;
@@ -3087,7 +3147,8 @@ static int hermes_kms_ioctl_set_output(struct drm_device *drm, void *data,
 	if (!refresh_hz)
 		refresh_hz = HERMES_KMS_DEFAULT_REFRESH_HZ;
 
-	if (!hermes_kms_valid_requested_mode(width, height, refresh_hz)) {
+	if (!hermes_kms_valid_requested_mode(&hdev->display, width, height,
+					     refresh_hz)) {
 		mutex_unlock(&context->lock);
 		return -EINVAL;
 	}
@@ -3911,7 +3972,7 @@ static int hermes_kms_output_modeset_init(struct hermes_kms_output *output)
 	 * BT2020. Gated by the same hdr_enable flag so all three mechanisms are
 	 * always enabled together.
 	 */
-	if (hdr_enable) {
+	if (output->hdev->display.hdr_enable) {
 		/*
 		 * Deliberately called for its effect only. This helper returned
 		 * int through 7.1 and returns void from 7.2 on, so assigning the
@@ -3954,11 +4015,12 @@ static int hermes_kms_output_modeset_init(struct hermes_kms_output *output)
 	 * separately via DRM_IOCTL_HERMES_KMS_GET_IDENTITY (output_name).
 	 */
 
-	output->connector.display_info.non_desktop = non_desktop;
+	output->connector.display_info.non_desktop =
+		output->hdev->display.non_desktop;
 	if (drm->mode_config.non_desktop_property)
 		drm_object_attach_property(&output->connector.base,
 					   drm->mode_config.non_desktop_property,
-					   non_desktop ? 1 : 0);
+					   output->hdev->display.non_desktop ? 1 : 0);
 	output->connector.polled = DRM_CONNECTOR_POLL_CONNECT |
 				   DRM_CONNECTOR_POLL_DISCONNECT;
 
@@ -3967,7 +4029,7 @@ static int hermes_kms_output_modeset_init(struct hermes_kms_output *output)
 				       &hermes_kms_plane_funcs,
 				       hermes_kms_formats,
 				       ARRAY_SIZE(hermes_kms_formats),
-				       hermes_kms_plane_modifiers,
+				       output->hdev->plane_modifiers,
 				       DRM_PLANE_TYPE_PRIMARY, NULL);
 	if (ret)
 		return ret;
@@ -4041,8 +4103,8 @@ static int hermes_kms_modeset_init(struct hermes_kms_device *hdev)
 	 */
 	drm->mode_config.min_width = HERMES_KMS_MIN_FRAMEBUFFER_WIDTH;
 	drm->mode_config.min_height = HERMES_KMS_MIN_FRAMEBUFFER_HEIGHT;
-	drm->mode_config.max_width = max_width;
-	drm->mode_config.max_height = max_height;
+	drm->mode_config.max_width = hdev->display.max_width;
+	drm->mode_config.max_height = hdev->display.max_height;
 	drm->mode_config.preferred_depth = 24;
 	/* Standard 256x256 cursor envelope so compositors size HW cursors. */
 	drm->mode_config.cursor_width = 256;
@@ -4125,6 +4187,40 @@ static void hermes_kms_free_output_identities(struct hermes_kms_device *hdev)
 	}
 }
 
+static void hermes_kms_default_display_config(
+	struct hermes_kms_display_config *display, bool dynamic)
+{
+	*display = (struct hermes_kms_display_config) {
+		.min_width = min_width,
+		.min_height = min_height,
+		.max_width = max_width,
+		.max_height = max_height,
+		.max_refresh_hz = max_refresh_hz,
+		.initial_width = initial_width,
+		.initial_height = initial_height,
+		.initial_refresh_hz = initial_refresh_hz,
+		.physical_width_mm = physical_width_mm,
+		.physical_height_mm = physical_height_mm,
+		.color_depth = color_depth,
+		.initial_enabled = initial_enabled,
+		.non_desktop = non_desktop,
+		.hdr_enable = hdr_enable,
+	};
+	memcpy(display->modifiers, hermes_kms_plane_modifiers,
+	       sizeof(display->modifiers));
+	if (dynamic) {
+		strscpy(display->manufacturer, "VRT",
+			sizeof(display->manufacturer));
+		strscpy(display->monitor_name, "Virtual KMS",
+			sizeof(display->monitor_name));
+		strscpy(display->output_prefix, "VIRTUAL-",
+			sizeof(display->output_prefix));
+	} else {
+		strscpy(display->output_prefix, HERMES_KMS_OUTPUT_NAME_PREFIX,
+			sizeof(display->output_prefix));
+	}
+}
+
 static int hermes_kms_probe(struct platform_device *pdev)
 {
 	struct hermes_kms_device *hdev;
@@ -4144,6 +4240,7 @@ static int hermes_kms_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, hdev);
 	hdev->device_index = pdev->id >= 0 ? pdev->id : 0;
 	if (config) {
+		hdev->display = config->display;
 		/* A configfs-created card states its own role and topology. */
 		output_count = config->outputs;
 		hdev->device_role = config->role;
@@ -4151,20 +4248,25 @@ static int hermes_kms_probe(struct platform_device *pdev)
 		hdev->session_device_count = session_devices;
 		hdev->access_uid = config->access_uid;
 	} else if (session_devices) {
+		hermes_kms_default_display_config(&hdev->display, false);
 		hdev->session_device_count = session_devices;
 		hdev->device_role = hdev->device_index == 0 ?
 				      HERMES_KMS_DEVICE_ROLE_HOST :
 				      HERMES_KMS_DEVICE_ROLE_SESSION;
 		hdev->session_index = hdev->device_index;
 	} else if (registered_device_count > 1) {
+		hermes_kms_default_display_config(&hdev->display, false);
 		/* Preserve the UAPI v9 devices=N all-private layout. */
 		hdev->device_role = HERMES_KMS_DEVICE_ROLE_SESSION;
 		hdev->session_index = hdev->device_index + 1;
 		hdev->session_device_count = registered_device_count;
 	} else {
+		hermes_kms_default_display_config(&hdev->display, false);
 		hdev->device_role = HERMES_KMS_DEVICE_ROLE_GENERAL;
 		hdev->session_index = 0;
 	}
+	memcpy(hdev->plane_modifiers, hdev->display.modifiers,
+	       sizeof(hdev->plane_modifiers));
 	if (output_count < 1 || output_count > HERMES_KMS_MAX_OUTPUTS) {
 		output_count = clamp(output_count, 1u,
 				     (unsigned int)HERMES_KMS_MAX_OUTPUTS);
@@ -4188,16 +4290,30 @@ static int hermes_kms_probe(struct platform_device *pdev)
 		 * from a module-wide allocator rather than computing them from
 		 * this card's index.
 		 */
-		identity = ida_alloc_min(&hermes_kms_output_ida, 1, GFP_KERNEL);
+		if (hdev->display.serial_base)
+			identity = ida_alloc_range(&hermes_kms_output_ida,
+				hdev->display.serial_base + i,
+				hdev->display.serial_base + i, GFP_KERNEL);
+		else
+			identity = ida_alloc_min(&hermes_kms_output_ida, 1,
+						 GFP_KERNEL);
 		if (identity < 0) {
+			if (hdev->display.serial_base)
+				drm_err(drm, "serial_base=%u conflicts with a live output at offset %u\n",
+					hdev->display.serial_base, i);
 			ret = identity;
 			goto err_free_identities;
 		}
 		output->identity = identity;
 		snprintf(output->output_name, sizeof(output->output_name),
-			 HERMES_KMS_OUTPUT_NAME_PREFIX "%d", identity);
+			 "%s%d", hdev->display.output_prefix, identity);
 
-		hermes_kms_build_output_edid(output, (u32)identity);
+		if (!hermes_kms_build_output_edid(output, (u32)identity) &&
+		    config && (hdev->display.max_width != max_width ||
+			       hdev->display.max_height != max_height ||
+			       hdev->display.max_refresh_hz != max_refresh_hz))
+			drm_warn(drm, "%s: configured mode envelope exceeds the EDID range descriptor; some modes may be filtered by userspace\n",
+				 output->output_name);
 
 		mutex_init(&output->state_lock);
 		mutex_init(&output->export_lock);
@@ -4248,9 +4364,9 @@ static int hermes_kms_probe(struct platform_device *pdev)
 		 hdev->session_index,
 		 hdev->session_device_count,
 		 hdev->output_count,
-		 initial_enabled,
+		 hdev->display.initial_enabled,
 		 hotplug_events,
-		 non_desktop,
+		 hdev->display.non_desktop,
 		 hdev->outputs[0].requested_width,
 		 hdev->outputs[0].requested_height,
 		 hdev->outputs[0].requested_refresh_hz);
@@ -4399,6 +4515,7 @@ struct hermes_kms_config_device {
 	unsigned int role;
 	unsigned int session_index;
 	unsigned int access_uid;
+	struct hermes_kms_display_config display;
 	bool enabled;
 };
 
@@ -4445,15 +4562,30 @@ static int hermes_kms_config_create(struct hermes_kms_config_device *cfg)
 		.role = cfg->role,
 		.session_index = cfg->session_index,
 		.access_uid = cfg->access_uid,
+		.display = cfg->display,
 	};
 	struct platform_device *pdev;
 	int id;
 	int ret;
+	bool session_reserved = false;
+
+	if (cfg->role == HERMES_KMS_DEVICE_ROLE_SESSION) {
+		mutex_lock(&hermes_kms_session_lock);
+		if (test_bit(cfg->session_index, &hermes_kms_session_indices)) {
+			mutex_unlock(&hermes_kms_session_lock);
+			return -EBUSY;
+		}
+		set_bit(cfg->session_index, &hermes_kms_session_indices);
+		mutex_unlock(&hermes_kms_session_lock);
+		session_reserved = true;
+	}
 
 	id = ida_alloc_max(&hermes_kms_device_ida, HERMES_KMS_MAX_DEVICE_ID,
 			   GFP_KERNEL);
-	if (id < 0)
-		return id;
+	if (id < 0) {
+		ret = id;
+		goto err_release_session;
+	}
 
 	pdev = platform_device_alloc(HERMES_KMS_DRIVER_NAME, id);
 	if (!pdev) {
@@ -4488,6 +4620,13 @@ err_put_device:
 	platform_device_put(pdev);
 err_free_id:
 	ida_free(&hermes_kms_device_ida, id);
+
+err_release_session:
+	if (session_reserved) {
+		mutex_lock(&hermes_kms_session_lock);
+		clear_bit(cfg->session_index, &hermes_kms_session_indices);
+		mutex_unlock(&hermes_kms_session_lock);
+	}
 	return ret;
 }
 
@@ -4499,6 +4638,11 @@ static void hermes_kms_config_destroy(struct hermes_kms_config_device *cfg)
 
 	platform_device_unregister(cfg->pdev);
 	ida_free(&hermes_kms_device_ida, cfg->device_id);
+	if (cfg->role == HERMES_KMS_DEVICE_ROLE_SESSION) {
+		mutex_lock(&hermes_kms_session_lock);
+		clear_bit(cfg->session_index, &hermes_kms_session_indices);
+		mutex_unlock(&hermes_kms_session_lock);
+	}
 	cfg->pdev = NULL;
 	cfg->device_id = -1;
 }
@@ -4654,6 +4798,9 @@ static ssize_t hermes_kms_config_access_uid_store(struct config_item *item,
 	return ret ? ret : (ssize_t)count;
 }
 
+static bool hermes_kms_config_display_valid(
+	const struct hermes_kms_config_device *cfg);
+
 static ssize_t hermes_kms_config_enabled_show(struct config_item *item,
 					      char *page)
 {
@@ -4685,6 +4832,8 @@ static ssize_t hermes_kms_config_enabled_store(struct config_item *item,
 			 * udev maps hermes-kms-<session_index> to a seat and a
 			 * private broker; index 0 would land on none of them.
 			 */
+			ret = -EINVAL;
+		} else if (!hermes_kms_config_display_valid(cfg)) {
 			ret = -EINVAL;
 		} else {
 			ret = hermes_kms_config_create(cfg);
@@ -4744,10 +4893,288 @@ static ssize_t hermes_kms_config_device_index_show(struct config_item *item,
 	return sysfs_emit(page, "%d\n", value);
 }
 
+#define HERMES_KMS_CONFIG_U32_ATTR(name, low, high)                         \
+static ssize_t hermes_kms_config_##name##_show(struct config_item *item,    \
+					      char *page)                      \
+{                                                                          \
+	struct hermes_kms_config_device *cfg =                               \
+		to_hermes_kms_config_device(item);                             \
+	u32 value;                                                             \
+	mutex_lock(&cfg->lock);                                               \
+	value = cfg->display.name;                                            \
+	mutex_unlock(&cfg->lock);                                             \
+	return sysfs_emit(page, "%u\n", value);                              \
+}                                                                          \
+static ssize_t hermes_kms_config_##name##_store(struct config_item *item,   \
+					       const char *page, size_t count)   \
+{                                                                          \
+	struct hermes_kms_config_device *cfg =                               \
+		to_hermes_kms_config_device(item);                             \
+	unsigned int value;                                                   \
+	int ret = kstrtouint(page, 0, &value);                                 \
+	if (ret)                                                               \
+		return ret;                                                     \
+	if (value < (low) || value > (high))                                  \
+		return -EINVAL;                                                \
+	mutex_lock(&cfg->lock);                                               \
+	if (cfg->enabled)                                                      \
+		ret = -EBUSY;                                                  \
+	else                                                                   \
+		cfg->display.name = value;                                     \
+	mutex_unlock(&cfg->lock);                                             \
+	return ret ? ret : (ssize_t)count;                                    \
+}
+
+HERMES_KMS_CONFIG_U32_ATTR(min_width, 64, 16384)
+HERMES_KMS_CONFIG_U32_ATTR(min_height, 64, 16384)
+HERMES_KMS_CONFIG_U32_ATTR(max_width, 64, 16384)
+HERMES_KMS_CONFIG_U32_ATTR(max_height, 64, 16384)
+HERMES_KMS_CONFIG_U32_ATTR(max_refresh_hz, 1, 1000)
+HERMES_KMS_CONFIG_U32_ATTR(initial_width, 64, 16384)
+HERMES_KMS_CONFIG_U32_ATTR(initial_height, 64, 16384)
+HERMES_KMS_CONFIG_U32_ATTR(initial_refresh_hz, 1, 1000)
+HERMES_KMS_CONFIG_U32_ATTR(physical_width_mm, 0, 2550)
+HERMES_KMS_CONFIG_U32_ATTR(physical_height_mm, 0, 2550)
+HERMES_KMS_CONFIG_U32_ATTR(color_depth, 8, 10)
+HERMES_KMS_CONFIG_U32_ATTR(serial_base, 0, INT_MAX - HERMES_KMS_MAX_OUTPUTS)
+
+#define HERMES_KMS_CONFIG_BOOL_ATTR(name)                                 \
+static ssize_t hermes_kms_config_##name##_show(struct config_item *item,    \
+					       char *page)                     \
+{                                                                         \
+	struct hermes_kms_config_device *cfg =                              \
+		to_hermes_kms_config_device(item);                            \
+	bool value;                                                           \
+	mutex_lock(&cfg->lock);                                              \
+	value = cfg->display.name;                                           \
+	mutex_unlock(&cfg->lock);                                            \
+	return sysfs_emit(page, "%u\n", value);                             \
+}                                                                         \
+static ssize_t hermes_kms_config_##name##_store(struct config_item *item,  \
+					       const char *page, size_t count)  \
+{                                                                         \
+	struct hermes_kms_config_device *cfg =                              \
+		to_hermes_kms_config_device(item);                            \
+	bool value;                                                           \
+	int ret = kstrtobool(page, &value);                                   \
+	if (ret)                                                              \
+		return ret;                                                    \
+	mutex_lock(&cfg->lock);                                              \
+	if (cfg->enabled)                                                     \
+		ret = -EBUSY;                                                 \
+	else                                                                  \
+		cfg->display.name = value;                                    \
+	mutex_unlock(&cfg->lock);                                            \
+	return ret ? ret : (ssize_t)count;                                   \
+}
+
+HERMES_KMS_CONFIG_BOOL_ATTR(initial_enabled)
+HERMES_KMS_CONFIG_BOOL_ATTR(non_desktop)
+HERMES_KMS_CONFIG_BOOL_ATTR(hdr_enable)
+
+static bool hermes_kms_valid_manufacturer(const char *value)
+{
+	return strlen(value) == 3 && value[0] >= 'A' && value[0] <= 'Z' &&
+		value[1] >= 'A' && value[1] <= 'Z' &&
+		value[2] >= 'A' && value[2] <= 'Z';
+}
+
+static bool hermes_kms_valid_monitor_name(const char *value)
+{
+	size_t i, len = strlen(value);
+
+	if (!len || len > 12)
+		return false;
+	for (i = 0; i < len; i++)
+		if (value[i] < 32 || value[i] > 126)
+			return false;
+	return true;
+}
+
+static bool hermes_kms_valid_output_prefix(const char *value)
+{
+	size_t i, len = strlen(value);
+
+	if (!len || len > 20)
+		return false;
+	for (i = 0; i < len; i++)
+		if (!((value[i] >= 'A' && value[i] <= 'Z') ||
+		      (value[i] >= 'a' && value[i] <= 'z') ||
+		      (value[i] >= '0' && value[i] <= '9') ||
+		      value[i] == '-' || value[i] == '_'))
+			return false;
+	return true;
+}
+
+#define HERMES_KMS_CONFIG_STRING_ATTR(name, valid)                         \
+static ssize_t hermes_kms_config_##name##_show(struct config_item *item,    \
+					       char *page)                     \
+{                                                                         \
+	struct hermes_kms_config_device *cfg =                              \
+		to_hermes_kms_config_device(item);                            \
+	ssize_t ret;                                                          \
+	mutex_lock(&cfg->lock);                                              \
+	ret = sysfs_emit(page, "%s\n", cfg->display.name);                  \
+	mutex_unlock(&cfg->lock);                                            \
+	return ret;                                                           \
+}                                                                         \
+static ssize_t hermes_kms_config_##name##_store(struct config_item *item,  \
+					       const char *page, size_t count)  \
+{                                                                         \
+	struct hermes_kms_config_device *cfg =                              \
+		to_hermes_kms_config_device(item);                            \
+	char value[sizeof(cfg->display.name)];                               \
+	size_t len = count;                                                   \
+	int ret = 0;                                                          \
+	if (len && page[len - 1] == '\n')                                    \
+		len--;                                                        \
+	if (len >= sizeof(value))                                             \
+		return -EINVAL;                                                \
+	memcpy(value, page, len);                                             \
+	value[len] = 0;                                                       \
+	if (!(valid)(value))                                                  \
+		return -EINVAL;                                                \
+	mutex_lock(&cfg->lock);                                              \
+	if (cfg->enabled)                                                     \
+		ret = -EBUSY;                                                 \
+	else                                                                  \
+		strscpy(cfg->display.name, value,                           \
+			sizeof(cfg->display.name));                            \
+	mutex_unlock(&cfg->lock);                                            \
+	return ret ? ret : (ssize_t)count;                                   \
+}
+
+HERMES_KMS_CONFIG_STRING_ATTR(manufacturer, hermes_kms_valid_manufacturer)
+HERMES_KMS_CONFIG_STRING_ATTR(monitor_name, hermes_kms_valid_monitor_name)
+HERMES_KMS_CONFIG_STRING_ATTR(output_prefix, hermes_kms_valid_output_prefix)
+
+static ssize_t hermes_kms_config_scanout_modifiers_show(
+	struct config_item *item, char *page)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	ssize_t used = 0;
+	unsigned int i;
+
+	mutex_lock(&cfg->lock);
+	for (i = 1; i < HERMES_KMS_PLANE_MODIFIER_SLOTS &&
+	     cfg->display.modifiers[i] != DRM_FORMAT_MOD_INVALID; i++)
+		used += sysfs_emit_at(page, used, "%s0x%llx",
+				      i == 1 ? "" : ",",
+				      cfg->display.modifiers[i]);
+	used += sysfs_emit_at(page, used, "\n");
+	mutex_unlock(&cfg->lock);
+	return used;
+}
+
+static ssize_t hermes_kms_config_scanout_modifiers_store(
+	struct config_item *item, const char *page, size_t count)
+{
+	struct hermes_kms_config_device *cfg = to_hermes_kms_config_device(item);
+	u64 parsed[HERMES_KMS_PLANE_MODIFIER_SLOTS] = {
+		DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_MOD_INVALID,
+	};
+	char *input, *cursor, *part;
+	unsigned int n = 1, j;
+	int ret = 0;
+
+	input = kmemdup_nul(page, count, GFP_KERNEL);
+	if (!input)
+		return -ENOMEM;
+	cursor = strim(input);
+	while (*cursor) {
+		u64 modifier;
+
+		part = strsep(&cursor, ",");
+		if (!part || !*strim(part) ||
+		    n >= HERMES_KMS_PLANE_MODIFIER_SLOTS - 1 ||
+		    kstrtoull(strim(part), 0, &modifier) ||
+		    modifier == DRM_FORMAT_MOD_INVALID) {
+			ret = -EINVAL;
+			goto out;
+		}
+		for (j = 0; j < n; j++)
+			if (parsed[j] == modifier) {
+				ret = -EINVAL;
+				goto out;
+			}
+		parsed[n++] = modifier;
+		if (!cursor)
+			break;
+		if (!*cursor) {
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+	parsed[n] = DRM_FORMAT_MOD_INVALID;
+	mutex_lock(&cfg->lock);
+	if (cfg->enabled)
+		ret = -EBUSY;
+	else
+		memcpy(cfg->display.modifiers, parsed, sizeof(parsed));
+	mutex_unlock(&cfg->lock);
+out:
+	kfree(input);
+	return ret ? ret : (ssize_t)count;
+}
+
+static bool hermes_kms_config_display_valid(
+	const struct hermes_kms_config_device *cfg)
+{
+	const struct hermes_kms_display_config *d = &cfg->display;
+	struct hermes_kms_edid_config edid_config = {
+		.min_width = d->min_width,
+		.min_height = d->min_height,
+		.max_width = d->max_width,
+		.max_height = d->max_height,
+		.max_refresh_hz = d->max_refresh_hz,
+		.preferred_width = d->initial_width,
+		.preferred_height = d->initial_height,
+		.preferred_refresh_hz = d->initial_refresh_hz,
+	};
+	u8 edid[HERMES_KMS_EDID_SIZE];
+
+	if (d->min_width > d->max_width || d->min_height > d->max_height ||
+	    d->min_width > 4095 || d->min_height > 4095 ||
+	    (d->color_depth != 8 && d->color_depth != 10) ||
+	    (d->hdr_enable &&
+	     (d->min_width > 640 || d->min_height > 480 ||
+	      d->max_width < 640 || d->max_height < 480 ||
+	      d->max_refresh_hz < 60)) ||
+	    (!!d->physical_width_mm != !!d->physical_height_mm) ||
+	    !hermes_kms_valid_requested_mode(d, d->initial_width,
+					     d->initial_height,
+					     d->initial_refresh_hz) ||
+	    (d->serial_base && d->serial_base > INT_MAX - cfg->outputs + 1))
+		return false;
+
+	hermes_kms_build_edid(edid, d->serial_base, &edid_config);
+	return edid[HERMES_KMS_EDID_DTD_OFFSET] ||
+	       edid[HERMES_KMS_EDID_DTD_OFFSET + 1];
+}
+
 CONFIGFS_ATTR(hermes_kms_config_, outputs);
 CONFIGFS_ATTR(hermes_kms_config_, role);
 CONFIGFS_ATTR(hermes_kms_config_, session_index);
 CONFIGFS_ATTR(hermes_kms_config_, access_uid);
+CONFIGFS_ATTR(hermes_kms_config_, min_width);
+CONFIGFS_ATTR(hermes_kms_config_, min_height);
+CONFIGFS_ATTR(hermes_kms_config_, max_width);
+CONFIGFS_ATTR(hermes_kms_config_, max_height);
+CONFIGFS_ATTR(hermes_kms_config_, max_refresh_hz);
+CONFIGFS_ATTR(hermes_kms_config_, initial_width);
+CONFIGFS_ATTR(hermes_kms_config_, initial_height);
+CONFIGFS_ATTR(hermes_kms_config_, initial_refresh_hz);
+CONFIGFS_ATTR(hermes_kms_config_, physical_width_mm);
+CONFIGFS_ATTR(hermes_kms_config_, physical_height_mm);
+CONFIGFS_ATTR(hermes_kms_config_, color_depth);
+CONFIGFS_ATTR(hermes_kms_config_, initial_enabled);
+CONFIGFS_ATTR(hermes_kms_config_, non_desktop);
+CONFIGFS_ATTR(hermes_kms_config_, hdr_enable);
+CONFIGFS_ATTR(hermes_kms_config_, serial_base);
+CONFIGFS_ATTR(hermes_kms_config_, manufacturer);
+CONFIGFS_ATTR(hermes_kms_config_, monitor_name);
+CONFIGFS_ATTR(hermes_kms_config_, output_prefix);
+CONFIGFS_ATTR(hermes_kms_config_, scanout_modifiers);
 CONFIGFS_ATTR(hermes_kms_config_, enabled);
 CONFIGFS_ATTR_RO(hermes_kms_config_, card);
 CONFIGFS_ATTR_RO(hermes_kms_config_, render_node);
@@ -4758,6 +5185,25 @@ static struct configfs_attribute *hermes_kms_config_attrs[] = {
 	&hermes_kms_config_attr_role,
 	&hermes_kms_config_attr_session_index,
 	&hermes_kms_config_attr_access_uid,
+	&hermes_kms_config_attr_min_width,
+	&hermes_kms_config_attr_min_height,
+	&hermes_kms_config_attr_max_width,
+	&hermes_kms_config_attr_max_height,
+	&hermes_kms_config_attr_max_refresh_hz,
+	&hermes_kms_config_attr_initial_width,
+	&hermes_kms_config_attr_initial_height,
+	&hermes_kms_config_attr_initial_refresh_hz,
+	&hermes_kms_config_attr_physical_width_mm,
+	&hermes_kms_config_attr_physical_height_mm,
+	&hermes_kms_config_attr_color_depth,
+	&hermes_kms_config_attr_initial_enabled,
+	&hermes_kms_config_attr_non_desktop,
+	&hermes_kms_config_attr_hdr_enable,
+	&hermes_kms_config_attr_serial_base,
+	&hermes_kms_config_attr_manufacturer,
+	&hermes_kms_config_attr_monitor_name,
+	&hermes_kms_config_attr_output_prefix,
+	&hermes_kms_config_attr_scanout_modifiers,
 	&hermes_kms_config_attr_enabled,
 	&hermes_kms_config_attr_card,
 	&hermes_kms_config_attr_render_node,
@@ -4788,6 +5234,19 @@ static const struct config_item_type hermes_kms_config_device_type = {
 	.ct_owner = THIS_MODULE,
 };
 
+/* Stable across boots and independent of the order configfs cards appear. */
+static u32 hermes_kms_serial_from_name(const char *name)
+{
+	u32 hash = 2166136261u;
+	const unsigned char *p = (const unsigned char *)name;
+
+	while (*p) {
+		hash ^= *p++;
+		hash *= 16777619u;
+	}
+	return 1 + hash % (INT_MAX - HERMES_KMS_MAX_OUTPUTS);
+}
+
 static struct config_group *hermes_kms_config_make_group(
 	struct config_group *group, const char *name)
 {
@@ -4801,6 +5260,8 @@ static struct config_group *hermes_kms_config_make_group(
 	cfg->device_id = -1;
 	cfg->outputs = HERMES_KMS_DEFAULT_OUTPUTS;
 	cfg->role = HERMES_KMS_DEVICE_ROLE_GENERAL;
+	hermes_kms_default_display_config(&cfg->display, true);
+	cfg->display.serial_base = hermes_kms_serial_from_name(name);
 	config_group_init_type_name(&cfg->group, name,
 				    &hermes_kms_config_device_type);
 
@@ -4891,12 +5352,34 @@ static void __init hermes_kms_sanitize_mode_range(void)
 			     HERMES_KMS_LIMIT_MAX_DIMENSION);
 	max_refresh_hz = clamp_t(unsigned int, max_refresh_hz, 1,
 				 HERMES_KMS_LIMIT_MAX_REFRESH_HZ);
+	if (min_width > 4095 || min_height > 4095) {
+		pr_warn("%s: minimum mode exceeds EDID detailed-timing limits; limiting the minimum to 4095 pixels per axis\n",
+			HERMES_KMS_DRIVER_NAME);
+		min_width = min(min_width, 4095u);
+		min_height = min(min_height, 4095u);
+	}
 
-	if (!hermes_kms_edid_depth_field(color_depth)) {
-		pr_warn("%s: color_depth=%u is not an EDID-encodable depth, using %u\n",
+	if (color_depth != 8 && color_depth != 10) {
+		pr_warn("%s: color_depth=%u has no matching scanout format, using %u\n",
 			HERMES_KMS_DRIVER_NAME, color_depth,
 			HERMES_KMS_DEFAULT_COLOR_DEPTH);
 		color_depth = HERMES_KMS_DEFAULT_COLOR_DEPTH;
+	}
+	physical_width_mm = min(physical_width_mm,
+				(unsigned int)HERMES_KMS_EDID_MAX_SIZE_MM);
+	physical_height_mm = min(physical_height_mm,
+				 (unsigned int)HERMES_KMS_EDID_MAX_SIZE_MM);
+	if (!!physical_width_mm != !!physical_height_mm) {
+		pr_warn("%s: physical size needs both dimensions; leaving it undefined\n",
+			HERMES_KMS_DRIVER_NAME);
+		physical_width_mm = physical_height_mm = 0;
+	}
+	if (hdr_enable && (min_width > 640 || min_height > 480 ||
+			   max_width < 640 || max_height < 480 ||
+			   max_refresh_hz < 60)) {
+		pr_warn("%s: disabling HDR because the configured mode range cannot provide CTA baseline 640x480p60\n",
+			HERMES_KMS_DRIVER_NAME);
+		hdr_enable = false;
 	}
 
 	/*
@@ -4933,6 +5416,8 @@ static void __init hermes_kms_sanitize_mode_range(void)
 
 static int __init hermes_kms_init(void)
 {
+	struct hermes_kms_edid_config static_edid_config;
+	u8 static_edid[HERMES_KMS_EDID_SIZE];
 	unsigned int device_count = devices;
 	unsigned int i;
 	int ret;
@@ -4949,16 +5434,45 @@ static int __init hermes_kms_init(void)
 			pr_warn("%s: session_devices=%u overrides devices=%u\n",
 				HERMES_KMS_DRIVER_NAME, session_devices, devices);
 		device_count = 1 + session_devices;
-	} else if (device_count < 1 || device_count > HERMES_KMS_MAX_DEVICES) {
-		device_count = clamp(device_count, 1u,
+	} else if (device_count > HERMES_KMS_MAX_DEVICES) {
+		device_count = clamp(device_count, 0u,
 				     (unsigned int)HERMES_KMS_MAX_DEVICES);
 		pr_warn("%s: devices=%u out of range, using %u\n",
 			HERMES_KMS_DRIVER_NAME, devices, device_count);
 		devices = device_count;
 	}
+	if (!device_count && !IS_ENABLED(CONFIG_CONFIGFS_FS))
+		return -EOPNOTSUPP;
 	registered_device_count = device_count;
+	hermes_kms_session_indices = 0;
+	if (session_devices) {
+		for (i = 1; i <= session_devices; i++)
+			set_bit(i, &hermes_kms_session_indices);
+	} else if (device_count > 1) {
+		for (i = 1; i <= device_count; i++)
+			set_bit(i, &hermes_kms_session_indices);
+	}
 
 	hermes_kms_sanitize_mode_range();
+	if (device_count) {
+		static_edid_config = (struct hermes_kms_edid_config) {
+			.min_width = min_width,
+			.min_height = min_height,
+			.max_width = max_width,
+			.max_height = max_height,
+			.max_refresh_hz = max_refresh_hz,
+			.preferred_width = initial_width,
+			.preferred_height = initial_height,
+			.preferred_refresh_hz = initial_refresh_hz,
+		};
+		hermes_kms_build_edid(static_edid, 1, &static_edid_config);
+		if (!static_edid[HERMES_KMS_EDID_DTD_OFFSET] &&
+		    !static_edid[HERMES_KMS_EDID_DTD_OFFSET + 1]) {
+			pr_err("%s: static mode range has no EDID-encodable preferred timing\n",
+			       HERMES_KMS_DRIVER_NAME);
+			return -EINVAL;
+		}
+	}
 	hermes_kms_init_plane_modifiers();
 
 	/*
@@ -5001,6 +5515,10 @@ static int __init hermes_kms_init(void)
 	}
 
 	hermes_kms_configfs_register();
+	if (!device_count && !hermes_kms_dynamic_devices_available()) {
+		ret = -EOPNOTSUPP;
+		goto err_unregister_devices;
+	}
 
 	pr_info("%s: module loaded devices=%u session_devices=%u outputs_per_device=%u dynamic_devices=%d\n",
 		HERMES_KMS_DRIVER_NAME, device_count, session_devices, outputs,

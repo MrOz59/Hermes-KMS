@@ -34,8 +34,3 @@ ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_r
 ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_role}=="session", ATTRS{hermes_kms_session_index}=="6", ENV{ID_SEAT}="hermes-kms-6", TAG+="seat", TAG+="master-of-seat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hermes-kms-seatd@6.service", OWNER="root", GROUP="root", MODE="0600", TAG-="uaccess"
 ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_role}=="session", ATTRS{hermes_kms_session_index}=="7", ENV{ID_SEAT}="hermes-kms-7", TAG+="seat", TAG+="master-of-seat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hermes-kms-seatd@7.service", OWNER="root", GROUP="root", MODE="0600", TAG-="uaccess"
 ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ATTRS{hermes_kms_role}=="session", ATTRS{hermes_kms_session_index}=="8", ENV{ID_SEAT}="hermes-kms-8", TAG+="seat", TAG+="master-of-seat", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hermes-kms-seatd@8.service", OWNER="root", GROUP="root", MODE="0600", TAG-="uaccess"
-
-# Capture/control render nodes default to root-only access.
-# hermes-kms-setup writes a generic UID-specific rule under /etc/udev/rules.d;
-# do not grant every active local seat user access through uaccess.
-ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", DEVPATH=="*/platform/hermes-kms*/drm/renderD*", OWNER="root", GROUP="root", MODE="0600", TAG-="uaccess"

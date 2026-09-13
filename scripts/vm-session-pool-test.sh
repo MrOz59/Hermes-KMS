@@ -6,6 +6,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KO="$REPO/kernel/hermes-kms/hermes_kms.ko"
 CTL="$REPO/tools/hermes-kmsctl/hermes-kmsctl"
 RUNTIME_RULE=/run/udev/rules.d/72-hermes-kms-session-seats.rules
+COLLISION_GROUP=/sys/kernel/config/hermes-kms/pool-index-collision
 RULE_BACKUP=""
 MODULE_LOADED_BY_TEST=0
 CARDS=()
@@ -13,6 +14,10 @@ FAIL=0
 
 cleanup()
 {
+	if [ -d "$COLLISION_GROUP" ]; then
+		printf 0 > "$COLLISION_GROUP/enabled" 2>/dev/null || true
+		rmdir "$COLLISION_GROUP" 2>/dev/null || true
+	fi
 	if [ "$MODULE_LOADED_BY_TEST" -eq 1 ]; then
 		timeout -k 1s 5s rmmod hermes_kms 2>/dev/null || true
 		MODULE_LOADED_BY_TEST=0
@@ -113,6 +118,19 @@ for index in 0 1 2; do
 		require_value "$identity" session_index "$index"
 	fi
 done
+
+# Static pool indices must reserve their seat/broker names against configfs.
+mkdir "$COLLISION_GROUP"
+printf session > "$COLLISION_GROUP/role"
+printf 1 > "$COLLISION_GROUP/session_index"
+if printf 1 > "$COLLISION_GROUP/enabled" 2>/dev/null; then
+	printf 'FAIL: configfs reused static pool session_index 1\n' >&2
+	FAIL=1
+	printf 0 > "$COLLISION_GROUP/enabled"
+else
+	printf 'ok: static pool session_index 1 is reserved\n'
+fi
+rmdir "$COLLISION_GROUP"
 
 host_properties="$(udevadm info --query=property --name="${CARDS[0]}")"
 if printf '%s\n' "$host_properties" | grep -q '^ID_SEAT=hermes-kms-'; then

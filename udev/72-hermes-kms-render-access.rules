@@ -1,0 +1,3 @@
+# Capture/control render nodes default to root-only access. Projects grant
+# access through their own udev policy or per-card access_uid in configfs.
+ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", DEVPATH=="*/platform/hermes-kms*/drm/renderD*", OWNER="root", GROUP="root", MODE="0600", TAG-="uaccess"

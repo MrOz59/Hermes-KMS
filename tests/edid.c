@@ -83,9 +83,15 @@ static void check_structure(const u8 *edid, const char *what)
 	      EDID_FEATURE_CONTINUOUS_FREQ,
 	      "%s: drm_get_monitor_range() ignores the range descriptor without the continuous-frequency bit",
 	      what);
-	CHECK(edid[HERMES_KMS_EDID_FEATURES_OFFSET] &
-	      EDID_FEATURE_PREFERRED_TIMING,
-	      "%s: first detailed timing must be marked preferred", what);
+	if (edid[HERMES_KMS_EDID_DTD_OFFSET] ||
+	    edid[HERMES_KMS_EDID_DTD_OFFSET + 1])
+		CHECK(edid[HERMES_KMS_EDID_FEATURES_OFFSET] &
+		      EDID_FEATURE_PREFERRED_TIMING,
+		      "%s: first detailed timing must be marked preferred", what);
+	else
+		CHECK(!(edid[HERMES_KMS_EDID_FEATURES_OFFSET] &
+			EDID_FEATURE_PREFERRED_TIMING),
+		      "%s: no timing must not claim a preferred DTD", what);
 
 	/* A display descriptor has a zero pixel clock and a type byte. */
 	CHECK(range[0] == 0 && range[1] == 0 && range[2] == 0,
@@ -175,6 +181,28 @@ static void check_color_depth(void)
 	}
 }
 
+static void check_project_identity(void)
+{
+	struct hermes_kms_edid_config config = {
+		.max_width = 1920,
+		.max_height = 1080,
+		.max_refresh_hz = 60,
+		.color_depth = 8,
+		.manufacturer = "VRT",
+		.monitor_name = "Virtual KMS",
+	};
+	u8 edid[HERMES_KMS_EDID_SIZE];
+
+	hermes_kms_build_edid(edid, 123456, &config);
+	check_structure(edid, "project identity");
+	CHECK(edid[8] == 0x5a && edid[9] == 0x54,
+	      "manufacturer code for VRT is %02x%02x", edid[8], edid[9]);
+	CHECK(!memcmp(&edid[77], "Virtual KMS\n", 12),
+	      "monitor name did not survive EDID encoding");
+	CHECK(edid[12] == 0x40 && edid[13] == 0xe2 && edid[14] == 0x01,
+	      "configured serial was not encoded in the EDID");
+}
+
 /*
  * Validate the CTA-861 extension block (the second EDID block) independently of
  * the builder, mirroring how an EDID parser would decode it rather than reusing
@@ -187,9 +215,9 @@ static void check_color_depth(void)
  * use-extended-tag data block with extended tag 0x06 declaring Static Metadata
  * Descriptor Type 1).
  *
- * It also exercises Property 10 (the Colorimetry data block at bytes 8..11 is
+ * It also exercises Property 10 (the Colorimetry data block at bytes 14..17 is
  * well-formed: 0xE3, 0x05, 0x80, 0x00), Property 11 (both data blocks are
- * present and the DTD offset points past them at 12), and Property 12 (the CTA
+ * present and the DTD offset points past them at 18), and Property 12 (the CTA
  * checksum sums to 0 mod 256 with both data blocks present -- the checksum
  * check above now covers both blocks).
  */
@@ -207,22 +235,26 @@ static void check_cta_extension(const u8 *block, const char *what)
 	      "%s: CTA extension checksum does not sum to zero", what);
 
 	/*
-	 * CTA-861 extension header: tag 0x02, DTD offset 12 (no detailed
-	 * timings; the offset points past the 4-byte CTA header plus the two
-	 * 4-byte data blocks that make up the 8-byte data block collection).
+	 * CTA-861 extension header: tag 0x02, DTD offset 18 (no detailed
+	 * timings; the offset points past the 4-byte header and data blocks).
 	 */
 	CHECK(block[0] == 0x02,
 	      "%s: CTA extension tag is 0x%02x, expected 0x02", what, block[0]);
-	CHECK(block[2] == 0x0c,
-	      "%s: CTA DTD offset is 0x%02x, expected 0x0c (no detailed timings, past both data blocks)",
+	CHECK(block[2] == 0x12,
+	      "%s: CTA DTD offset is 0x%02x, expected 0x12",
 	      what, block[2]);
+	CHECK(block[3] & 0x80, "%s: IT formats must default to underscan", what);
+	CHECK(block[4] == 0x42 && block[5] == 0x90 && block[6] == 1,
+	      "%s: CTA video block must carry VIC 1 and native VIC 16", what);
+	CHECK(block[7] == 0xe2 && block[8] == 0 && block[9] == 0x4a,
+	      "%s: VCDB must offer selectable RGB quantization", what);
 
 	/*
 	 * The data block collection starts at byte 4. Decode the tag/length
 	 * byte the way CTA-861 specifies: bits 7:5 are the block type and bits
 	 * 4:0 the number of payload bytes that follow.
 	 */
-	tag_length = block[4];
+	tag_length = block[10];
 	payload_length = tag_length & 0x1f;
 	CHECK((tag_length >> 5) == 0x07,
 	      "%s: data block type is %u, expected 0x07 (use extended tag)",
@@ -232,16 +264,16 @@ static void check_cta_extension(const u8 *block, const char *what)
 	      what, payload_length);
 
 	/* Extended tag 0x06 identifies the block as HDR Static Metadata. */
-	CHECK(block[5] == 0x06,
+	CHECK(block[11] == 0x06,
 	      "%s: extended tag is 0x%02x, expected 0x06 (HDR static metadata)",
-	      what, block[5]);
+	      what, block[11]);
 
 	/*
 	 * EOTF byte: bit 0 is traditional SDR gamma, bit 2 is SMPTE ST2084
 	 * (PQ). Both must be set (0x05), and PQ must never appear without SDR
 	 * gamma.
 	 */
-	eotf = block[6];
+	eotf = block[12];
 	CHECK(eotf == 0x05,
 	      "%s: EOTF byte is 0x%02x, expected 0x05 (SDR gamma + ST2084/PQ)",
 	      what, eotf);
@@ -253,17 +285,17 @@ static void check_cta_extension(const u8 *block, const char *what)
 	      "%s: PQ EOTF must never be set without SDR gamma", what);
 
 	/* Descriptor byte declares Static Metadata Descriptor Type 1. */
-	CHECK(block[7] == 0x01,
+	CHECK(block[13] == 0x01,
 	      "%s: descriptor type byte is 0x%02x, expected 0x01",
-	      what, block[7]);
+	      what, block[13]);
 
 	/*
-	 * The Colorimetry Data Block follows immediately at bytes 8..11.
+	 * The Colorimetry Data Block follows at bytes 14..17.
 	 * Decode its tag/length byte the same way as the HDR block above: bits
 	 * 7:5 are the block type (0x07, use extended tag) and bits 4:0 the
 	 * payload length (3 bytes following).
 	 */
-	tag_length = block[8];
+	tag_length = block[14];
 	payload_length = tag_length & 0x1f;
 	CHECK((tag_length >> 5) == 0x07,
 	      "%s: colorimetry block type is %u, expected 0x07 (use extended tag)",
@@ -273,25 +305,25 @@ static void check_cta_extension(const u8 *block, const char *what)
 	      what, payload_length);
 
 	/* Extended tag 0x05 identifies the block as Colorimetry. */
-	CHECK(block[9] == 0x05,
+	CHECK(block[15] == 0x05,
 	      "%s: colorimetry extended tag is 0x%02x, expected 0x05",
-	      what, block[9]);
+	      what, block[15]);
 
 	/*
 	 * Colorimetry byte: bit 7 is BT2020 RGB. It must be the only bit set,
 	 * so the whole byte reads 0x80 -- KWin's supportsBT2020() only checks
 	 * for BT2020 RGB and the block advertises nothing else.
 	 */
-	CHECK(block[10] == 0x80,
+	CHECK(block[16] == 0x80,
 	      "%s: colorimetry byte is 0x%02x, expected 0x80 (BT2020 RGB only)",
-	      what, block[10]);
-	CHECK(block[10] & 0x80,
+	      what, block[16]);
+	CHECK(block[16] & 0x80,
 	      "%s: BT2020 RGB colorimetry bit must be set", what);
 
 	/* Gamut-metadata byte advertises no supported bits. */
-	CHECK(block[11] == 0x00,
+	CHECK(block[17] == 0x00,
 	      "%s: gamut-metadata byte is 0x%02x, expected 0x00",
-	      what, block[11]);
+	      what, block[17]);
 }
 
 /*
@@ -537,6 +569,10 @@ static void check_physical_size(void)
 	CHECK(edid[HERMES_KMS_EDID_SIZE_CM_OFFSET] == 0 &&
 	      edid[HERMES_KMS_EDID_SIZE_CM_OFFSET + 1] == 0,
 	      "an unset physical size must stay undefined");
+	CHECK(edid[HERMES_KMS_EDID_DTD_OFFSET + 12] == 0 &&
+	      edid[HERMES_KMS_EDID_DTD_OFFSET + 13] == 0 &&
+	      edid[HERMES_KMS_EDID_DTD_OFFSET + 14] == 0,
+	      "an unset physical size must not remain in the preferred DTD");
 
 	config.physical_width_mm = 697;
 	config.physical_height_mm = 392;
@@ -554,6 +590,56 @@ static void check_physical_size(void)
 	      "base block size is %ux%u cm, expected 70x39",
 	      edid[HERMES_KMS_EDID_SIZE_CM_OFFSET],
 	      edid[HERMES_KMS_EDID_SIZE_CM_OFFSET + 1]);
+
+	config.physical_width_mm = 4095;
+	config.physical_height_mm = 4095;
+	hermes_kms_build_edid(edid, 1, &config);
+	check_structure(edid, "oversized physical size");
+	CHECK(edid[HERMES_KMS_EDID_SIZE_CM_OFFSET] == 255 &&
+	      edid[HERMES_KMS_EDID_SIZE_CM_OFFSET + 1] == 255,
+	      "oversized physical size must fit the base block's cm fields");
+}
+
+static void check_profile_preferred_timing(void)
+{
+	struct hermes_kms_edid_config config = {
+		.min_width = 640,
+		.min_height = 480,
+		.max_width = 2560,
+		.max_height = 1440,
+		.max_refresh_hz = 120,
+		.preferred_width = 1280,
+		.preferred_height = 720,
+		.preferred_refresh_hz = 60,
+	};
+	u8 edid[2 * HERMES_KMS_EDID_SIZE];
+	const u8 *dtd;
+	u32 width, height;
+
+	hermes_kms_build_edid(edid, 1024, &config);
+	check_structure(edid, "configured 720p preference");
+	dtd = &edid[HERMES_KMS_EDID_DTD_OFFSET];
+	width = dtd[2] | ((u32)(dtd[4] & 0xf0) << 4);
+	height = dtd[5] | ((u32)(dtd[7] & 0xf0) << 4);
+	CHECK(width == 1280 && height == 720,
+	      "configured DTD is %ux%u, expected 1280x720", width, height);
+	CHECK(hermes_kms_append_hdr_extension(edid),
+	      "configured 720p EDID must accept the HDR extension");
+	CHECK(edid[HERMES_KMS_EDID_SIZE + 4] == 0x41 &&
+	      edid[HERMES_KMS_EDID_SIZE + 5] == 0x01 &&
+	      edid[HERMES_KMS_EDID_SIZE + 2] == 17,
+	      "CTA must omit VIC 16 when the preferred timing is not 1080p60");
+
+	config.max_width = 1280;
+	config.max_height = 720;
+	config.preferred_width = config.preferred_height = 0;
+	config.preferred_refresh_hz = 0;
+	hermes_kms_build_edid(edid, 1024, &config);
+	dtd = &edid[HERMES_KMS_EDID_DTD_OFFSET];
+	width = dtd[2] | ((u32)(dtd[4] & 0xf0) << 4);
+	height = dtd[5] | ((u32)(dtd[7] & 0xf0) << 4);
+	CHECK(width <= config.max_width && height <= config.max_height,
+	      "fallback DTD %ux%u exceeds a 1280x720 profile", width, height);
 }
 
 int main(void)
@@ -581,7 +667,9 @@ int main(void)
 
 	check_serials_differ();
 	check_physical_size();
+	check_profile_preferred_timing();
 	check_color_depth();
+	check_project_identity();
 
 	{
 		u8 cta[HERMES_KMS_EDID_SIZE];

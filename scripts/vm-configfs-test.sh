@@ -104,6 +104,16 @@ install -Dm0644 "$REPO/udev/92-hermes-kms-access.rules" "$ACCESS_RULE"
 RULE_INSTALLED=1
 udevadm control --reload-rules
 
+if insmod "$KO" min_width=64 min_height=64 max_width=64 max_height=64 \
+	initial_width=64 initial_height=64 initial_refresh_hz=1 \
+	max_refresh_hz=1 2>/dev/null; then
+	printf 'FAIL: static card without an EDID-encodable timing loaded\n' >&2
+	FAIL=1
+	rmmod hermes_kms
+else
+	printf 'ok: static card without an EDID-encodable timing rejected\n'
+fi
+
 insmod "$KO" initial_enabled=0 hotplug_events=0
 LOADED_BY_TEST=1
 sleep 0.5
@@ -133,6 +143,12 @@ fi
 
 printf 2 > "$CONFIGFS/stream1/outputs"
 printf 3 > "$CONFIGFS/stream1/session_index"
+printf 1024 > "$CONFIGFS/stream1/serial_base"
+printf 2560 > "$CONFIGFS/stream1/max_width"
+printf 1440 > "$CONFIGFS/stream1/max_height"
+printf VRT > "$CONFIGFS/stream1/manufacturer"
+printf 'Virtual KMS' > "$CONFIGFS/stream1/monitor_name"
+printf 'PROJECT-' > "$CONFIGFS/stream1/output_prefix"
 printf 1 > "$CONFIGFS/stream1/enabled"
 sleep 0.5
 
@@ -152,6 +168,34 @@ check "identity session_index" 3 \
 	"$(printf '%s\n' "$IDENTITY" | value session_index)"
 check "identity output_count" 2 \
 	"$(printf '%s\n' "$IDENTITY" | value output_count)"
+check "stable configured output name" PROJECT-1024 \
+	"$(printf '%s\n' "$IDENTITY" | value output)"
+check "per-card mode envelope" 2560x1440 \
+	"$("$CTL" --device "/dev/dri/$CARD" caps | value max)"
+
+# A second card must not be able to take the same seat/broker index.
+mkdir "$CONFIGFS/conflicting-session"
+printf session > "$CONFIGFS/conflicting-session/role"
+printf 3 > "$CONFIGFS/conflicting-session/session_index"
+if printf 1 > "$CONFIGFS/conflicting-session/enabled" 2>/dev/null; then
+	printf 'FAIL: duplicate session_index was accepted\n' >&2
+	FAIL=1
+	printf 0 > "$CONFIGFS/conflicting-session/enabled"
+else
+	printf 'ok: duplicate session_index rejected\n'
+fi
+rmdir "$CONFIGFS/conflicting-session"
+
+mkdir "$CONFIGFS/conflicting-serial"
+printf 1024 > "$CONFIGFS/conflicting-serial/serial_base"
+if printf 1 > "$CONFIGFS/conflicting-serial/enabled" 2>/dev/null; then
+	printf 'FAIL: duplicate EDID serial was accepted\n' >&2
+	FAIL=1
+	printf 0 > "$CONFIGFS/conflicting-serial/enabled"
+else
+	printf 'ok: duplicate EDID serial rejected\n'
+fi
+rmdir "$CONFIGFS/conflicting-serial"
 check "identity device_count" 2 \
 	"$(printf '%s\n' "$IDENTITY" | value device_count)"
 
@@ -178,6 +222,8 @@ check "distinct output names across cards ($NAMES )" \
 refuse "outputs write" "$CONFIGFS/stream1/outputs" 4
 refuse "role write" "$CONFIGFS/stream1/role" host
 refuse "session_index write" "$CONFIGFS/stream1/session_index" 5
+refuse "serial_base write" "$CONFIGFS/stream1/serial_base" 2048
+refuse "max_width write" "$CONFIGFS/stream1/max_width" 3840
 
 # The item type holds a module reference while a group exists.
 if rmmod hermes_kms 2>/dev/null; then
@@ -194,10 +240,15 @@ check "card count after disable" 1 "$(hermes_cards)"
 check "device_index after disable" -1 "$(cat "$CONFIGFS/stream1/device_index")"
 
 # Re-enabling must work, and rmdir must take a live card with it.
+mkdir "$CONFIGFS/interloper"
+printf 1 > "$CONFIGFS/interloper/enabled"
 printf 1 > "$CONFIGFS/stream1/enabled"
 sleep 0.5
-check "card count after re-enable" 2 "$(hermes_cards)"
+check "card count after re-enable" 3 "$(hermes_cards)"
+check "identity survives creation-order change" PROJECT-1024 \
+	"$("$CTL" --device "/dev/dri/$(cat "$CONFIGFS/stream1/card")" identity | value output)"
 rmdir "$CONFIGFS/stream1"
+rmdir "$CONFIGFS/interloper"
 sleep 0.5
 check "card count after rmdir" 1 "$(hermes_cards)"
 
@@ -274,6 +325,77 @@ LOADED_BY_TEST=0
 	printf 'FAIL: module still loaded after rmmod\n' >&2
 	FAIL=1
 }
+
+# Projects using only runtime cards need not expose an unused static card.
+insmod "$KO" devices=0 initial_enabled=0
+LOADED_BY_TEST=1
+check "configfs-only initial card count" 0 "$(hermes_cards)"
+mkdir "$CONFIGFS/invalid-edid"
+for dimension in width height; do
+	printf 64 > "$CONFIGFS/invalid-edid/min_$dimension"
+	printf 64 > "$CONFIGFS/invalid-edid/max_$dimension"
+	printf 64 > "$CONFIGFS/invalid-edid/initial_$dimension"
+done
+printf 1 > "$CONFIGFS/invalid-edid/max_refresh_hz"
+printf 1 > "$CONFIGFS/invalid-edid/initial_refresh_hz"
+if printf 1 > "$CONFIGFS/invalid-edid/enabled" 2>/dev/null; then
+	printf 'FAIL: a profile without an EDID-encodable timing was accepted\n' >&2
+	FAIL=1
+	printf 0 > "$CONFIGFS/invalid-edid/enabled"
+else
+	printf 'ok: profile without an EDID-encodable timing rejected\n'
+fi
+rmdir "$CONFIGFS/invalid-edid"
+mkdir "$CONFIGFS/runtime-only"
+default_serial="$(cat "$CONFIGFS/runtime-only/serial_base")"
+if printf 12 > "$CONFIGFS/runtime-only/color_depth" 2>/dev/null; then
+	printf 'FAIL: color depth without a scanout format was accepted\n' >&2
+	FAIL=1
+else
+	printf 'ok: unsupported color depth rejected\n'
+fi
+printf 10 > "$CONFIGFS/runtime-only/color_depth"
+printf 1280 > "$CONFIGFS/runtime-only/max_width"
+printf 720 > "$CONFIGFS/runtime-only/max_height"
+printf 1280 > "$CONFIGFS/runtime-only/initial_width"
+printf 720 > "$CONFIGFS/runtime-only/initial_height"
+printf 1 > "$CONFIGFS/runtime-only/hdr_enable"
+printf 1 > "$CONFIGFS/runtime-only/initial_enabled"
+printf 600 > "$CONFIGFS/runtime-only/physical_width_mm"
+printf 340 > "$CONFIGFS/runtime-only/physical_height_mm"
+printf 1 > "$CONFIGFS/runtime-only/enabled"
+check "configfs-only live card count" 1 "$(hermes_cards)"
+check "generic default output name" "VIRTUAL-$default_serial" \
+	"$("$CTL" --device "/dev/dri/$(cat "$CONFIGFS/runtime-only/card")" identity | value output)"
+runtime_card="$(cat "$CONFIGFS/runtime-only/card")"
+runtime_modes="$(modetest -M hermes-kms -c)"
+if printf '%s\n' "$runtime_modes" | grep -q '1920x1080'; then
+	printf 'FAIL: a 720p card advertised the unsupported 1080p mode\n' >&2
+	FAIL=1
+else
+	printf 'ok: 720p card mode list excludes 1080p\n'
+fi
+runtime_connector="$(find /sys/class/drm -maxdepth 1 -name "$runtime_card-Virtual-*" | head -n 1)"
+[ -n "$runtime_connector" ] || { printf 'FAIL: runtime connector missing\n' >&2; FAIL=1; }
+if [ -n "$runtime_connector" ]; then
+	check "per-card HDR EDID size" 256 "$(wc -c < "$runtime_connector/edid")"
+	if edid-decode --check "$runtime_connector/edid" >/dev/null 2>&1; then
+		printf 'ok: per-card branded HDR EDID is conformant\n'
+	else
+		printf 'FAIL: per-card branded HDR EDID is non-conformant\n' >&2
+		FAIL=1
+	fi
+	if edid-decode "$runtime_connector/edid" |
+		grep -q 'DTD 1:  1280x720'; then
+		printf 'ok: per-card EDID prefers the configured 720p mode\n'
+	else
+		printf 'FAIL: per-card EDID did not prefer 720p\n' >&2
+		FAIL=1
+	fi
+fi
+rmdir "$CONFIGFS/runtime-only"
+rmmod hermes_kms
+LOADED_BY_TEST=0
 
 if dmesg | grep -qiE 'BUG:|WARNING:|use-after-free|general protection'; then
 	printf 'FAIL: kernel splat during the run\n' >&2

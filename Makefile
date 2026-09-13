@@ -1,6 +1,7 @@
 KERNELRELEASE ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KERNELRELEASE)/build
 PWD := $(shell pwd)
+INSTALL_BROKER ?= 0
 
 # Build the module with the same toolchain the target kernel was built with.
 # A clang-built kernel (e.g. CachyOS) needs LLVM=1; a gcc-built kernel must not
@@ -59,7 +60,7 @@ DKMS_NAME := hermes-kms
 DKMS_VERSION := $(shell awk '/^#define HERMES_KMS_DRIVER_MAJOR/{maj=$$3} /^#define HERMES_KMS_DRIVER_MINOR/{min=$$3} /^#define HERMES_KMS_DRIVER_PATCH/{pat=$$3} END{print maj"."min"."pat}' kernel/hermes-kms/hermes_kms.c)
 DKMS_SRC := /usr/src/$(DKMS_NAME)-$(DKMS_VERSION)
 
-.PHONY: all full check check-uapi check-session check-edid check-edid-conformity modules tools install-runtime-udev uninstall-runtime-udev \
+.PHONY: all full check check-uapi check-session check-edid check-edid-conformity modules tools install-runtime-udev uninstall-runtime-udev install-core-configs install-broker-configs uninstall-core-configs uninstall-broker-configs \
 	install-dev-udev uninstall-dev-udev \
 	dkms-install dkms-uninstall modules-install install-configs \
 	install-uapi uninstall-uapi clean clean-tools
@@ -186,8 +187,10 @@ dkms-install:
 	else \
 		modprobe hermes_kms; \
 	fi
-	@printf 'To prepare the default independent-session pool for this user, run:\n'
-	@printf '  sudo /usr/lib/hermes-kms/hermes-kms-setup configure --user auto\n'
+	@if [ '$(INSTALL_BROKER)' = 1 ]; then \
+		printf 'To prepare the private-session pool for this user, run:\n'; \
+		printf '  sudo /usr/lib/hermes-kms/hermes-kms-setup configure --user auto\n'; \
+	fi
 
 dkms-uninstall:
 	@set -eu; \
@@ -239,15 +242,21 @@ modules-install:
 # under /usr so they survive on an image-based system. Split out from
 # install-runtime-udev because that target reloads udev and systemd, which
 # cannot work inside an image build.
-install-configs:
+install-configs: install-core-configs install-broker-configs
+
+install-core-configs:
 	install -Dm0644 packaging/modules-load.d/hermes-kms.conf \
 		'$(DESTDIR)/usr/lib/modules-load.d/hermes-kms.conf'
 	install -Dm0644 packaging/modprobe.d/hermes-kms.conf \
 		'$(DESTDIR)/usr/lib/modprobe.d/hermes-kms.conf'
-	install -Dm0644 udev/72-hermes-kms-session-seats.rules \
-		'$(DESTDIR)$(SYSTEM_UDEV_RULE_DIR)/72-hermes-kms-session-seats.rules'
+	install -Dm0644 udev/72-hermes-kms-render-access.rules \
+		'$(DESTDIR)$(SYSTEM_UDEV_RULE_DIR)/72-hermes-kms-render-access.rules'
 	install -Dm0644 udev/92-hermes-kms-access.rules \
 		'$(DESTDIR)$(SYSTEM_UDEV_RULE_DIR)/92-hermes-kms-access.rules'
+
+install-broker-configs:
+	install -Dm0644 udev/72-hermes-kms-session-seats.rules \
+		'$(DESTDIR)$(SYSTEM_UDEV_RULE_DIR)/72-hermes-kms-session-seats.rules'
 	install -Dm0755 scripts/hermes-kms-seatd-instance \
 		'$(DESTDIR)/usr/lib/hermes-kms/hermes-kms-seatd-instance'
 	install -Dm0755 scripts/hermes-kms-setup \
@@ -310,7 +319,10 @@ tools/hermes-cursor-probe/hermes_cursor_probe: tools/hermes-cursor-probe/hermes_
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(CURSOR_PROBE_CFLAGS) -o $@ $< $(CURSOR_PROBE_LIBS)
 
 install-runtime-udev:
-	$(MAKE) install-configs DESTDIR=
+	$(MAKE) install-core-configs DESTDIR=
+	@if [ '$(INSTALL_BROKER)' = 1 ]; then \
+		$(MAKE) install-broker-configs DESTDIR=; \
+	fi
 	@# The rule moved from 70- to 72- so systemd's 70-uaccess.rules cannot
 	@# re-add the tag it removes; drop the stale copy from older installs.
 	$(RM) $(SYSTEM_UDEV_RULE_DIR)/70-hermes-kms-session-seats.rules
@@ -319,6 +331,21 @@ install-runtime-udev:
 	-udevadm trigger --subsystem-match=drm --action=change
 
 uninstall-runtime-udev:
+	$(MAKE) uninstall-core-configs
+	@if [ '$(INSTALL_BROKER)' = 1 ]; then \
+		$(MAKE) uninstall-broker-configs; \
+	fi
+	-systemctl daemon-reload
+	-udevadm control --reload-rules
+	-udevadm trigger --subsystem-match=drm --action=change
+
+uninstall-core-configs:
+	$(RM) /usr/lib/modules-load.d/hermes-kms.conf
+	$(RM) /usr/lib/modprobe.d/hermes-kms.conf
+	$(RM) $(SYSTEM_UDEV_RULE_DIR)/72-hermes-kms-render-access.rules
+	$(RM) $(SYSTEM_UDEV_RULE_DIR)/92-hermes-kms-access.rules
+
+uninstall-broker-configs:
 	-systemctl stop 'hermes-kms-seatd@*.service'
 	@if [ -f /etc/udev/rules.d/90-hermes-kms-user.rules ] && \
 		grep -qx '# Managed by hermes-kms-setup. Grants one configured UID render-node access.' \
@@ -341,18 +368,12 @@ uninstall-runtime-udev:
 	fi
 	-rmdir /etc/hermes-kms
 	$(RM) -r -- /run/hermes-kms-seatd
-	$(RM) /usr/lib/modules-load.d/hermes-kms.conf
-	$(RM) /usr/lib/modprobe.d/hermes-kms.conf
 	$(RM) $(SYSTEM_UDEV_RULE_DIR)/72-hermes-kms-session-seats.rules
-	$(RM) $(SYSTEM_UDEV_RULE_DIR)/92-hermes-kms-access.rules
 	$(RM) $(SYSTEM_UDEV_RULE_DIR)/70-hermes-kms-session-seats.rules
 	$(RM) /usr/lib/systemd/system/hermes-kms-seatd@.service
 	$(RM) /usr/lib/hermes-kms/hermes-kms-seatd-instance
 	$(RM) /usr/lib/hermes-kms/hermes-kms-setup
 	$(RM) /usr/share/polkit-1/actions/io.github.mroz59.hermes-kms.policy
-	-systemctl daemon-reload
-	-udevadm control --reload-rules
-	-udevadm trigger --subsystem-match=drm --action=change
 
 install-dev-udev:
 	install -m 0644 udev/99-hermes-kms-ignore-seat.rules $(UDEV_RULE_DIR)/99-hermes-kms-ignore-seat.rules

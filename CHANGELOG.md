@@ -44,61 +44,6 @@ subject to change between minor releases.
   with `color_depth=10`. `tests/edid.c` covers the generated EDID bytes, both
   block checksums and the published EDID length under `make check`.
 
-### Fixed
-
-- An upgrade no longer leaves a working module reporting itself as unusable
-  without saying why. Render nodes are denied by default and granted by the
-  `90-` rule `hermes-kms-setup` writes; no card in the packaged pool sets
-  `hermes_kms_access_uid`, so nothing else reverses that deny. Until the setup
-  has run, the consumer logs `Couldn't open render node ... Permission denied`
-  and its panel reports Hermes-KMS as not enabled, which sends people to
-  modprobe a module that is already loaded. `post_install` always named the
-  configuration step; `post_upgrade` did not, which is exactly where somebody
-  who reinstalled, or who never ran it, ends up. It now says so, and only when
-  the rule is actually missing.
-
-### Changed
-
-- The seat broker unit gains `SystemCallFilter=@system-service @mount` and
-  `ProcSubset=pid`, and narrows `RestrictNamespaces` from `yes` to `mnt` for the
-  launcher's own unshare.
-
-- `insecure_legacy_unbound_access` is load-time only (`0444`) instead of
-  runtime-writable, and logs a warning when set. At `0600` root could widen
-  every output's capture access on a live system mid-session, with nothing in
-  the log to show for it.
-
-### Fixed
-
-- `hermes-kmsctl` no longer ignores arguments a command does not take. Options
-  have to precede the command, so `hold 1280x720@60 --session-file X` held an
-  output and published nothing, with no sign the flag had been dropped.
-
-- The packaged seat broker could not start at all. Its launcher guarded against
-  a direct host-namespace invocation by comparing `/proc/self/ns/mnt` with
-  `/proc/1/ns/mnt`, and reading another process's namespace link needs
-  `PTRACE_MODE_READ` and therefore `CAP_SYS_PTRACE` — which the unit
-  deliberately does not grant, so the check rejected the very service it was
-  written for. The launcher now creates its own private mount namespace instead
-  of verifying one, which removes the check, the capability requirement and the
-  failure together, and makes a direct root invocation safe rather than merely
-  refused.
-
-- The private-seat udev rule no longer has its `TAG-="uaccess"` silently undone.
-  systemd's `70-uaccess.rules` adds `TAG+="uaccess"` to every DRM card and sorts
-  after any `70-hermes-*` name, so the removal never survived to
-  `73-seat-late.rules`, which is what runs the uaccess builtin. The file is now
-  `72-hermes-kms-session-seats.rules`, between the two. `make
-  install-runtime-udev` removes the stale `70-` copy from earlier installs.
-- `scripts/hermes-export-stress.c` no longer counts `-ESTALE` as a failure.
-  `ESTALE` is the documented answer when a flip lands between latching frame
-  metadata and installing the fds, and the consumer is expected to retry, which
-  the harness already did. Counting it made a healthy run report roughly twenty
-  failures out of eight million acquires, so the stress test always failed and
-  carried no signal. Stale retries are now reported separately.
-
-### Added
-
 - `hermes-kmsctl hold --control PATH` creates a private FIFO and reads `rotate`
   and `revoke` from it, which is the only way the command line can reach those
   operations: the owner's authorization is the descriptor that claimed the
@@ -213,6 +158,15 @@ subject to change between minor releases.
 
 ### Changed
 
+- The seat broker unit gains `SystemCallFilter=@system-service @mount` and
+  `ProcSubset=pid`, and narrows `RestrictNamespaces` from `yes` to `mnt` for the
+  launcher's own unshare.
+
+- `insecure_legacy_unbound_access` is load-time only (`0444`) instead of
+  runtime-writable, and logs a warning when set. At `0600` root could widen
+  every output's capture access on a live system mid-session, with nothing in
+  the log to show for it.
+
 - The default `make` target builds only the kernel module. Developers can use
   `make full` to opt into diagnostic tools and their libdrm/VAAPI/GBM/EGL/GL
   dependencies.
@@ -236,15 +190,45 @@ subject to change between minor releases.
 - Private broker sockets can be owned directly by the configured Hermes user,
   removing the logout/login and supplementary `seat` group requirement.
 
-### Validated
-
-- Public UAPI sizes, alignment-sensitive offsets, and encoded ioctl values are
-  identical for newly compiled x86-64 and i386 clients under UAPI v11,
-  including the cursor acquire and dual-stream wait structures.
-- The existing UAPI v7, multi-output, explicit `devices=N`, simultaneous DRM
-  master, DMA-BUF, and two-Weston VM regressions still pass under UAPI v10.
-
 ### Fixed
+
+- An upgrade no longer leaves a working module reporting itself as unusable
+  without saying why. Render nodes are denied by default and granted by the
+  `90-` rule `hermes-kms-setup` writes; no card in the packaged pool sets
+  `hermes_kms_access_uid`, so nothing else reverses that deny. Until the setup
+  has run, the consumer logs `Couldn't open render node ... Permission denied`
+  and its panel reports Hermes-KMS as not enabled, which sends people to
+  modprobe a module that is already loaded. `post_install` always named the
+  configuration step; `post_upgrade` did not, which is exactly where somebody
+  who reinstalled, or who never ran it, ends up. It now says so, and only when
+  the rule is actually missing.
+
+- `hermes-kmsctl` no longer ignores arguments a command does not take. Options
+  have to precede the command, so `hold 1280x720@60 --session-file X` held an
+  output and published nothing, with no sign the flag had been dropped.
+
+- The packaged seat broker could not start at all. Its launcher guarded against
+  a direct host-namespace invocation by comparing `/proc/self/ns/mnt` with
+  `/proc/1/ns/mnt`, and reading another process's namespace link needs
+  `PTRACE_MODE_READ` and therefore `CAP_SYS_PTRACE` — which the unit
+  deliberately does not grant, so the check rejected the very service it was
+  written for. The launcher now creates its own private mount namespace instead
+  of verifying one, which removes the check, the capability requirement and the
+  failure together, and makes a direct root invocation safe rather than merely
+  refused.
+
+- The private-seat udev rule no longer has its `TAG-="uaccess"` silently undone.
+  systemd's `70-uaccess.rules` adds `TAG+="uaccess"` to every DRM card and sorts
+  after any `70-hermes-*` name, so the removal never survived to
+  `73-seat-late.rules`, which is what runs the uaccess builtin. The file is now
+  `72-hermes-kms-session-seats.rules`, between the two. `make
+  install-runtime-udev` removes the stale `70-` copy from earlier installs.
+- `scripts/hermes-export-stress.c` no longer counts `-ESTALE` as a failure.
+  `ESTALE` is the documented answer when a flip lands between latching frame
+  metadata and installing the fds, and the consumer is expected to retry, which
+  the harness already did. Counting it made a healthy run report roughly twenty
+  failures out of eight million acquires, so the stress test always failed and
+  carried no signal. Stale retries are now reported separately.
 
 - GNOME/Mutter can now use the Hermes cursor plane. The driver no longer sets
   `DRIVER_CURSOR_HOTSPOT`, whose opt-in client capability caused the DRM core to
@@ -279,6 +263,36 @@ subject to change between minor releases.
 - Public structs now use explicitly aligned 64-bit fields and `GET_STATUS`
   replaces LP64-only implicit padding with a named reserved word. Newly compiled
   32-bit and 64-bit userspace therefore uses the same ioctl encodings.
+
+### Validated
+
+- Public UAPI sizes, alignment-sensitive offsets, and encoded ioctl values are
+  identical for newly compiled x86-64 and i386 clients under UAPI v11,
+  including the cursor acquire and dual-stream wait structures.
+- The existing UAPI v7, multi-output, explicit `devices=N`, simultaneous DRM
+  master, DMA-BUF, and two-Weston VM regressions still pass under UAPI v10.
+- The synthetic EDID is decoded by a real parser, not only by its own test.
+  `make check-edid-conformity` runs `edid-decode` over the same bytes
+  `tests/edid.c` generates, for all four configurations (base, `color_depth=10`,
+  `hdr_enable=1`, and both together), and compares the `--check` findings
+  against `tests/edid-conformity.expected`. The EDID does not pass `--check`
+  clean and `docs/driver-design.md` records why; what this pins is that the set
+  of findings cannot grow silently. Rule coverage varies between `edid-decode`
+  releases, so only the recording version compares the full set — every other
+  version still enforces that the parser decodes the blocks, that neither
+  checksum is wrong, and that the findings HDR adds are the expected ones. The
+  check SKIPs when `edid-decode` is absent, so it is safe in `make check` on
+  machines and CI images without v4l-utils.
+- `scripts/vm-hdr-test.sh` validates the HDR advertisement headlessly, with no
+  GPU and no compositor: that the module loads with `hdr_enable=1` at all (the
+  property-attach helper changed return type between 7.1 and 7.2), that the
+  published EDID is 128 bytes disabled and 256 enabled, and that `Colorspace`
+  and `HDR_OUTPUT_METADATA` appear on the connector only when enabled.
+
+## [0.3.2] - 2026-08-22
+
+### Fixed
+
 - The module builds again on Linux 7.2. That release renamed
   `struct drm_atomic_state` to `struct drm_atomic_commit` — the object was
   always one commit's worth of state, never the device's entire state — and
@@ -517,6 +531,8 @@ the warning at the bottom of this entry.
 > your graphics session. Do not run it on a machine where you cannot tolerate
 > an unstable display stack, and please report issues you hit.
 
+[0.3.2]: https://github.com/MrOz59/Hermes-KMS/releases/tag/v0.3.2
+[0.3.1]: https://github.com/MrOz59/Hermes-KMS/releases/tag/v0.3.1
 [0.3.0]: https://github.com/MrOz59/Hermes-KMS/releases/tag/v0.3.0
 [0.2.0]: https://github.com/MrOz59/Hermes-KMS/releases/tag/v0.2.0
 [0.1.2]: https://github.com/MrOz59/Hermes-KMS/releases/tag/v0.1.2

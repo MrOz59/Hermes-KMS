@@ -60,14 +60,14 @@ typedef uint64_t u64;
  * extension carries both data blocks. Tag 0x02 marks a CTA extension; the DTD
  * offset says "no detailed timings" and points past the data block collection.
  *
- * The DTD offset equals 4 (the CTA header) plus the byte length of the data
- * block collection: an HDR Static Metadata block (4 bytes) followed by a
- * Colorimetry block (4 bytes) gives 4 + 8 = 12. With no detailed timings, this
- * also marks where the zero padding begins.
+ * With a native 1080p60 DTD, the DTD offset equals 4 (the CTA header) plus
+ * a 3-byte Video Data Block, 3-byte VCDB, 4-byte HDR Static Metadata block
+ * and 4-byte Colorimetry block: 18. Other preferred timings omit VIC 16 and
+ * use a 17-byte offset.
  */
 #define HERMES_KMS_CTA_TAG		0x02	/* extension block[0] */
 #define HERMES_KMS_CTA_REVISION		0x03	/* extension block[1] */
-#define HERMES_KMS_CTA_DTD_OFFSET	0x0c	/* extension block[2]: 4 + 8-byte collection */
+#define HERMES_KMS_CTA_DTD_OFFSET	0x12	/* extension block[2]: 4 + 14-byte collection */
 
 /*
  * The HDR Static Metadata Data Block is a CTA "use extended tag" data block:
@@ -116,17 +116,25 @@ typedef uint64_t u64;
 #define HERMES_KMS_EDID_MAX_HFREQ_KHZ (2 * HERMES_KMS_EDID_MAX_RATE_FIELD)
 #define HERMES_KMS_EDID_MAX_VFREQ_HZ (2 * HERMES_KMS_EDID_MAX_RATE_FIELD)
 
-/* Physical size the EDID's millimetre fields can express. */
-#define HERMES_KMS_EDID_MAX_SIZE_MM 4095
+/* Largest physical size both the centimetre and DTD fields can express. */
+#define HERMES_KMS_EDID_MAX_SIZE_MM 2550
 
 struct hermes_kms_edid_config {
+	u32 min_width;
+	u32 min_height;
 	u32 max_width;
 	u32 max_height;
 	u32 max_refresh_hz;
+	u32 preferred_width;
+	u32 preferred_height;
+	u32 preferred_refresh_hz;
 	u32 physical_width_mm;
 	u32 physical_height_mm;
 	/* Bits per primary colour channel; 0 leaves the depth undefined. */
 	u32 color_depth;
+	/* Optional three-letter EISA ID and printable monitor name (max 12). */
+	char manufacturer[4];
+	char monitor_name[14];
 };
 
 /*
@@ -173,7 +181,7 @@ static inline u8 hermes_kms_edid_depth_field(u32 color_depth)
 static const u8 hermes_kms_edid_template[HERMES_KMS_EDID_SIZE] = {
 	0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x22, 0x4d, 0x01, 0x00,
 	0x01, 0x00, 0x00, 0x00, 0x01, 0x22, 0x01, 0x04, 0xa0, 0x00, 0x00, 0x78,
-	0x03, 0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54, 0x00,
+		0x07, 0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54, 0x00,
 	0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
 	0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3a, 0x80, 0x18, 0x71, 0x38,
 	0x2d, 0x40, 0x58, 0x2c, 0x45, 0x00, 0x13, 0x2b, 0x21, 0x00, 0x00, 0x1e,
@@ -183,6 +191,97 @@ static const u8 hermes_kms_edid_template[HERMES_KMS_EDID_SIZE] = {
 	0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
+
+static inline bool hermes_kms_edid_mode_supported(
+	const struct hermes_kms_edid_config *config, u32 width, u32 height,
+	u32 refresh_hz)
+{
+	return width >= config->min_width && width <= config->max_width &&
+	       height >= config->min_height && height <= config->max_height &&
+	       refresh_hz && refresh_hz <= config->max_refresh_hz;
+}
+
+/* Encode a valid fallback timing for profiles that cannot use 1080p60. */
+static inline u32 hermes_kms_edid_hblank(u32 width)
+{
+	u32 blank = ((width / 5 + 7) / 8) * 8;
+
+	return blank < 160 ? 160 : blank;
+}
+
+static inline bool hermes_kms_edid_write_dtd(u8 *dtd, u32 width, u32 height,
+					      u32 refresh_hz)
+{
+	u32 hblank, vblank = 45, hfront, hsync;
+	u64 clock_10khz;
+
+	if (!width || !height || width > 4095 || height > 4095 || !refresh_hz)
+		return false;
+	hblank = hermes_kms_edid_hblank(width);
+	hfront = hblank / 3;
+	hsync = hblank / 3;
+	clock_10khz = ((u64)(width + hblank) * (height + vblank) *
+			 refresh_hz + 5000) / 10000;
+	if (clock_10khz < 1000 || clock_10khz > 65535)
+		return false;
+
+	memset(dtd, 0, 18);
+	dtd[0] = (u8)clock_10khz;
+	dtd[1] = (u8)(clock_10khz >> 8);
+	dtd[2] = (u8)width;
+	dtd[3] = (u8)hblank;
+	dtd[4] = (u8)(((width >> 8) << 4) | (hblank >> 8));
+	dtd[5] = (u8)height;
+	dtd[6] = (u8)vblank;
+	dtd[7] = (u8)(((height >> 8) << 4) | (vblank >> 8));
+	dtd[8] = (u8)hfront;
+	dtd[9] = (u8)hsync;
+	dtd[10] = 0x35; /* vertical front porch 3, sync pulse 5 */
+	dtd[11] = (u8)(((hfront >> 8) << 6) | ((hsync >> 8) << 4));
+	dtd[17] = 0x1e; /* non-interlaced, separate positive sync */
+	return true;
+}
+
+static inline void hermes_kms_edid_set_preferred_timing(
+	u8 *edid, const struct hermes_kms_edid_config *config)
+{
+	u32 width = config->preferred_width;
+	u32 height = config->preferred_height;
+	u32 refresh_hz = config->preferred_refresh_hz;
+	u8 *dtd = &edid[HERMES_KMS_EDID_DTD_OFFSET];
+
+	if (hermes_kms_edid_mode_supported(config, width, height, refresh_hz) &&
+	    width == 1920 && height == 1080 && refresh_hz == 60)
+		return; /* preserve the standard CTA timing in the template */
+	if (hermes_kms_edid_mode_supported(config, width, height, refresh_hz) &&
+	    hermes_kms_edid_write_dtd(dtd, width, height, refresh_hz))
+		return;
+	if (hermes_kms_edid_mode_supported(config, 1920, 1080, 60))
+		return;
+
+	width = config->max_width < 4095 ? config->max_width : 4095;
+	height = config->max_height < 4095 ? config->max_height : 4095;
+	if (width >= config->min_width && height >= config->min_height) {
+		u64 pixels = (u64)(width + hermes_kms_edid_hblank(width)) *
+			     (height + 45);
+		u32 min_refresh = (u32)((10000000 + pixels - 1) / pixels);
+		u32 max_refresh = (u32)(655350000 / pixels);
+
+		refresh_hz = config->max_refresh_hz < 60 ?
+			config->max_refresh_hz : 60;
+		if (refresh_hz < min_refresh)
+			refresh_hz = min_refresh;
+		if (refresh_hz > max_refresh)
+			refresh_hz = max_refresh;
+		if (refresh_hz <= config->max_refresh_hz &&
+		    hermes_kms_edid_write_dtd(dtd, width, height, refresh_hz))
+			return;
+	}
+
+	/* EDID DTDs cannot encode every legal KMS mode (e.g. 8K-only cards). */
+	memcpy(dtd, &hermes_kms_edid_template[108], 18);
+	edid[24] &= (u8)~0x02; /* no preferred detailed timing */
+}
 
 /*
  * Rebuild the display range limits descriptor so it covers everything the
@@ -290,6 +389,32 @@ hermes_kms_build_edid(u8 *edid, u32 serial,
 	unsigned int i;
 
 	memcpy(edid, hermes_kms_edid_template, HERMES_KMS_EDID_SIZE);
+	hermes_kms_edid_set_preferred_timing(edid, config);
+	/* Avoid claiming a physical size in the DTD when none was configured. */
+	edid[HERMES_KMS_EDID_DTD_OFFSET + 12] = 0;
+	edid[HERMES_KMS_EDID_DTD_OFFSET + 13] = 0;
+	edid[HERMES_KMS_EDID_DTD_OFFSET + 14] = 0;
+	/* Advertise VGA only when the card can actually scan it out. */
+	if (hermes_kms_edid_mode_supported(config, 640, 480, 60))
+		edid[35] |= 0x20;
+	if (config->manufacturer[0]) {
+		u32 code = ((u32)(config->manufacturer[0] - 'A' + 1) << 10) |
+			   ((u32)(config->manufacturer[1] - 'A' + 1) << 5) |
+			   (u32)(config->manufacturer[2] - 'A' + 1);
+
+		edid[8] = code >> 8;
+		edid[9] = code & 0xff;
+	}
+	if (config->monitor_name[0]) {
+		unsigned int n = 0;
+
+		memset(&edid[77], ' ', 13);
+		while (n < 12 && config->monitor_name[n]) {
+			edid[77 + n] = config->monitor_name[n];
+			n++;
+		}
+		edid[77 + n] = '\n';
+	}
 
 	edid[HERMES_KMS_EDID_SERIAL_OFFSET + 0] = serial & 0xff;
 	edid[HERMES_KMS_EDID_SERIAL_OFFSET + 1] = (serial >> 8) & 0xff;
@@ -298,6 +423,27 @@ hermes_kms_build_edid(u8 *edid, u32 serial,
 
 	representable = hermes_kms_fill_edid_range(
 		&edid[HERMES_KMS_EDID_RANGE_OFFSET], config);
+	if (edid[HERMES_KMS_EDID_DTD_OFFSET] ||
+	    edid[HERMES_KMS_EDID_DTD_OFFSET + 1]) {
+		const u8 *dtd = &edid[HERMES_KMS_EDID_DTD_OFFSET];
+		u8 *range = &edid[HERMES_KMS_EDID_RANGE_OFFSET];
+		u32 htotal = dtd[2] | ((dtd[4] & 0xf0) << 4);
+		u32 hfreq_khz;
+		u32 encoded_max = range[8] +
+			((range[4] & HERMES_KMS_EDID_OFFSET_MAX_HFREQ) ? 255 : 0);
+
+		htotal += dtd[3] | ((dtd[4] & 0x0f) << 8);
+		hfreq_khz = ((u32)(dtd[0] | (dtd[1] << 8)) * 10 +
+			      htotal - 1) / htotal;
+		if (hfreq_khz > encoded_max &&
+		    hfreq_khz <= HERMES_KMS_EDID_MAX_HFREQ_KHZ) {
+			if (hfreq_khz > 255) {
+				range[4] |= HERMES_KMS_EDID_OFFSET_MAX_HFREQ;
+				hfreq_khz -= 255;
+			}
+			range[8] = (u8)hfreq_khz;
+		}
+	}
 
 	/* Digital input, interface undefined; only the depth field varies. */
 	edid[HERMES_KMS_EDID_VIDEO_INPUT_OFFSET] =
@@ -323,10 +469,14 @@ hermes_kms_build_edid(u8 *edid, u32 serial,
 
 		edid[HERMES_KMS_EDID_SIZE_CM_OFFSET + 0] = (u8)width_cm;
 		edid[HERMES_KMS_EDID_SIZE_CM_OFFSET + 1] = (u8)height_cm;
-		edid[HERMES_KMS_EDID_DTD_OFFSET + 12] = width_mm & 0xff;
-		edid[HERMES_KMS_EDID_DTD_OFFSET + 13] = height_mm & 0xff;
-		edid[HERMES_KMS_EDID_DTD_OFFSET + 14] =
-			(u8)(((width_mm >> 8) << 4) | ((height_mm >> 8) & 0x0f));
+		if (edid[HERMES_KMS_EDID_DTD_OFFSET] ||
+		    edid[HERMES_KMS_EDID_DTD_OFFSET + 1]) {
+			edid[HERMES_KMS_EDID_DTD_OFFSET + 12] = width_mm & 0xff;
+			edid[HERMES_KMS_EDID_DTD_OFFSET + 13] = height_mm & 0xff;
+			edid[HERMES_KMS_EDID_DTD_OFFSET + 14] =
+				(u8)(((width_mm >> 8) << 4) |
+				     ((height_mm >> 8) & 0x0f));
+		}
 	}
 
 	for (i = 0; i < HERMES_KMS_EDID_CHECKSUM_OFFSET; i++)
@@ -346,11 +496,10 @@ hermes_kms_build_edid(u8 *edid, u32 serial,
  * a prerequisite it requires before it will enable HDR at all -- additionally
  * needs edid()->supportsBT2020() to return true, which comes from a BT2020
  * Colorimetry Data Block, working alongside the connector's Colorspace
- * property. So this block carries two data blocks back to back: the HDR
- * Static Metadata block then the Colorimetry block. The CTA header advertises
- * no native video formats and a DTD offset of 12, which spans the CTA header
- * plus both 4-byte data blocks; everything after byte 12 is zero padding to
- * the checksum.
+ * property. The extension carries baseline VIC 1 and a VCDB for selectable
+ * RGB quantization. VIC 16 is included when the base DTD is the template's
+ * 1080p60 timing. The CTA header declares underscan and the corresponding
+ * DTD offset, followed by zero padding.
  *
  * The EOTF byte is written from a single combined constant that always sets
  * the traditional-SDR-gamma bit together with the SMPTE ST2084 (PQ) bit, so
@@ -360,48 +509,66 @@ hermes_kms_build_edid(u8 *edid, u32 serial,
  * chosen so all 128 bytes sum to 0 mod 256, matching the base block's own
  * checksum rule; without it the block is silently dropped by EDID parsers.
  */
-static inline void hermes_kms_build_edid_hdr_extension(u8 *block)
+static inline void hermes_kms_build_edid_hdr_extension_for_mode(
+	u8 *block, bool include_vic16)
 {
 	u8 checksum = 0;
-	unsigned int i;
+	unsigned int i, at;
 
 	/* CTA-861 extension header. */
 	block[0] = HERMES_KMS_CTA_TAG;
 	block[1] = HERMES_KMS_CTA_REVISION;
-	block[2] = HERMES_KMS_CTA_DTD_OFFSET;
-	block[3] = 0x00; /* no native formats, no flags */
+	block[3] = 0x80; /* IT video formats are underscanned by default */
+
+	/* VIC 16 is present only when the base DTD really is 1080p60. */
+	block[4] = include_vic16 ? 0x42 : 0x41;
+	at = 5;
+	if (include_vic16)
+		block[at++] = 0x90;
+	block[at++] = 0x01; /* required baseline 640x480p60 */
+
+	/* RGB quantization range is selectable (VCDB, extended tag 0). */
+	block[at++] = 0xe2;
+	block[at++] = 0x00;
+	block[at++] = 0x4a; /* selectable RGB; IT/CE formats underscanned */
 
 	/*
-	 * HDR Static Metadata Data Block (bytes 4..7): a use-extended-tag data
+	 * HDR Static Metadata Data Block: a use-extended-tag data
 	 * block whose tag/length byte selects the extended-tag type (top three
 	 * bits 0x07) and declares three payload bytes following it, the
 	 * extended tag identifies it as HDR Static Metadata (0x06), the EOTF
 	 * byte offers SDR gamma and ST2084/PQ together, and the descriptor byte
 	 * declares Static Metadata Descriptor Type 1.
 	 */
-	block[4] = (u8)((HERMES_KMS_CTA_TAG_EXTENDED << 5) | 3);
-	block[5] = HERMES_KMS_CTA_EXT_TAG_HDR_SM;
-	block[6] = HERMES_KMS_HDR_EOTF_SDR_GAMMA | HERMES_KMS_HDR_EOTF_ST2084_PQ;
-	block[7] = HERMES_KMS_HDR_SM_TYPE1;
+	block[at++] = (u8)((HERMES_KMS_CTA_TAG_EXTENDED << 5) | 3);
+	block[at++] = HERMES_KMS_CTA_EXT_TAG_HDR_SM;
+	block[at++] = HERMES_KMS_HDR_EOTF_SDR_GAMMA | HERMES_KMS_HDR_EOTF_ST2084_PQ;
+	block[at++] = HERMES_KMS_HDR_SM_TYPE1;
 
 	/*
-	 * Colorimetry Data Block (bytes 8..11): another use-extended-tag data
+	 * Colorimetry Data Block: another use-extended-tag data
 	 * block with three payload bytes; the extended tag identifies it as
 	 * Colorimetry (0x05), the colorimetry byte sets only the BT2020 RGB bit,
 	 * and the final gamut-metadata byte sets no bits.
 	 */
-	block[8] = (u8)((HERMES_KMS_CTA_TAG_EXTENDED << 5) | 3);
-	block[9] = HERMES_KMS_CTA_EXT_TAG_COLORIMETRY;
-	block[10] = HERMES_KMS_COLORIMETRY_BT2020_RGB;
-	block[11] = 0x00; /* no gamut-metadata bits */
+	block[at++] = (u8)((HERMES_KMS_CTA_TAG_EXTENDED << 5) | 3);
+	block[at++] = HERMES_KMS_CTA_EXT_TAG_COLORIMETRY;
+	block[at++] = HERMES_KMS_COLORIMETRY_BT2020_RGB;
+	block[at++] = 0x00; /* no gamut-metadata bits */
+	block[2] = (u8)at;
 
 	/* Zero the padding region up to the checksum byte. */
-	for (i = HERMES_KMS_CTA_DTD_OFFSET; i < HERMES_KMS_EDID_CHECKSUM_OFFSET; i++)
+	for (i = at; i < HERMES_KMS_EDID_CHECKSUM_OFFSET; i++)
 		block[i] = 0x00;
 
 	for (i = 0; i < HERMES_KMS_EDID_CHECKSUM_OFFSET; i++)
 		checksum += block[i];
 	block[HERMES_KMS_EDID_CHECKSUM_OFFSET] = (u8)-checksum;
+}
+
+static inline void hermes_kms_build_edid_hdr_extension(u8 *block)
+{
+	hermes_kms_build_edid_hdr_extension_for_mode(block, true);
 }
 
 /*
@@ -442,7 +609,11 @@ static inline bool hermes_kms_append_hdr_extension(u8 *edid)
 		sum += edid[i];
 	edid[HERMES_KMS_EDID_CHECKSUM_OFFSET] = (u8)-sum;
 
-	hermes_kms_build_edid_hdr_extension(&edid[HERMES_KMS_EDID_SIZE]);
+	hermes_kms_build_edid_hdr_extension_for_mode(
+		&edid[HERMES_KMS_EDID_SIZE],
+		memcmp(&edid[HERMES_KMS_EDID_DTD_OFFSET],
+		       &hermes_kms_edid_template[HERMES_KMS_EDID_DTD_OFFSET],
+		       12) == 0);
 
 	return true;
 }

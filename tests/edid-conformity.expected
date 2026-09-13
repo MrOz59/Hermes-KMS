@@ -7,26 +7,20 @@
 # Recorded with: edid-decode 1.32.0
 
 ### base-defaults (128 bytes)
-failure|Block 0, Base EDID|Basic Display Parameters & Features: The chromaticities match sRGB, but sRGB is not signaled.
-failure|EDID|Base EDID: The DTD max image size is 531x299mm, but the display size is not specified anywhere.
 warning|Block 0, Base EDID|Vendor & Product Identification: The serial number is one of the known dummy values, it should probably be set to 0.
 ### base-ten-bit (128 bytes)
-failure|Block 0, Base EDID|Basic Display Parameters & Features: The chromaticities match sRGB, but sRGB is not signaled.
-failure|EDID|Base EDID: The DTD max image size is 531x299mm, but the display size is not specified anywhere.
+warning|Block 0, Base EDID|Vendor & Product Identification: The serial number is one of the known dummy values, it should probably be set to 0.
+### generic (128 bytes)
+### profile-720p (128 bytes)
 warning|Block 0, Base EDID|Vendor & Product Identification: The serial number is one of the known dummy values, it should probably be set to 0.
 ### hdr-eight-bit (256 bytes)
-failure|Block 0, Base EDID|Basic Display Parameters & Features: The chromaticities match sRGB, but sRGB is not signaled.
-failure|Block 1, CTA-861 Extension Block|Missing VCDB, needed for Set Selectable RGB Quantization to avoid interop issues.
-failure|Block 1, CTA-861 Extension Block|Required 640x480p60 timings are missing in the established timings and the SVD list (VIC 1).
-failure|EDID|Base EDID: The DTD max image size is 531x299mm, but the display size is not specified anywhere.
-warning|Block 0, Base EDID|Detailed Timing Descriptor #1: DTD is identical to VIC 16, which is not present in the CTA Ext Block.
 warning|Block 0, Base EDID|Vendor & Product Identification: The serial number is one of the known dummy values, it should probably be set to 0.
-warning|Block 1, CTA-861 Extension Block|IT Video Formats are overscanned by default, but normally this should be underscanned.
+warning|Block 1, CTA-861 Extension Block|Video Data Block: For improved preferred timing interoperability, set 'Native detailed modes' to 1.
 ### hdr-ten-bit (256 bytes)
-failure|Block 0, Base EDID|Basic Display Parameters & Features: The chromaticities match sRGB, but sRGB is not signaled.
-failure|Block 1, CTA-861 Extension Block|Missing VCDB, needed for Set Selectable RGB Quantization to avoid interop issues.
-failure|Block 1, CTA-861 Extension Block|Required 640x480p60 timings are missing in the established timings and the SVD list (VIC 1).
-failure|EDID|Base EDID: The DTD max image size is 531x299mm, but the display size is not specified anywhere.
-warning|Block 0, Base EDID|Detailed Timing Descriptor #1: DTD is identical to VIC 16, which is not present in the CTA Ext Block.
 warning|Block 0, Base EDID|Vendor & Product Identification: The serial number is one of the known dummy values, it should probably be set to 0.
-warning|Block 1, CTA-861 Extension Block|IT Video Formats are overscanned by default, but normally this should be underscanned.
+warning|Block 1, CTA-861 Extension Block|Video Data Block: For improved preferred timing interoperability, set 'Native detailed modes' to 1.
+### generic-hdr (256 bytes)
+warning|Block 1, CTA-861 Extension Block|Video Data Block: For improved preferred timing interoperability, set 'Native detailed modes' to 1.
+### profile-720p-hdr (256 bytes)
+warning|Block 0, Base EDID|Vendor & Product Identification: The serial number is one of the known dummy values, it should probably be set to 0.
+warning|Block 1, CTA-861 Extension Block|Video Data Block: VIC 1 and the first DTD are not identical. Is this intended?
