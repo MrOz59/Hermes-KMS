@@ -28,6 +28,7 @@
 #include <linux/fdtable.h>
 #include <linux/fcntl.h>
 #include <linux/file.h>
+#include <linux/hrtimer.h>
 #include <linux/random.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -67,7 +68,9 @@
 #include <drm/drm_print.h>
 #include <drm/drm_prime.h>
 #include <drm/drm_vblank.h>
+#if HERMES_KMS_HAVE_DRM_VBLANK_TIMER
 #include <drm/drm_vblank_helper.h>
+#endif
 
 /*
  * Linux 7.2 renamed struct drm_atomic_state to struct drm_atomic_commit -- the
@@ -415,6 +418,11 @@ struct hermes_kms_output {
 	atomic64_t vblank_count;	   /* vblanks the software timer has fired */
 	atomic64_t vblank_overrun_count;  /* timer ticks that fell behind */
 	u64 last_vblank_callback_ns;
+#if !HERMES_KMS_HAVE_DRM_VBLANK_TIMER
+	struct hrtimer vblank_timer;
+	ktime_t vblank_period;
+	bool vblank_timer_enabled;
+#endif
 	u64 acquire_count;
 	u64 acquire_no_frame_count;
 	u64 dmabuf_export_count;
@@ -1366,6 +1374,7 @@ crtc_to_hermes_kms_output(struct drm_crtc *crtc)
 	return container_of(crtc, struct hermes_kms_output, crtc);
 }
 
+#if HERMES_KMS_HAVE_DRM_VBLANK_TIMER
 /*
  * The DRM core owns and cancels the hrtimer without waiting for its callback
  * under vblank_time_lock. This hook only augments the core timer with metrics.
@@ -1400,6 +1409,62 @@ static bool hermes_kms_handle_vblank_timeout(struct drm_crtc *crtc)
 
 	return handled;
 }
+#else
+/*
+ * Before the DRM-owned timer helpers, vblank callbacks were supplied by the
+ * driver. disable_vblank runs under vblank_time_lock, which the callback needs
+ * inside drm_crtc_handle_vblank(), so it must never wait for the callback.
+ * The final cancel at device removal runs outside that lock.
+ */
+static enum hrtimer_restart hermes_kms_vblank_timer(struct hrtimer *timer)
+{
+	struct hermes_kms_output *output =
+		container_of(timer, struct hermes_kms_output, vblank_timer);
+	u64 periods;
+	bool handled;
+
+	if (!READ_ONCE(output->vblank_timer_enabled))
+		return HRTIMER_NORESTART;
+
+	periods = hrtimer_forward_now(timer, output->vblank_period);
+	if (periods > 1)
+		atomic64_add(periods - 1, &output->vblank_overrun_count);
+	WRITE_ONCE(output->last_vblank_callback_ns, ktime_get_ns());
+	atomic64_inc(&output->vblank_count);
+
+	handled = drm_crtc_handle_vblank(&output->crtc);
+	if (!handled && READ_ONCE(output->vblank_timer_enabled))
+		drm_err_ratelimited(&output->hdev->drm,
+				    "%s failure handling vblank\n",
+				    output->output_name);
+
+	return READ_ONCE(output->vblank_timer_enabled) ?
+		HRTIMER_RESTART : HRTIMER_NORESTART;
+}
+
+static int hermes_kms_enable_vblank(struct drm_crtc *crtc)
+{
+	struct hermes_kms_output *output = crtc_to_hermes_kms_output(crtc);
+	int period_ns = crtc->dev->vblank[drm_crtc_index(crtc)].framedur_ns;
+
+	if (period_ns <= 0)
+		return -EINVAL;
+
+	output->vblank_period = ns_to_ktime(period_ns);
+	WRITE_ONCE(output->vblank_timer_enabled, true);
+	hrtimer_start(&output->vblank_timer, output->vblank_period,
+		      HRTIMER_MODE_REL);
+	return 0;
+}
+
+static void hermes_kms_disable_vblank(struct drm_crtc *crtc)
+{
+	struct hermes_kms_output *output = crtc_to_hermes_kms_output(crtc);
+
+	WRITE_ONCE(output->vblank_timer_enabled, false);
+	hrtimer_try_to_cancel(&output->vblank_timer);
+}
+#endif
 
 static const struct drm_crtc_funcs hermes_kms_crtc_funcs = {
 	.set_config = drm_atomic_helper_set_config,
@@ -1407,7 +1472,12 @@ static const struct drm_crtc_funcs hermes_kms_crtc_funcs = {
 	.reset = drm_atomic_helper_crtc_reset,
 	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
+#if HERMES_KMS_HAVE_DRM_VBLANK_TIMER
 	DRM_CRTC_VBLANK_TIMER_FUNCS,
+#else
+	.enable_vblank = hermes_kms_enable_vblank,
+	.disable_vblank = hermes_kms_disable_vblank,
+#endif
 };
 
 static enum drm_mode_status
@@ -1560,7 +1630,9 @@ static const struct drm_crtc_helper_funcs hermes_kms_crtc_helper_funcs = {
 	.atomic_enable = hermes_kms_crtc_atomic_enable,
 	.atomic_disable = hermes_kms_crtc_atomic_disable,
 	.atomic_flush = hermes_kms_crtc_atomic_flush,
+#if HERMES_KMS_HAVE_DRM_VBLANK_TIMER
 	.handle_vblank_timeout = hermes_kms_handle_vblank_timeout,
+#endif
 };
 
 static enum drm_mode_status
@@ -3718,7 +3790,9 @@ static long hermes_kms_compat_ioctl(struct file *filp, unsigned int cmd,
 
 static const struct file_operations hermes_kms_fops = {
 	.owner = THIS_MODULE,
+#ifdef FOP_UNSIGNED_OFFSET
 	.fop_flags = FOP_UNSIGNED_OFFSET,
+#endif
 	.open = drm_open,
 	.release = drm_release,
 	.unlocked_ioctl = drm_ioctl,
@@ -3770,7 +3844,7 @@ static int hermes_kms_stats_show(struct seq_file *m, void *data)
 			   output->requested_width, output->requested_height,
 			   output->requested_refresh_hz);
 		seq_printf(m, "vblank_period_ns:      %d\n",
-			   READ_ONCE(drm_crtc_vblank_crtc(&output->crtc)->framedur_ns));
+			   READ_ONCE(drm->vblank[drm_crtc_index(&output->crtc)].framedur_ns));
 		seq_printf(m, "vblank_count:          %llu\n",
 			   (unsigned long long)atomic64_read(
 				   &output->vblank_count));
@@ -3934,7 +4008,11 @@ static const struct drm_driver hermes_kms_driver = {
 #endif
 	.ioctls = hermes_kms_ioctls,
 	.num_ioctls = ARRAY_SIZE(hermes_kms_ioctls),
+#if HERMES_KMS_HAVE_SHMEM_IMPORT_NO_MAP
 	.gem_prime_import = drm_gem_shmem_prime_import_no_map,
+#else
+	.gem_prime_import_sg_table = drm_gem_shmem_prime_import_sg_table,
+#endif
 	.dumb_create = hermes_kms_dumb_create,
 };
 
@@ -4323,6 +4401,11 @@ static int hermes_kms_probe(struct platform_device *pdev)
 		atomic64_set(&output->cursor_sequence, 0);
 		atomic64_set(&output->vblank_count, 0);
 		atomic64_set(&output->vblank_overrun_count, 0);
+#if !HERMES_KMS_HAVE_DRM_VBLANK_TIMER
+		hrtimer_init(&output->vblank_timer, CLOCK_MONOTONIC,
+			     HRTIMER_MODE_REL);
+		output->vblank_timer.function = hermes_kms_vblank_timer;
+#endif
 		ratelimit_state_init(&output->output_change_ratelimit,
 				     HERMES_KMS_OUTPUT_CHANGE_INTERVAL,
 				     HERMES_KMS_OUTPUT_CHANGE_BURST);
@@ -4430,6 +4513,13 @@ static void hermes_kms_remove(struct platform_device *pdev)
 	atomic_dec(&hermes_kms_live_devices);
 	drm_dev_unplug(&hdev->drm);
 	drm_atomic_helper_shutdown(&hdev->drm);
+#if !HERMES_KMS_HAVE_DRM_VBLANK_TIMER
+	/* Device removal may race the final callback after try_to_cancel(). */
+	for (i = 0; i < hdev->output_count; i++) {
+		WRITE_ONCE(hdev->outputs[i].vblank_timer_enabled, false);
+		hrtimer_cancel(&hdev->outputs[i].vblank_timer);
+	}
+#endif
 
 	for (i = 0; i < hdev->output_count; i++) {
 		struct hermes_kms_output *output = &hdev->outputs[i];
@@ -4464,7 +4554,11 @@ static void hermes_kms_remove(struct platform_device *pdev)
 
 static struct platform_driver hermes_kms_platform_driver = {
 	.probe = hermes_kms_probe,
+#if HERMES_KMS_HAVE_PLATFORM_REMOVE_VOID
 	.remove = hermes_kms_remove,
+#else
+	.remove_new = hermes_kms_remove,
+#endif
 	.driver = {
 		.name = HERMES_KMS_DRIVER_NAME,
 	},
@@ -5572,4 +5666,8 @@ module_exit(hermes_kms_exit);
 MODULE_AUTHOR("Hermes contributors");
 MODULE_DESCRIPTION(HERMES_KMS_DRIVER_DESC);
 MODULE_LICENSE("GPL");
+#if HERMES_KMS_MODULE_NS_STRINGIFY
+MODULE_IMPORT_NS(DMA_BUF);
+#else
 MODULE_IMPORT_NS("DMA_BUF");
+#endif
