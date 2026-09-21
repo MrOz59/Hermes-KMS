@@ -28,7 +28,7 @@
 	_Static_assert((unsigned long)(name) == (value), \
 		       "unexpected encoded ioctl value: " #name)
 
-_Static_assert(HERMES_KMS_UAPI_VERSION == 13,
+_Static_assert(HERMES_KMS_UAPI_VERSION == 14,
 	       "update the ABI test when intentionally changing the UAPI");
 
 /*
@@ -200,6 +200,15 @@ ASSERT_IOCTL(DRM_IOCTL_HERMES_KMS_ACQUIRE_CURSOR,
 ASSERT_IOCTL(DRM_IOCTL_HERMES_KMS_WAIT_UPDATE,
 	     DRM_HERMES_KMS_WAIT_UPDATE, _IOC_READ | _IOC_WRITE, 112,
 	     0xc070644bUL);
+
+ASSERT_SIZE(struct drm_hermes_kms_frame_color, 48);
+ASSERT_OFFSET(struct drm_hermes_kms_frame_color, hdr, 8);
+ASSERT_OFFSET(struct drm_hermes_kms_frame_color, reserved, 40);
+ASSERT_SIZE(struct drm_hermes_kms_acquire_frame2, 224);
+ASSERT_OFFSET(struct drm_hermes_kms_acquire_frame2, color, 176);
+ASSERT_IOCTL(DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME2,
+             DRM_HERMES_KMS_ACQUIRE_FRAME2, _IOC_READ | _IOC_WRITE, 224,
+             0xc0e0644cUL);
 
 int main(void)
 {

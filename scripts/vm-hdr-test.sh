@@ -25,6 +25,10 @@
 #      is present -- and both are absent with hdr_enable=0. Default is checked
 #      because the driver deliberately does not request it: the DRM helper ORs
 #      it in, and this is what proves that still holds.
+#   4. The colour state a compositor commits reaches the capture consumer:
+#      hermes-hdr-metadata-test performs the atomic commit itself and reads the
+#      metadata back through ACQUIRE_FRAME2, so the advertisement and the delivery
+#      are checked in the same run rather than one standing in for the other.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -260,6 +264,35 @@ LOADED_BY_TEST=0
 sleep 0.3
 check "module unloaded cleanly" "gone" \
 	"$([ -d /sys/module/hermes_kms ] && echo present || echo gone)"
+
+# ---------------------------------------------------------------------------
+# Per-frame colour metadata: commit HDR state with a ten-bit framebuffer the
+# way a compositor does and read it back through the capture UAPI. This is the
+# part advertisement cannot cover, so it runs the atomic commit itself.
+# ---------------------------------------------------------------------------
+printf '\n--- per-frame colour metadata (hdr_enable=1) ---\n'
+HDR_TOOL="$REPO/tools/hermes-hdr-metadata-test/hermes-hdr-metadata-test"
+if [ ! -x "$HDR_TOOL" ]; then
+	printf 'FAIL: %s is missing; build it with: make tools\n' "$HDR_TOOL" >&2
+	FAIL=1
+else
+	insmod "$KO" initial_enabled=1 hotplug_events=0 outputs=1 hdr_enable=1 color_depth=10
+	LOADED_BY_TEST=1
+	sleep 0.5
+	if timeout -k 1s 60s "$HDR_TOOL" > "$TEST_TMP/metadata.log" 2>&1; then
+		sed 's/^/    /' "$TEST_TMP/metadata.log"
+		printf 'ok: committed colour state reached ACQUIRE_FRAME2\n'
+	else
+		printf 'FAIL: hermes-hdr-metadata-test:\n' >&2
+		sed 's/^/    /' "$TEST_TMP/metadata.log" >&2
+		FAIL=1
+	fi
+	rmmod hermes_kms
+	LOADED_BY_TEST=0
+	sleep 0.3
+	check "module unloaded cleanly" "gone" \
+		"$([ -d /sys/module/hermes_kms ] && echo present || echo gone)"
+fi
 
 # ---------------------------------------------------------------------------
 # Nothing in the kernel log should have complained.
