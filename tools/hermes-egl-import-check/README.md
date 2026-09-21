@@ -84,6 +84,45 @@ the buffer; beyond that the GPU reads the wrong pages while the CPU view
 stripe corruption at larger modes. The Hermes NVIDIA fork therefore uses a
 CPU-copy capture path for NVENC sessions until this is resolved.
 
+### Narrowing it down
+
+2 MiB is also the size of a huge page, and whether the import works has so
+far depended on how contiguously the kernel happened to allocate the pages.
+Two experiments separate the possible causes. Each takes a minute on an
+NVIDIA machine; run them at a mode that shows the corruption, such as
+2560x1440.
+
+1. Without Hermes-KMS, with the udmabuf control in
+   `tools/hermes-sysmem-import-check`. `--verify` reads the whole import back
+   through the GPU, since the import itself has never failed:
+
+   ```sh
+   hermes-sysmem-import-check --verify 2560 1440            # scattered 4 KiB pages
+   hermes-sysmem-import-check --verify --thp 2560 1440      # 2 MiB transparent huge pages
+   sudo sh -c 'echo 16 > /proc/sys/vm/nr_hugepages'
+   hermes-sysmem-import-check --verify --hugetlb 2560 1440  # reserved 2 MiB pages
+   ```
+
+   - All PASS: NVIDIA imports plain system memory correctly, and the fault is
+     specific to what Hermes-KMS exports (how its scatter/gather table is
+     built, for instance).
+   - The first FAILs and the huge-page runs PASS: the importer only reads
+     physically contiguous 2 MiB runs correctly. Experiment 2 then shows
+     whether Hermes-KMS can provide them.
+   - All FAIL: no producer-side arrangement fixes it; it belongs in a report to
+     NVIDIA and the CPU copy stays.
+
+   A FAIL prints where the correct prefix ends and which page the GPU read
+   instead. On AMD (radeonsi) all three pass at 1440p and 4K.
+
+2. With Hermes-KMS itself: load the driver with `huge_gem=1` and repeat
+   `hermes-egl-import-check` and `pitch-detect` against a live output at the
+   same mode. `huge_gem` backs buffers with 2 MiB folios where memory allows,
+   on kernels that have `drm_gem_huge_mnt_create()`; dmesg says whether it
+   took effect. In a VM a 1440p buffer got seven 2 MiB folios (all but its
+   last partial block) and a 4K buffer fifteen, and the export-stress and HDR
+   capture tests pass with it.
+
 Related teardown finding: once CUDA/GL interop has touched the imported
 buffer in a process, the same driver segfaults when the last GPU-side
 reference to the import is released, regardless of teardown order

@@ -37,6 +37,13 @@ subject to change between minor releases.
   `huge_gem` makes those runs cover the buffer. It does not reduce CPU mapping
   faults: a DMA-BUF mapping is not 2 MiB aligned, so the kernel still maps it
   one 4 KiB page at a time.
+- `hermes-sysmem-import-check --verify` reads the whole imported buffer back
+  through the GPU instead of stopping at a successful `eglCreateImage`, and
+  reports where the correct prefix ends and which page was read instead.
+  `--thp` and `--hugetlb` back the buffer with 2 MiB pages, and `--gpu` picks
+  the render node, so the same control can tell whether an importer depends
+  on physical contiguity.
+
 - HDR advertisement from the virtual output, behind the new `hdr_enable` module
   parameter (default off, load-time only). A compositor needs several signals
   together before it treats an output as HDR-capable, so `hdr_enable` gates them
