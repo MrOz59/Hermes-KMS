@@ -28,6 +28,15 @@ subject to change between minor releases.
 
 ### Added
 
+- `huge_gem`, an experimental module parameter (default off, load-time only)
+  that backs dumb buffers with a `huge=within_size` tmpfs, so they come in
+  2 MiB folios where memory allows, on kernels that have
+  `drm_gem_huge_mnt_create()`. It exists to test the NVIDIA finding in
+  `tools/hermes-egl-import-check/README.md`: NVIDIA's EGL import of these
+  buffers samples correct pixels only for the first ~2 MiB contiguous run, and
+  `huge_gem` makes those runs cover the buffer. It does not reduce CPU mapping
+  faults: a DMA-BUF mapping is not 2 MiB aligned, so the kernel still maps it
+  one 4 KiB page at a time.
 - HDR advertisement from the virtual output, behind the new `hdr_enable` module
   parameter (default off, load-time only). A compositor needs several signals
   together before it treats an output as HDR-capable, so `hdr_enable` gates them

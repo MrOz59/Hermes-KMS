@@ -167,6 +167,17 @@ module_param(hotplug_events, bool, 0644);
 MODULE_PARM_DESC(hotplug_events, "Emit DRM hotplug events when output state changes");
 module_param(non_desktop, bool, 0444);
 MODULE_PARM_DESC(non_desktop, "Mark connector as non-desktop. Default false so compositors can manage Hermes as a normal virtual monitor when connected");
+/*
+ * Experimental, for the NVIDIA import investigation. NVIDIA's EGL import of
+ * these system-memory buffers has been seen to sample correct pixels only
+ * for the first ~2 MiB physically contiguous run. Backing GEM objects with a
+ * huge=within_size tmpfs gives them 2 MiB folios where memory allows, which
+ * tests whether that run length is what the importer depends on.
+ */
+static bool huge_gem;
+module_param(huge_gem, bool, 0444);
+MODULE_PARM_DESC(huge_gem,
+		 "EXPERIMENTAL: back buffers with 2 MiB folios where available, for testing importers that mishandle scattered pages. Needs a kernel with drm_gem_huge_mnt_create(). Default false");
 module_param(hdr_enable, bool, 0444);
 MODULE_PARM_DESC(hdr_enable,
 		 "Advertise HDR via a CTA-861 EDID extension (HDR Static Metadata + BT2020 Colorimetry data blocks) plus the HDR_OUTPUT_METADATA and Colorspace connector properties. Default false. Untested together with color_depth=10; validate that pairing before deployment");
@@ -4475,6 +4486,20 @@ static int hermes_kms_probe(struct platform_device *pdev)
 
 	drm = &hdev->drm;
 	platform_set_drvdata(pdev, hdev);
+	if (huge_gem) {
+#if HERMES_KMS_HAVE_GEM_HUGE_MNT
+		ret = drm_gem_huge_mnt_create(drm, "within_size");
+		if (ret)
+			drm_warn(drm, "huge_gem: could not create a huge tmpfs (%d), using regular pages\n",
+				 ret);
+		else if (!drm_gem_get_huge_mnt(drm))
+			drm_warn(drm, "huge_gem: transparent huge pages are unavailable, using regular pages\n");
+		else
+			drm_info(drm, "huge_gem: buffers are backed by 2 MiB folios where available\n");
+#else
+		drm_warn(drm, "huge_gem: this kernel has no drm_gem_huge_mnt_create(), using regular pages\n");
+#endif
+	}
 	hdev->device_index = pdev->id >= 0 ? pdev->id : 0;
 	if (config) {
 		hdev->display = config->display;

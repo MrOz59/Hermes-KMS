@@ -26,6 +26,14 @@ hermes-kms-shmem-import-no-map := $(shell grep -qs 'drm_gem_shmem_prime_import_n
 	$(hermes-kms-shmem-h) && echo 1 || echo 0)
 ccflags-y += -DHERMES_KMS_HAVE_SHMEM_IMPORT_NO_MAP=$(hermes-kms-shmem-import-no-map)
 
+# drm_gem_huge_mnt_create() lets a driver back its GEM objects with a
+# huge=within_size tmpfs, so their pages come in 2 MiB folios. Only newer
+# kernels have it; huge_gem is refused with a warning elsewhere.
+hermes-kms-drm-gem-h := $(srctree)/include/drm/drm_gem.h
+hermes-kms-gem-huge-mnt := $(shell grep -qs 'drm_gem_huge_mnt_create' \
+	$(hermes-kms-drm-gem-h) && echo 1 || echo 0)
+ccflags-y += -DHERMES_KMS_HAVE_GEM_HUGE_MNT=$(hermes-kms-gem-huge-mnt)
+
 # The platform .remove callback returned int before the void conversion.
 hermes-kms-platform-h := $(srctree)/include/linux/platform_device.h
 hermes-kms-platform-remove-void := $(shell grep -qFs 'void (*remove)(struct platform_device *);' \
