@@ -109,12 +109,10 @@ the output name prefix is `HERMES-` and the UAPI symbols are prefixed
 `HERMES_KMS_`.
 
 What is currently validated: VAAPI with `XRGB8888`, linear. NVENC/AMF and
-NV12/P010 are not validated yet — see the [Roadmap](#roadmap). HDR is
-*advertised* but not deliverable end to end: `hdr_enable=1` makes a compositor
-recognise the output as HDR-capable, but the capture UAPI carries no colour
-metadata, so a consumer cannot interpret an HDR frame correctly — see
-[HDR advertisement](#hdr-advertisement). Forks and contributions extending those
-paths are welcome under the project's license.
+NV12/P010 are not validated yet — see the [Roadmap](#roadmap). UAPI v14
+`ACQUIRE_FRAME2` provides frame-associated HDR colour metadata. HDR streaming
+still requires consumer integration and end-to-end validation — see
+[HDR capture](docs/hdr-capture.md).
 
 The kernel module is GPL-2.0, while the installed UAPI has the Linux syscall-note
 exception and the optional userspace session helper is MIT-licensed. This keeps
@@ -165,8 +163,8 @@ an independently developed consumer separate from the Hermes application; see
 - optional HDR *advertisement* (`hdr_enable=1`, default off), which adds a
   CTA-861 EDID extension (HDR Static Metadata + BT2020 Colorimetry data blocks)
   and the `HDR_OUTPUT_METADATA` and `Colorspace` connector properties as one
-  unit. Advertisement only — the capture UAPI carries no colour metadata, so
-  end-to-end HDR is incomplete; see [HDR advertisement](#hdr-advertisement);
+  unit. UAPI v14 adds frame-associated colour metadata through `ACQUIRE_FRAME2`;
+  see [HDR capture](docs/hdr-capture.md);
 - scanout modifier pass-through: any tiled or compressed layout the compositor's
   render GPU produces is accepted, and `scanout_modifiers=` publishes the extra
   layouts an `IN_FORMATS`-driven compositor can negotiate;
@@ -395,29 +393,13 @@ To apply it at every module load, drop a file in `/etc/modprobe.d`:
 options hermes_kms hdr_enable=1
 ```
 
-**This feature is incomplete.** `hdr_enable=1` advertises HDR capability to
-compositors. Hermes does not yet include colorspace, EOTF, or HDR metadata in its
-capture UAPI. Consumers relying only on that interface cannot determine the
-captured frame's colour encoding. End-to-end HDR streaming remains incomplete,
-including with `color_depth=10`.
-
-Concretely, that means:
-
-- `hdr_enable=1` only advertises support — it does not itself activate HDR.
-- If the compositor switches to PQ/BT.2020 and the consumer keeps interpreting
-  the frame as SDR, colours will be wrong. This applies to ten-bit frames too;
-  `color_depth=10` does not supply the missing signalling.
-- DRM does store the negotiated `Colorspace` and `HDR_OUTPUT_METADATA` on the
-  connector, and a consumer holding the primary KMS node can read them. That is
-  not reachable through the render node, and it does not associate the metadata
-  atomically with a captured frame.
-- Whether a given compositor needs `color_depth=10` set alongside `hdr_enable=1`
-  is untested. If one still reports "HDR: incapable" with both set, CRTC
-  colour-management properties are the next area to look at; that is outside this
-  feature's scope.
-
-Carrying colour metadata alongside the captured frame is a capture-UAPI change
-and is deliberately left to follow-up work.
+`hdr_enable=1` advertises capability; the compositor decides whether to use PQ.
+Use `color_depth=10` for ten-bit scanout. UAPI v14 `ACQUIRE_FRAME2` returns the
+negotiated colorspace, EOTF and static metadata atomically with the frame through
+the render node. The old `ACQUIRE_FRAME` contract remains unchanged and cannot
+interpret HDR. Consumers must adopt the new interface and correctly convert,
+encode and signal HDR before end-to-end HDR streaming is supported. See the
+[HDR contract, tests and release gates](docs/hdr-capture.md).
 
 Independent compositors use the packaged
 `72-hermes-kms-session-seats.rules` and one private seat broker per session
@@ -825,3 +807,11 @@ MIT license in [LICENSES/MIT.txt](LICENSES/MIT.txt). An independently developed
 userspace project therefore does not have to become the Hermes application or
 adopt its application license merely because it issues the documented ioctls,
 includes the syscall-note UAPI, or reuses the MIT helper.
+
+### Frame-associated HDR capture (UAPI v14)
+
+`CAP_FRAME_COLOR` and `ACQUIRE_FRAME2` return colour state with the exact captured
+frame. SDR/HDR transitions wake frame waiters even without a framebuffer change.
+See [the HDR contract and validation requirements](docs/hdr-capture.md). Existing
+consumers need integration work before enabling HDR; driver advertisement alone
+does not provide end-to-end HDR streaming.

@@ -21,3 +21,4 @@ tools/hermes-cursor-probe/hermes_cursor_probe
 tools/hermes-pixel-peek/hermes_pixel_peek
 tools/hermes-sysmem-import-check/hermes-sysmem-import-check
 tools/hermes-imported-scanout-test/hermes-imported-scanout-test
+tests/hdr-capture

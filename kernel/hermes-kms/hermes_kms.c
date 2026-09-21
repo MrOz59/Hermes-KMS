@@ -361,6 +361,7 @@ struct hermes_kms_output {
 	u32 requested_height;
 	u32 requested_refresh_hz;
 	atomic64_t frame_sequence;
+	struct drm_hermes_kms_frame_color frame_color;
 	u64 framebuffer_generation;
 	u64 last_update_ns;
 	u64 last_enable_ns;
@@ -481,6 +482,9 @@ struct hermes_kms_file {
 /* Keep ioctl numbers/layouts identical on LP64 and newly compiled ILP32. */
 static_assert(sizeof(struct drm_hermes_kms_status) == 208);
 static_assert(offsetof(struct drm_hermes_kms_status, framebuffer_modifier) == 136);
+static_assert(HERMES_KMS_COLORSPACE_DEFAULT == DRM_MODE_COLORIMETRY_DEFAULT);
+static_assert(HERMES_KMS_COLORSPACE_BT2020_RGB == DRM_MODE_COLORIMETRY_BT2020_RGB);
+static_assert(sizeof(struct drm_hermes_kms_acquire_frame2) == 224);
 static_assert(sizeof(struct drm_hermes_kms_acquire_frame) == 176);
 static_assert(offsetof(struct drm_hermes_kms_acquire_frame, reserved) == 128);
 static_assert(sizeof(struct drm_hermes_kms_metrics) == 312);
@@ -910,6 +914,7 @@ static void hermes_kms_set_frame_metadata_locked(struct hermes_kms_output *outpu
 
 static void hermes_kms_track_frame(struct hermes_kms_output *output,
 				   struct drm_framebuffer *fb,
+				   const struct drm_hermes_kms_frame_color *color,
 				   const struct drm_rect *damage,
 				   bool notify)
 {
@@ -950,6 +955,12 @@ static void hermes_kms_track_frame(struct hermes_kms_output *output,
 	output->frame_update_count++;
 	output->last_update_ns = ktime_get_ns();
 	hermes_kms_set_frame_metadata_locked(output, fb);
+	if (!color || memcmp(&output->frame_color, color, sizeof(*color)))
+		damage = NULL;
+	if (fb && color)
+		output->frame_color = *color;
+	else
+		memset(&output->frame_color, 0, sizeof(output->frame_color));
 	if (fb && damage) {
 		output->framebuffer_damage_valid = true;
 		output->framebuffer_damage_x1 = max(damage->x1, 0);
@@ -1355,8 +1366,49 @@ static int hermes_kms_connector_get_modes(struct drm_connector *connector)
 	return count;
 }
 
+static int hermes_kms_connector_atomic_check(struct drm_connector *connector,
+					   struct drm_atomic_commit *state)
+{
+	struct drm_connector_state *new =
+		drm_atomic_get_new_connector_state(state, connector);
+	struct drm_connector_state *old =
+		drm_atomic_get_old_connector_state(state, connector);
+	struct hermes_kms_output *output =
+		container_of(connector, struct hermes_kms_output, connector);
+	struct drm_plane_state *plane_state;
+	const struct hdr_output_metadata *hdr;
+
+	if (new->hdr_output_metadata) {
+		if (!output->hdev->display.hdr_enable || new->hdr_output_metadata->length != sizeof(*hdr))
+			return -EINVAL;
+		hdr = new->hdr_output_metadata->data;
+		/* The EDID advertises traditional SDR and PQ, static type 1 only. */
+		if (hdr->metadata_type || hdr->hdmi_metadata_type1.metadata_type ||
+		    (hdr->hdmi_metadata_type1.eotf != 0 &&
+		     hdr->hdmi_metadata_type1.eotf != 2))
+			return -EINVAL;
+		if (hdr->hdmi_metadata_type1.eotf == 2 &&
+		    new->colorspace != DRM_MODE_COLORIMETRY_BT2020_RGB)
+			return -EINVAL;
+	}
+	if (new->colorspace != DRM_MODE_COLORIMETRY_DEFAULT &&
+	    (!output->hdev->display.hdr_enable || new->colorspace != DRM_MODE_COLORIMETRY_BT2020_RGB))
+		return -EINVAL;
+
+	if (new->crtc &&
+	    (old->colorspace != new->colorspace ||
+	     !drm_connector_atomic_hdr_metadata_equal(old, new))) {
+		/* Serialize colour-only commits with primary flips and run flush. */
+		plane_state = drm_atomic_get_plane_state(state, &output->primary);
+		if (IS_ERR(plane_state))
+			return PTR_ERR(plane_state);
+	}
+	return 0;
+}
+
 static const struct drm_connector_helper_funcs hermes_kms_connector_helper_funcs = {
 	.get_modes = hermes_kms_connector_get_modes,
+	.atomic_check = hermes_kms_connector_atomic_check,
 };
 
 static const struct drm_connector_funcs hermes_kms_connector_funcs = {
@@ -1567,7 +1619,7 @@ static void hermes_kms_crtc_atomic_disable(struct drm_crtc *crtc,
 	mutex_lock(&output->state_lock);
 	output->last_disable_ns = ktime_get_ns();
 	mutex_unlock(&output->state_lock);
-	hermes_kms_track_frame(output, NULL, NULL, false);
+	hermes_kms_track_frame(output, NULL, NULL, NULL, false);
 	hermes_kms_track_cursor(output, NULL, false);
 	wake_up_interruptible(&output->frame_wait);
 
@@ -1586,6 +1638,24 @@ static void hermes_kms_crtc_atomic_flush(struct drm_crtc *crtc,
 	struct drm_plane_state *new_plane_state;
 	struct drm_rect damage;
 	bool have_damage = false;
+	struct drm_connector_state *conn_state =
+		drm_atomic_get_new_connector_state(state, &output->connector);
+	struct drm_hermes_kms_frame_color color = {
+		.flags = HERMES_KMS_COLOR_VALID | HERMES_KMS_COLOR_RGB_FULL_RANGE,
+	};
+
+	if (WARN_ON(!conn_state))
+		return;
+	color.colorspace = conn_state->colorspace;
+	if (conn_state->hdr_output_metadata) {
+		const struct hdr_output_metadata *hdr =
+			conn_state->hdr_output_metadata->data;
+
+		color.flags |= HERMES_KMS_COLOR_HDR_VALID;
+		/* Copy fields, not the blob's untrusted trailing padding. */
+		color.hdr.metadata_type = hdr->metadata_type;
+		color.hdr.hdmi_metadata_type1 = hdr->hdmi_metadata_type1;
+	}
 
 	new_plane_state = drm_atomic_get_new_plane_state(state, plane);
 	if (new_plane_state) {
@@ -1599,7 +1669,7 @@ static void hermes_kms_crtc_atomic_flush(struct drm_crtc *crtc,
 		 * commit has no new primary state and deliberately does not advance
 		 * the capture sequence.
 		 */
-		hermes_kms_track_frame(output, new_plane_state->fb,
+		hermes_kms_track_frame(output, new_plane_state->fb, &color,
 				       have_damage ? &damage : NULL, false);
 	}
 	cursor_state = drm_atomic_get_new_plane_state(state, &output->cursor);
@@ -1831,9 +1901,31 @@ static const struct drm_encoder_funcs hermes_kms_encoder_funcs = {
 	.destroy = drm_encoder_cleanup,
 };
 
+static int hermes_kms_atomic_check(struct drm_device *drm,
+				   struct drm_atomic_commit *state)
+{
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *crtc_state;
+	struct drm_connector_state *conn_state;
+	int i;
+
+	/*
+	 * Keep connector colour state owned by this transaction. Reading the
+	 * live connector during flush can observe a later nonblocking swap.
+	 */
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+		struct hermes_kms_output *output = crtc_to_hermes_kms_output(crtc);
+
+		conn_state = drm_atomic_get_connector_state(state, &output->connector);
+		if (IS_ERR(conn_state))
+			return PTR_ERR(conn_state);
+	}
+	return drm_atomic_helper_check(drm, state);
+}
+
 static const struct drm_mode_config_funcs hermes_kms_mode_config_funcs = {
 	.fb_create = drm_gem_fb_create,
-	.atomic_check = drm_atomic_helper_check,
+	.atomic_check = hermes_kms_atomic_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };
 
@@ -1874,6 +1966,7 @@ static int hermes_kms_ioctl_get_caps(struct drm_device *drm, void *data,
 			      HERMES_KMS_CAP_MULTI_OUTPUT |
 			      HERMES_KMS_CAP_SESSION_TOKEN |
 			      HERMES_KMS_CAP_SESSION_LIFECYCLE |
+			      HERMES_KMS_CAP_FRAME_COLOR |
 			      HERMES_KMS_CAP_CURSOR_CAPTURE |
 			      HERMES_KMS_CAP_ZERO_COPY_TARGET |
 		      HERMES_KMS_CAP_SYNC_FILE;
@@ -2712,8 +2805,9 @@ static bool hermes_kms_buffer_shared_with_other_session(
 	return shared;
 }
 
-static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
-					  struct drm_file *file)
+static int hermes_kms_acquire_frame(struct drm_device *drm, void *data,
+				  struct drm_file *file,
+				  struct drm_hermes_kms_frame_color *color)
 {
 	struct hermes_kms_device *hdev = to_hermes_kms(drm);
 	struct hermes_kms_file *context;
@@ -2779,6 +2873,8 @@ static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
 	sequence = atomic64_read(&output->frame_sequence);
 	session_id = output->session_id;
 	owner_file = output->owner_file;
+	if (color)
+		*color = output->frame_color;
 	frame->flags = HERMES_KMS_FRAME_METADATA_VALID;
 	frame->sequence = sequence;
 	frame->timestamp_ns = output->last_update_ns;
@@ -2882,6 +2978,23 @@ out_put_fb:
 	drm_framebuffer_put(fb);
 	mutex_unlock(&context->lock);
 	return ret;
+}
+
+static int hermes_kms_ioctl_acquire_frame(struct drm_device *drm, void *data,
+					  struct drm_file *file)
+{
+	return hermes_kms_acquire_frame(drm, data, file, NULL);
+}
+
+static int hermes_kms_ioctl_acquire_frame2(struct drm_device *drm, void *data,
+					   struct drm_file *file)
+{
+	struct drm_hermes_kms_acquire_frame2 *request = data;
+
+	if (memchr_inv(&request->color, 0, sizeof(request->color)))
+		return -EINVAL;
+	return hermes_kms_acquire_frame(drm, &request->frame, file,
+				      &request->color);
 }
 
 static void hermes_kms_init_invalid_cursor_fds(
@@ -3193,7 +3306,7 @@ static int hermes_kms_ioctl_set_output(struct drm_device *drm, void *data,
 		if (was_enabled)
 			output->output_disable_count++;
 		mutex_unlock(&output->state_lock);
-		hermes_kms_track_frame(output, NULL, NULL, false);
+		hermes_kms_track_frame(output, NULL, NULL, NULL, false);
 		hermes_kms_track_cursor(output, NULL, false);
 		wake_up_interruptible(&output->frame_wait);
 		if (was_enabled)
@@ -3275,7 +3388,7 @@ static int hermes_kms_ioctl_set_output(struct drm_device *drm, void *data,
 	request->result_flags |= HERMES_KMS_SET_OUTPUT_RESULT_CONNECTED |
 		HERMES_KMS_SET_OUTPUT_RESULT_OWNER_ASSIGNED;
 	if (session_transition) {
-		hermes_kms_track_frame(output, NULL, NULL, false);
+		hermes_kms_track_frame(output, NULL, NULL, NULL, false);
 		hermes_kms_track_cursor(output, NULL, false);
 		wake_up_interruptible(&output->frame_wait);
 	}
@@ -3588,7 +3701,7 @@ static void hermes_kms_postclose(struct drm_device *drm, struct drm_file *file)
 		if (!disconnected)
 			continue;
 
-		hermes_kms_track_frame(output, NULL, NULL, false);
+		hermes_kms_track_frame(output, NULL, NULL, NULL, false);
 		hermes_kms_track_cursor(output, NULL, false);
 		wake_up_interruptible(&output->frame_wait);
 		hermes_kms_hotplug_event(output);
@@ -3605,6 +3718,9 @@ static void hermes_kms_postclose(struct drm_device *drm, struct drm_file *file)
 }
 
 static const struct drm_ioctl_desc hermes_kms_ioctls[] = {
+	DRM_IOCTL_DEF_DRV(HERMES_KMS_ACQUIRE_FRAME2,
+			  hermes_kms_ioctl_acquire_frame2,
+			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(HERMES_KMS_GET_VERSION,
 			  hermes_kms_ioctl_get_version,
 			  DRM_RENDER_ALLOW),
@@ -4497,7 +4613,7 @@ static void hermes_kms_remove(struct platform_device *pdev)
 		}
 		hermes_kms_clear_owner_locked(output);
 		mutex_unlock(&output->state_lock);
-		hermes_kms_track_frame(output, NULL, NULL, false);
+		hermes_kms_track_frame(output, NULL, NULL, NULL, false);
 		hermes_kms_track_cursor(output, NULL, false);
 		wake_up_interruptible(&output->frame_wait);
 	}
@@ -5476,16 +5592,8 @@ static void __init hermes_kms_sanitize_mode_range(void)
 		hdr_enable = false;
 	}
 
-	/*
-	 * hdr_enable only advertises the capability; it does not activate HDR,
-	 * and the capture UAPI carries no colorspace or HDR metadata either way
-	 * (see README.md). Whether a compositor needs ten-bit scanout set at the
-	 * same time before it will enable HDR is untested. Surface the pairing
-	 * without forcing it -- the user's color_depth choice is left exactly as
-	 * configured.
-	 */
 	if (hdr_enable && color_depth < 10)
-		pr_info("%s: hdr_enable=1 advertises HDR only, with color_depth=%u (<10); the pairing is untested and consumers still receive no colorspace or HDR metadata\n",
+		pr_info("%s: HDR advertised with color_depth=%u; use color_depth=10 for ten-bit HDR scanout\n",
 			HERMES_KMS_DRIVER_NAME, color_depth);
 
 	if (min_width != requested_min_width ||

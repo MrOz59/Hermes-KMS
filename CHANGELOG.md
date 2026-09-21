@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Add UAPI v14 `CAP_FRAME_COLOR` and `ACQUIRE_FRAME2`, carrying validated RGB
+  colorspace and static HDR metadata in the framebuffer's atomic snapshot.
+- Wake capture on colour-only commits, invalidate partial damage on colour
+  transitions, and clear HDR metadata on SDR/disable transitions.
+- Preserve all existing ioctl layouts and authorization/export behavior.
+- Add HDR diagnostics, ABI checks, and a disposable-VM HDR capture regression.
+- Document consumer integration and end-to-end HDR release validation requirements.
+
+
 All notable changes to Hermes-KMS are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),

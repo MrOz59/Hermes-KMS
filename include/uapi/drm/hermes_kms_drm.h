@@ -10,12 +10,13 @@
 #define HERMES_KMS_DRM_H
 
 #include <drm/drm.h>
+#include <drm/drm_mode.h>
 
 #if defined(__cplusplus)
 extern "C" {
 #endif
 
-#define HERMES_KMS_UAPI_VERSION 13
+#define HERMES_KMS_UAPI_VERSION 14
 
 #define HERMES_KMS_NAME_LEN 32
 
@@ -49,6 +50,8 @@ extern "C" {
  * bound_fd_count, and GET_METRICS reports the bind/revoke counters.
  */
 #define HERMES_KMS_CAP_SESSION_LIFECYCLE	(1ULL << 17)
+/* ACQUIRE_FRAME2 returns colour state atomically with the captured buffer. */
+#define HERMES_KMS_CAP_FRAME_COLOR		(1ULL << 18)
 #define HERMES_KMS_CAP_DMABUF_EXPORT_PLANNED	(1ULL << 32)
 #define HERMES_KMS_CAP_ZERO_COPY_TARGET		(1ULL << 33)
 #define HERMES_KMS_CAP_WRITEBACK_CONNECTOR	(1ULL << 34)
@@ -250,6 +253,44 @@ struct drm_hermes_kms_acquire_frame {
 	__u32 damage_x2;
 	__u32 damage_y2;
 	__aligned_u64 reserved[6];
+};
+
+/*
+ * Colour of the captured RGB samples, not the remote display or the encoder's
+ * YUV output. RGB samples are full range. colorspace uses DRM_MODE_COLORIMETRY_*
+ * values (Default means the synthetic EDID's sRGB primaries). A missing HDR
+ * blob means SDR; ten-bit storage alone does not imply HDR or BT.2020.
+ * HDR_VALID means hdr contains the committed type-1 static metadata; eotf=2
+ * denotes PQ. All luminance/chromaticity units are those of drm_mode.h.
+ * Zero mastering values mean unspecified, never invented display measurements.
+ * No dynamic HDR metadata, tone mapping, or pixel conversion is performed.
+ */
+#define HERMES_KMS_COLORSPACE_DEFAULT 0U
+#define HERMES_KMS_COLORSPACE_BT2020_RGB 9U
+#define HERMES_KMS_EOTF_SDR 0U
+#define HERMES_KMS_EOTF_PQ 2U
+#define HERMES_KMS_COLOR_VALID (1U << 0)
+#define HERMES_KMS_COLOR_HDR_VALID (1U << 1)
+#define HERMES_KMS_COLOR_RGB_FULL_RANGE (1U << 2)
+struct drm_hermes_kms_frame_color {
+	__u32 flags;
+	__u32 colorspace;
+	struct hdr_output_metadata hdr;
+	__u32 reserved[2];
+};
+
+/*
+ * Requires CAP_FRAME_COLOR. Input: zero the entire structure and set only
+ * frame.flags to the ACQUIRE_FRAME request flags. Frame, colour, sequence and
+ * fds describe one snapshot. Same authorization, fences, damage and ESTALE
+ * retry contract as ACQUIRE_FRAME. Colour-only changes wake WAIT_FRAME and
+ * invalidate damage. Old ACQUIRE_FRAME remains binary-compatible, but cannot
+ * safely interpret HDR. Never query connector properties separately to infer
+ * the colour of a captured frame.
+ */
+struct drm_hermes_kms_acquire_frame2 {
+	struct drm_hermes_kms_acquire_frame frame;
+	struct drm_hermes_kms_frame_color color;
 };
 
 struct drm_hermes_kms_wait_frame {
@@ -460,6 +501,11 @@ struct drm_hermes_kms_session_access {
 #define DRM_HERMES_KMS_SESSION_ACCESS	0x09
 #define DRM_HERMES_KMS_ACQUIRE_CURSOR	0x0a
 #define DRM_HERMES_KMS_WAIT_UPDATE	0x0b
+#define DRM_HERMES_KMS_ACQUIRE_FRAME2	0x0c
+
+#define DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME2 \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_HERMES_KMS_ACQUIRE_FRAME2, \
+		 struct drm_hermes_kms_acquire_frame2)
 
 #define DRM_IOCTL_HERMES_KMS_GET_VERSION \
 	DRM_IOR(DRM_COMMAND_BASE + DRM_HERMES_KMS_GET_VERSION, struct drm_hermes_kms_version)

@@ -73,8 +73,8 @@ full: modules tools
 check: check-uapi check-session check-edid check-edid-conformity
 
 # Pin public structure layouts and ioctl encodings on the native userspace ABI.
-# When a working multilib compiler is present, exercise the 32-bit compat ABI
-# too; an actual ABI assertion failure remains fatal rather than being skipped.
+# When a compiler with 32-bit headers is present, compile the compat ABI
+# too (all assertions are compile-time; no 32-bit runtime is needed); an actual ABI assertion failure remains fatal rather than being skipped.
 check-uapi:
 	@set -eu; \
 		test -n '$(CURSOR_PROBE_CFLAGS)' || { \
@@ -90,15 +90,14 @@ check-uapi:
 			tests/uapi-abi.c -o "$$test_tmp/uapi-abi-native"; \
 		"$$test_tmp/uapi-abi-native"; \
 		printf 'UAPI ABI: native PASS\n'; \
-		if printf 'int main(void) { return 0; }\n' | \
-			$(CC) -m32 -x c - -o "$$test_tmp/m32-probe" >/dev/null 2>&1; then \
+		if printf '#include <drm/hermes_kms_drm.h>\n' | \
+			$(CC) -m32 $(UAPI_CFLAGS) $(CURSOR_PROBE_CFLAGS) -x c -c - -o "$$test_tmp/m32-probe.o" >/dev/null 2>&1; then \
 			$(CC) -m32 $(CFLAGS) -std=c11 -Werror -pedantic \
 				$(UAPI_CFLAGS) $(CURSOR_PROBE_CFLAGS) \
-				tests/uapi-abi.c -o "$$test_tmp/uapi-abi-32"; \
-			"$$test_tmp/uapi-abi-32"; \
-			printf 'UAPI ABI: 32-bit PASS\n'; \
+				-c tests/uapi-abi.c -o "$$test_tmp/uapi-abi-32.o"; \
+			printf 'UAPI ABI: 32-bit compile PASS\n'; \
 		else \
-			printf 'UAPI ABI: 32-bit SKIP (multilib compiler/runtime unavailable)\n'; \
+			printf 'UAPI ABI: 32-bit SKIP (32-bit compiler/headers unavailable)\n'; \
 			fi
 
 # Exercise the file-backed CLI credential transport without loading the driver.
@@ -409,6 +408,7 @@ uninstall-dev-udev:
 	@printf 'removed Hermes-KMS development udev rules\n'
 
 clean-tools:
+	$(RM) tests/hdr-capture
 	$(RM) tools/hermes-kmsctl/hermes-kmsctl
 	$(RM) tools/hermes-kms-import-check/hermes-kms-import-check
 	$(RM) tools/hermes-egl-import-check/hermes-egl-import-check
@@ -429,3 +429,10 @@ clean: clean-tools
 		$(RM) -r -- kernel/hermes-kms/.tmp_versions; \
 		printf 'kernel build tree unavailable; removed local module artifacts directly\n'; \
 	fi
+
+.PHONY: check-hdr-build
+# Runtime execution is deliberately separate: it needs an isolated DRM master.
+check-hdr-build: tests/hdr-capture
+
+tests/hdr-capture: tests/hdr-capture.c tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h
+	$(CC) $(CFLAGS) -std=c11 -Werror -pthread $(UAPI_CFLAGS) $(CURSOR_PROBE_CFLAGS) -o $@ $< $(CURSOR_PROBE_LIBS)

@@ -72,6 +72,9 @@
   baseline, so a new conformity failure surfaces as a diff instead of in
   someone else's parser.
 
+- UAPI v14 frame-associated RGB colorspace and static HDR metadata capture,
+  including metadata-only transitions and validation at atomic check time.
+
 ## Next
 
 - Colour metadata in the capture UAPI, which is what HDR is still missing.
