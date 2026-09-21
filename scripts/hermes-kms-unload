@@ -61,6 +61,7 @@ done
 
 printf 'Hermes-KMS cards were detached, but the module is still in use: %s\n' "$error" >&2
 [ -z "$openers" ] || printf 'Openers seen before detaching:\n%s\n' "$openers" >&2
-printf 'Close processes still holding Hermes-KMS resources, then run this command again.\n' >&2
+printf 'Detaching cannot close descriptors held by another process; the opener list is a pre-detach snapshot.\n' >&2
+printf 'Exit any remaining capture clients and retry. If the desktop retains descriptors, save your work and log out before retrying from another session, or reboot.\n' >&2
 printf 'To restore the cards instead, run hermes-kms-rebind.\n' >&2
 exit 1

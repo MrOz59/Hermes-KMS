@@ -335,7 +335,13 @@ A desktop compositor or Xwayland may keep the DRM card open after Hermes exits,
 even when its connector is disconnected. `hermes-kms-unload` first unbinds the
 cards (which sends a device-removal event), waits briefly, and then removes the
 module. If a process keeps an old descriptor open, the script leaves the cards
-detached and reports the earlier openers; close that process and rerun it. Use
+detached and reports the earlier openers. This is a snapshot taken before
+detaching, not a list of processes confirmed to remain open afterward. Exit
+remaining capture clients and retry. If the desktop retains descriptors, save
+your work and log out before retrying from another session, or reboot; do not
+kill systemd, logind, or the desktop merely because they appear in this list.
+Detaching cannot close another process's descriptors, and the kernel must keep
+the module loaded until its remaining users release it. Use
 `sudo hermes-kms-rebind` to restore detached cards without rebooting. Configfs
 cards must be removed by their creator before unloading.
 

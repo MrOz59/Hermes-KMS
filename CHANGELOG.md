@@ -26,6 +26,8 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+- Clarify that unload openers are a pre-detach snapshot and explain safe recovery when desktop processes retain DRM descriptors.
+
 ### Added
 
 - HDR advertisement from the virtual output, behind the new `hdr_enable` module

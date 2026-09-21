@@ -97,6 +97,14 @@ grep -q "$HOLDER" "$TMP/first-unload" || {
 	printf 'unload did not identify the open DRM fd holder\n' >&2
 	exit 1
 }
+grep -q 'pre-detach snapshot' "$TMP/first-unload" || {
+	printf 'unload did not distinguish historical openers from current blockers\n' >&2
+	exit 1
+}
+grep -q 'save your work and log out' "$TMP/first-unload" || {
+	printf 'unload did not explain recovery for a desktop holding descriptors\n' >&2
+	exit 1
+}
 printf 'ok: busy module leaves its DRM card detached and reports the blocker\n'
 
 "$REPO/scripts/hermes-kms-rebind" >/dev/null
