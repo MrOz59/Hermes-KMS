@@ -26,6 +26,8 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-22
+
 ### Added
 
 - `huge_gem`, an experimental module parameter (default off, load-time only)
@@ -569,6 +571,7 @@ the warning at the bottom of this entry.
 > your graphics session. Do not run it on a machine where you cannot tolerate
 > an unstable display stack, and please report issues you hit.
 
+[0.4.0]: https://github.com/MrOz59/Hermes-KMS/releases/tag/v0.4.0
 [0.3.2]: https://github.com/MrOz59/Hermes-KMS/releases/tag/v0.3.2
 [0.3.1]: https://github.com/MrOz59/Hermes-KMS/releases/tag/v0.3.1
 [0.3.0]: https://github.com/MrOz59/Hermes-KMS/releases/tag/v0.3.0
