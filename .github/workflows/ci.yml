@@ -39,7 +39,7 @@ jobs:
             udev
 
       - name: Run userspace regression checks
-        run: make check
+        run: make check check-hdr-build
 
       - name: Check shell and packaged configuration syntax
         shell: bash

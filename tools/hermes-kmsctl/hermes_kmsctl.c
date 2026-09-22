@@ -475,6 +475,8 @@ static int print_outputs(int fd)
 static int print_frame(int fd, int argc, char **argv)
 {
 	struct drm_hermes_kms_acquire_frame frame;
+	struct drm_hermes_kms_acquire_frame2 frame2 = {0};
+	struct drm_hermes_kms_caps caps = {0};
 	bool require_dmabuf = false;
 	bool require_sync_file = false;
 	int ret = 0;
@@ -497,11 +499,39 @@ static int print_frame(int fd, int argc, char **argv)
 		}
 	}
 
-	if (ioctl(fd, DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME, &frame) < 0) {
+	if (ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_CAPS, &caps) < 0) {
+		perror("GET_CAPS");
+		return 1;
+	}
+	if (caps.flags & HERMES_KMS_CAP_FRAME_COLOR) {
+		frame2.frame = frame;
+		ret = ioctl(fd, DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME2, &frame2);
+		frame = frame2.frame;
+	} else {
+		ret = ioctl(fd, DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME, &frame);
+	}
+	if (ret < 0) {
 		perror("ACQUIRE_FRAME");
 		return 1;
 	}
 
+	if (caps.flags & HERMES_KMS_CAP_FRAME_COLOR) {
+		const struct hdr_metadata_infoframe *hdr = &frame2.color.hdr.hdmi_metadata_type1;
+
+		printf("color_flags=0x%08x\ncolorspace=%u\n",
+		       frame2.color.flags, frame2.color.colorspace);
+		if (frame2.color.flags & HERMES_KMS_COLOR_HDR_VALID) {
+			printf("eotf=%u\nmastering_max=%u\nmastering_min=%u\nmax_cll=%u\nmax_fall=%u\n",
+			       hdr->eotf, hdr->max_display_mastering_luminance,
+			       hdr->min_display_mastering_luminance, hdr->max_cll, hdr->max_fall);
+			for (unsigned int i = 0; i < 3; i++)
+				printf("primary_%u=%u,%u\n", i,
+				       hdr->display_primaries[i].x, hdr->display_primaries[i].y);
+			printf("white_point=%u,%u\n", hdr->white_point.x, hdr->white_point.y);
+		}
+	} else {
+		printf("color_metadata=unavailable\n");
+	}
 	printf("flags=0x%016llx\n", (unsigned long long)frame.flags);
 	printf("metadata_valid=%s\n",
 	       (frame.flags & HERMES_KMS_FRAME_METADATA_VALID) ? "true" : "false");
