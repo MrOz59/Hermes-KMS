@@ -53,12 +53,37 @@ subject to change between minor releases.
   properties. [`docs/driver-design.md`](docs/driver-design.md) explains why each
   one is required and how KWin's two-gate chain consumes them.
 
-  This is advertisement only. It does not activate HDR, and Hermes' capture UAPI
-  still carries no colorspace, EOTF or HDR metadata alongside a captured frame,
-  so a consumer reading only that interface cannot tell how to interpret the
-  pixels it receives. End-to-end HDR streaming is therefore incomplete, including
-  with `color_depth=10`. `tests/edid.c` covers the generated EDID bytes, both
-  block checksums and the published EDID length under `make check`.
+  Advertisement does not activate HDR -- that stays the compositor's decision --
+  and it is only half the path; the colour metadata entry below carries the other
+  half. `tests/edid.c` covers the generated EDID bytes, both block checksums and
+  the published EDID length under `make check`.
+
+- Per-frame colour metadata in capture UAPI version 14. The new
+  `ACQUIRE_FRAME2` returns the framebuffer and a `drm_hermes_kms_frame_color`
+  snapshot from the same atomic transaction. Its flags distinguish valid colour,
+  committed Type-1 static HDR metadata and full-range RGB. Legacy
+  `ACQUIRE_FRAME` remains unchanged and binary-compatible, while
+  `HERMES_KMS_CAP_FRAME_COLOR` advertises the extended command.
+
+  Colour-only commits are capture updates: they advance `frame_sequence`, wake
+  `WAIT_FRAME` and invalidate damage so consumers reprocess the whole frame under
+  the new transfer function. The driver serializes those commits with primary
+  flips, preventing a nonblocking transaction from pairing one framebuffer with
+  another transaction's colour state. It also rejects malformed metadata,
+  unsupported EOTFs and PQ metadata without BT.2020 RGB.
+
+- `tools/hermes-hdr-metadata-test` commits Colorspace and `HDR_OUTPUT_METADATA`
+  the way a compositor does, then reads them back through `ACQUIRE_FRAME2` -- with
+  no GPU and no compositor, so the delivery path is covered rather than inferred
+  from the advertisement. It checks that the committed mastering metadata returns
+  field for field, that the legacy ioctl remains compatible, that a metadata-only
+  change advances the sequence and clears stale HDR, that a
+  descriptor id other than Static Metadata Type 1 is refused at commit time
+  instead of accepted and silently dropped, and that disabling the output clears
+  the latched state. `scripts/vm-hdr-test.sh` runs it as its fourth phase.
+  `tests/hdr-capture.c` additionally covers authorization, DMA-BUF and sync-file
+  export, `TEST_ONLY`, wait semantics, invalid metadata, repeated nonblocking
+  transitions and concurrent framebuffer/colour acquisition.
 
 - `hermes-kmsctl hold --control PATH` creates a private FIFO and reads `rotate`
   and `revoke` from it, which is the only way the command line can reach those
