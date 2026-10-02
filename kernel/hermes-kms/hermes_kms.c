@@ -4586,9 +4586,15 @@ static int hermes_kms_probe(struct platform_device *pdev)
 		atomic64_set(&output->vblank_count, 0);
 		atomic64_set(&output->vblank_overrun_count, 0);
 #if !HERMES_KMS_HAVE_DRM_VBLANK_TIMER
+#if HERMES_KMS_HAVE_HRTIMER_SETUP
+		hrtimer_setup(&output->vblank_timer,
+			      hermes_kms_vblank_timer, CLOCK_MONOTONIC,
+			      HRTIMER_MODE_REL);
+#else
 		hrtimer_init(&output->vblank_timer, CLOCK_MONOTONIC,
 			     HRTIMER_MODE_REL);
 		output->vblank_timer.function = hermes_kms_vblank_timer;
+#endif
 #endif
 		ratelimit_state_init(&output->output_change_ratelimit,
 				     HERMES_KMS_OUTPUT_CHANGE_INTERVAL,

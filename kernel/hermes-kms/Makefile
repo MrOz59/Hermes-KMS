@@ -20,6 +20,16 @@ endif
 hermes-kms-vblank-helper-h := $(srctree)/include/drm/drm_vblank_helper.h
 ccflags-y += -DHERMES_KMS_HAVE_DRM_VBLANK_TIMER=$(if $(wildcard $(hermes-kms-vblank-helper-h)),1,0)
 
+# hrtimer_init() was folded into hrtimer_setup(), which takes the callback too.
+# A kernel can drop the old name before it gains the DRM-owned vblank timer:
+# upstream 6.17 and 6.18 have hrtimer_setup() but no drm_vblank_helper.h, so
+# the driver-owned timer needs the new call there. Ask the target header which
+# name it provides.
+hermes-kms-hrtimer-h := $(srctree)/include/linux/hrtimer.h
+hermes-kms-hrtimer-setup := $(shell grep -qs 'hrtimer_setup' \
+	$(hermes-kms-hrtimer-h) && echo 1 || echo 0)
+ccflags-y += -DHERMES_KMS_HAVE_HRTIMER_SETUP=$(hermes-kms-hrtimer-setup)
+
 # Older DRM shmem helpers import through the generic scatter/gather path.
 hermes-kms-shmem-h := $(srctree)/include/drm/drm_gem_shmem_helper.h
 hermes-kms-shmem-import-no-map := $(shell grep -qs 'drm_gem_shmem_prime_import_no_map' \
