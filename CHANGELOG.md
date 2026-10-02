@@ -26,6 +26,17 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- Host/general render-node `uaccess` now survives udev add/change events. The
+  rules previously combined `MODE="0600"` with `TAG+="uaccess"`; when udev
+  reapplied the device mode, the POSIX ACL mask could become `---`, leaving the
+  named `rw-` entry for the active desktop user present but ineffective and
+  causing unprivileged Hermes opens to fail with `EACCES`. Use `0660` for those
+  host/general nodes so the group-class ACL mask remains writable while
+  preserving `root:root` ownership and logind active-seat `uaccess` selection.
+  Private/session render-node policies are unchanged.
+
 ## [0.4.0] - 2026-09-22
 
 ### Added
