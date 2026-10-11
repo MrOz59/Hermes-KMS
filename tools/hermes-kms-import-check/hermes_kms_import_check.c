@@ -62,7 +62,7 @@ static int open_if_hermes(const char *path)
 	struct drm_hermes_kms_version version;
 	int fd;
 
-	fd = open(path, O_RDWR | O_CLOEXEC);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		return -1;
 

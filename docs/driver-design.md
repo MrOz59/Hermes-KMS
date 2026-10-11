@@ -331,7 +331,10 @@ The packaged pool's private cards are private from the desktop — dedicated sea
 private broker, root-only primary node — but not from each other. The access
 policy gives one configured uid an ACL on every private render node in the
 pool, so whoever holds that uid can open any unowned private card. The host
-render node instead follows the active seat0 session. This pool is designed for
+render node instead follows the active seat0 session. Both policies grant
+read-only opens: the private ioctls and exported DMA-BUF/sync_file descriptors
+work on an `O_RDONLY` DRM fd, while generic GPU probes that require `O_RDWR`
+cannot mistake the capture-only node for a renderer. This pool is designed for
 one consumer, not mutually untrusted consumers.
 
 `access_uid` closes it. A card created through configfs can name the uid it
@@ -340,7 +343,7 @@ attribute on the platform device and does not interpret it further, keeping
 device-node policy where the rest of it already lives. The packaged
 `92-hermes-kms-access.rules` keeps an explicitly assigned card root-only and
 removes the host `uaccess` tag; the short-lived udev ACL helper grants only that
-UID read/write access after the node has been created.
+UID read access after the node has been created.
 
 The UID must resolve to a real account. The ACL helper removes stale entries on
 change and checks the account before granting access, so a card naming a UID
@@ -763,7 +766,8 @@ starts disconnected; a controller connects it when a stream starts, and the
 compositor owns the real modeset path after the hotplug event.
 
 The driver exposes a **render node** (`DRIVER_RENDER`), and all private ioctls
-are `DRM_RENDER_ALLOW`. A controller/capture consumer opens the render node —
+are `DRM_RENDER_ALLOW`. A controller/capture consumer opens the render node
+with `O_RDONLY` —
 never the primary node, which would steal DRM master and EBUSY-block the
 compositor — so the compositor keeps master and drives the modeset while the
 consumer pulls frames through the side channel.

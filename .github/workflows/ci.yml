@@ -55,6 +55,7 @@ jobs:
           udevadm verify udev/72-hermes-kms-session-seats.rules
           udevadm verify udev/72-hermes-kms-render-access.rules
           udevadm verify udev/92-hermes-kms-access.rules
+          udevadm verify udev/95-hermes-kms-host-access.rules
           udevadm verify udev/99-hermes-kms-ignore-seat.rules
           sudo install -Dm0755 scripts/hermes-kms-seatd-instance \
             /usr/lib/hermes-kms/hermes-kms-seatd-instance

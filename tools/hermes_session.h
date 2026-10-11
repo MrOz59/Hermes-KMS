@@ -675,7 +675,7 @@ hermes_session_open_bound_render_credentials(
 		const char *candidate = render_nodes.gl_pathv[i];
 		int candidate_fd;
 
-		candidate_fd = open(candidate, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+		candidate_fd = open(candidate, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
 		if (candidate_fd < 0) {
 			if (!open_errno)
 				open_errno = errno;

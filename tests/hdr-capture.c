@@ -166,7 +166,7 @@ int main(int argc, char **argv)
 	CHECK(render >= 0);
 	render_path = drmGetRenderDeviceNameFromFd(card);
 	CHECK(render_path);
-	unbound = open(render_path, O_RDWR | O_CLOEXEC);
+	unbound = open(render_path, O_RDONLY | O_CLOEXEC);
 	free(render_path);
 	CHECK(unbound >= 0);
 	memset(&f, 0, sizeof(f));

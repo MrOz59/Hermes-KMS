@@ -45,12 +45,16 @@ card="/dev/dri/${card_sysnode[0]##*/}"
 	printf 'host render node lost root ownership\n' >&2
 	exit 1
 }
+[ "$(stat -c '%a' "$render")" = 640 ] || {
+	printf 'host render node is not read-only outside root\n' >&2
+	exit 1
+}
 udevadm info --query=property --name="$render" |
 	grep -Eq '^(TAGS|CURRENT_TAGS)=.*uaccess' || {
 	printf 'host render node has no uaccess tag\n' >&2
 	exit 1
 }
-printf 'ok: root-owned host render node receives uaccess\n'
+printf 'ok: root-owned host render node receives read-only uaccess\n'
 
 mkdir /sys/kernel/config/hermes-kms/unload-guard
 if "$REPO/scripts/hermes-kms-unload" >"$TMP/configfs-guard" 2>&1; then

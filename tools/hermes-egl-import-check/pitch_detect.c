@@ -42,7 +42,7 @@ static void usage(const char *argv0)
 static int open_if_hermes(const char *path)
 {
 	struct drm_hermes_kms_version version;
-	int fd = open(path, O_RDWR | O_CLOEXEC);
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
 	int saved_errno;
 	int ioctl_result;
 
