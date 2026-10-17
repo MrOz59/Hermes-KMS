@@ -295,7 +295,7 @@ for spec in 'tenant-a:1' 'tenant-b:2'; do
 	name=${spec%:*}
 	uid=${spec#*:}
 	node="/dev/dri/$(cat "$CONFIGFS/$name/render_node")"
-	getfacl -cpn "$node" | grep -q "^user:${uid}:rw-$" || {
+	getfacl -cpn "$node" | grep -q "^user:${uid}:r--$" || {
 		printf 'FAIL: %s lacks UID %s ACL\n' "$node" "$uid" >&2
 		FAIL=1
 	}

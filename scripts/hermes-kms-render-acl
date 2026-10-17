@@ -15,7 +15,11 @@ uid=$(cat "/sys${platform}/hermes_kms_access_uid")
 
 if [ -z "$uid" ]; then
 	if [ "$role" != session ]; then
-		# logind owns the active-seat ACL on host/general cards.
+		# logind owns the named active-seat ACL on host/general cards. Its
+		# uaccess builtin always grants rw; keep that entry but constrain the
+		# ACL mask to read-only. Chromium/Electron use O_RDWR while the
+		# Hermes-KMS capture UAPI deliberately opens this node O_RDONLY.
+		chmod 0640 -- "$node"
 		exit 0
 	fi
 	user_file=/etc/hermes-kms/session-user
@@ -33,4 +37,4 @@ case "$uid" in
 	*[!0-9]*) exit 1 ;;
 esac
 getent passwd "$uid" >/dev/null || exit 0
-setfacl -m "u:${uid}:rw" -- "$node"
+setfacl -m "u:${uid}:r" -- "$node"

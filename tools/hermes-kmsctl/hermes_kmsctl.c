@@ -60,7 +60,13 @@ static int open_if_hermes(const char *path, bool verbose)
 	struct drm_hermes_kms_version version;
 	int fd;
 
-	fd = open(path, O_RDWR | O_CLOEXEC);
+	/*
+	 * The packaged ACL intentionally permits only O_RDONLY opens. DRM private
+	 * ioctls and returned DMA-BUF/sync_file descriptors do not require a
+	 * writable file description, and O_RDWR is how generic GPU probes such as
+	 * Chromium distinguish candidate render devices.
+	 */
+	fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
 		if (verbose)
 			fprintf(stderr, "%s: open failed: %s\n", path, strerror(errno));

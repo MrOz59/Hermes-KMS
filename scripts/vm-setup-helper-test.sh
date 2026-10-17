@@ -103,16 +103,22 @@ for index in 1 2; do
 	for sysnode in /sys/devices/platform/hermes-kms."$index"/drm/renderD*; do
 		[ -e "$sysnode" ] || continue
 		node="/dev/dri/${sysnode##*/}"
-		getfacl -cpn "$node" | grep -q "^user:${target_uid}:rw-$" || {
+		getfacl -cpn "$node" | grep -q "^user:${target_uid}:r--$" || {
 			printf 'FAIL: %s lacks configured-user ACL\n' "$node" >&2
 			FAIL=1
 		}
 		runuser -u nobody -- python3 -c \
-			'import os,sys; fd=os.open(sys.argv[1], os.O_RDWR); os.close(fd)' \
+			'import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY); os.close(fd)' \
 			"$node" || {
-			printf 'FAIL: configured user cannot open %s read/write\n' "$node" >&2
+			printf 'FAIL: configured user cannot open %s read-only\n' "$node" >&2
 			FAIL=1
 		}
+		if runuser -u nobody -- python3 -c \
+			'import os,sys; fd=os.open(sys.argv[1], os.O_RDWR); os.close(fd)' \
+			"$node" 2>/dev/null; then
+			printf 'FAIL: configured user can open %s read/write\n' "$node" >&2
+			FAIL=1
+		fi
 	done
 done
 
@@ -123,7 +129,7 @@ for sysnode in /sys/devices/platform/hermes-kms.1/drm/renderD*; do
 	[ -e "$sysnode" ] || continue
 	node="/dev/dri/${sysnode##*/}"
 	acl="$(getfacl -cpn "$node")"
-	printf '%s\n' "$acl" | grep -q "^user:${alternate_uid}:rw-$" || {
+	printf '%s\n' "$acl" | grep -q "^user:${alternate_uid}:r--$" || {
 		printf 'FAIL: updated consumer lacks ACL on %s\n' "$node" >&2
 		FAIL=1
 	}

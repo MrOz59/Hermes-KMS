@@ -52,7 +52,8 @@ symbol, and the capture path is a plain DRM ioctl UAPI over the render node. Any
 userspace consumer — another streaming host such as Apollo/Sunshine, a recorder,
 or your own tool — can use it by talking the same UAPI, with no fork required:
 
-1. Open a candidate render node and identify it with the DRM core
+1. Open a candidate render node **read-only** (`O_RDONLY | O_CLOEXEC`) and
+   identify it with the DRM core
    `DRM_IOCTL_VERSION` ioctl (or libdrm's `drmGetVersion()`); require the exact
    driver name `hermes-kms` before issuing any Hermes-KMS private ioctl. Private
    DRM command numbers are driver-local and are not safe device probes. Then use
@@ -239,10 +240,16 @@ makepkg -si
 ```
 
 The default load creates one seat0 host card. Its render node remains owned by
-root and gets a logind `uaccess` ACL for the active local desktop user. For a
+root and gets a read-only logind `uaccess` ACL for the active local desktop
+user. Hermes-KMS control and capture ioctls work through an `O_RDONLY` fd. The
+restricted open mode is intentional: Chromium/Electron probe candidate GPUs
+with `O_RDWR`, so they skip this capture-only render node instead of selecting
+it as the system's renderer. Upgrade capture consumers with this policy (older
+clients that still open Hermes-KMS with `O_RDWR` receive `EACCES`). For a
 private pool, install the optional broker package and configure the intended
 consumer. The setup helper stores that UID and grants it only the private
-render-node ACLs, without udev's deprecated non-system `OWNER` assignment:
+read-only render-node ACLs, without udev's deprecated non-system `OWNER`
+assignment:
 
 ```bash
 sudo /usr/lib/hermes-kms/hermes-kms-setup configure --user auto

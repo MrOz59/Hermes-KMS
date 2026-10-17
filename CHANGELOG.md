@@ -28,14 +28,14 @@ subject to change between minor releases.
 
 ### Fixed
 
-- Host/general render-node `uaccess` now survives udev add/change events. The
-  rules previously combined `MODE="0600"` with `TAG+="uaccess"`; when udev
-  reapplied the device mode, the POSIX ACL mask could become `---`, leaving the
-  named `rw-` entry for the active desktop user present but ineffective and
-  causing unprivileged Hermes opens to fail with `EACCES`. Use `0660` for those
-  host/general nodes so the group-class ACL mask remains writable while
-  preserving `root:root` ownership and logind active-seat `uaccess` selection.
-  Private/session render-node policies are unchanged.
+- Render-node access is read-only for both active-seat and explicitly assigned
+  users. Hermes-KMS private ioctls, DMA-BUF export and sync-file export work on
+  an `O_RDONLY` fd, whereas Chromium/Electron discover candidate render GPUs by
+  opening them `O_RDWR`. Keeping the POSIX ACL mask at `r--` therefore prevents
+  those applications from selecting this capture-only device without reviving
+  the `EACCES` failure from #6. The host node remains `root:root`, logind still
+  selects the active seat user, and the ACL helper now grants assigned private
+  cards `r--` rather than `rw-`.
 
 ## [0.4.0] - 2026-09-22
 

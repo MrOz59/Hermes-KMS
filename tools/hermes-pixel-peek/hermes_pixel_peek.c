@@ -93,7 +93,7 @@ int main(int argc, char **argv)
 	int fd;
 
 	if (dev) {
-		fd = open(dev, O_RDWR | O_CLOEXEC);
+		fd = open(dev, O_RDONLY | O_CLOEXEC);
 		if (fd < 0) {
 			perror("open");
 			return 1;
