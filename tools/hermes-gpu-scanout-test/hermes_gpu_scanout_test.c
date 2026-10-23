@@ -352,6 +352,10 @@ int main(int argc, char **argv)
 	if (ioctl(card, DRM_IOCTL_HERMES_KMS_GET_CAPS, &caps) || caps.output_count != 1) {
 		fprintf(stderr, "FAIL: requires a dedicated single-output Hermes-KMS card\n"); goto out;
 	}
+	if (w < caps.min_width || w > caps.max_width || h < caps.min_height ||
+	    h > caps.max_height || caps.max_refresh_hz < 60) {
+		fprintf(stderr, "FAIL: requested mode exceeds Hermes-KMS capabilities\n"); goto out;
+	}
 	if (drmSetMaster(card)) { fprintf(stderr, "FAIL: card already has a DRM master\n"); goto out; }
 	master = 1;
 	if (ioctl(card, DRM_IOCTL_HERMES_KMS_GET_STATUS, &status) ||
@@ -392,7 +396,8 @@ int main(int argc, char **argv)
 	if (render < 0) goto out;
 	frame.flags = HERMES_KMS_FRAME_REQUEST_DMABUF | HERMES_KMS_FRAME_REQUEST_SYNC_FILE;
 	if (ioctl(render, DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME, &frame)) goto out;
-	if (!(frame.flags & HERMES_KMS_FRAME_DMABUF_VALID) ||
+	if (!(frame.flags & HERMES_KMS_FRAME_METADATA_VALID) ||
+	    !(frame.flags & HERMES_KMS_FRAME_DMABUF_VALID) ||
 	    !(frame.flags & HERMES_KMS_FRAME_SYNC_FILE_VALID) ||
 	    (frame.flags & HERMES_KMS_FRAME_COPY_FALLBACK_REQUIRED) ||
 	    frame.framebuffer_id != fb || frame.width != w || frame.height != h ||
@@ -430,7 +435,8 @@ int main(int argc, char **argv)
 	}
 	result = interrupted ? 128 + interrupted : 0;
 out:
-	if (result == 1) fprintf(stderr, "FAIL: GPU scanout experiment: %s (EGL 0x%x)\n", strerror(errno), eglGetError());
+	if (interrupted) result = 128 + interrupted;
+	if (result == 1) fprintf(stderr, "FAIL: GPU scanout experiment incomplete (errno=%d, EGL 0x%x)\n", errno, eglGetError());
 	hermes_session_forget(&credentials);
 	if (session_created && unlink(session_path)) { perror("remove session credential"); result = 1; }
 	if (render >= 0) close(render);
