@@ -26,7 +26,16 @@ jobs:
             build-essential git pkg-config libdrm-dev libegl-dev libgbm-dev libgl-dev
       - uses: actions/checkout@v4
       - name: Test whole-frame comparison without a GPU
-        run: make check-frame-verify
+        run: make check-frame-verify check-gpu-pattern
+      - name: Compile GPU-origin producer and exercise argument handling
+        run: |
+          make tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test
+          tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test --help
+          set +e
+          tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test --width 0
+          status=$?
+          set -e
+          test "$status" -eq 2
       - name: Compile the checker with CUDA enabled
         run: |
           make tools/hermes-egl-import-check/hermes-egl-import-check \
@@ -128,6 +137,7 @@ jobs:
           test ! -e tools/hermes-kmsctl/hermes-kmsctl
           test ! -e tools/hermes-sysmem-import-check/hermes-sysmem-import-check
           test ! -e tools/hermes-imported-scanout-test/hermes-imported-scanout-test
+          test ! -e tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test
 
       - name: Reject whitespace errors
         run: git diff --check

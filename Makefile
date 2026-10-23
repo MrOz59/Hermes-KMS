@@ -70,7 +70,17 @@ all: modules
 # Opt in to developer diagnostics that need libdrm, VAAPI, GBM, EGL and GL.
 full: modules tools
 
-check: check-uapi check-session check-edid check-edid-conformity check-frame-verify
+check: check-uapi check-session check-edid check-edid-conformity check-frame-verify check-gpu-pattern
+
+.PHONY: check-gpu-pattern
+check-gpu-pattern:
+	@set -eu; \
+		test_tmp="$$(mktemp -d "$${TMPDIR:-/tmp}/hermes-kms-gpu-pattern.XXXXXX")"; \
+		trap '$(RM) -r -- "$$test_tmp"' EXIT; \
+		trap 'exit 1' HUP INT TERM; \
+		$(CC) $(CFLAGS) -std=c11 -Werror -pedantic \
+			tests/gpu-pattern.c -o "$$test_tmp/gpu-pattern"; \
+		"$$test_tmp/gpu-pattern"
 
 .PHONY: check-frame-verify
 check-frame-verify:
@@ -305,6 +315,7 @@ tools: tools/hermes-kmsctl/hermes-kmsctl tools/hermes-kms-import-check/hermes-km
 	tools/hermes-egl-import-check/hermes-egl-import-check tools/hermes-egl-import-check/pitch-detect \
 	tools/hermes-sysmem-import-check/hermes-sysmem-import-check \
 	tools/hermes-imported-scanout-test/hermes-imported-scanout-test \
+	tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test \
 	tools/hermes-hdr-metadata-test/hermes-hdr-metadata-test \
 	tools/hermes-pixel-peek/hermes_pixel_peek tools/hermes-cursor-probe/hermes_cursor_probe
 
@@ -322,6 +333,10 @@ tools/hermes-egl-import-check/hermes-egl-import-check: tools/hermes-egl-import-c
 tools/hermes-imported-scanout-test/hermes-imported-scanout-test: tools/hermes-imported-scanout-test/hermes_imported_scanout_test.c tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h
 	@test -n "$(CURSOR_PROBE_LIBS)" || { printf 'missing libdrm pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(CURSOR_PROBE_CFLAGS) -o $@ $< $(CURSOR_PROBE_LIBS)
+
+tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test: tools/hermes-gpu-scanout-test/hermes_gpu_scanout_test.c tools/hermes-gpu-scanout-test/pattern.h tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h
+	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }
+	$(CC) $(CFLAGS) -std=c11 -Werror $(UAPI_CFLAGS) $(EGL_CHECK_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS)
 
 tools/hermes-hdr-metadata-test/hermes-hdr-metadata-test: tools/hermes-hdr-metadata-test/hermes_hdr_metadata_test.c tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h
 	@test -n "$(CURSOR_PROBE_LIBS)" || { printf 'missing libdrm pkg-config metadata\n' >&2; exit 1; }
@@ -431,6 +446,7 @@ clean-tools:
 	$(RM) tools/hermes-egl-import-check/pitch-detect
 	$(RM) tools/hermes-sysmem-import-check/hermes-sysmem-import-check
 	$(RM) tools/hermes-imported-scanout-test/hermes-imported-scanout-test
+	$(RM) tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test
 	$(RM) tools/hermes-hdr-metadata-test/hermes-hdr-metadata-test
 	$(RM) tools/hermes-pixel-peek/hermes_pixel_peek
 	$(RM) tools/hermes-cursor-probe/hermes_cursor_probe
