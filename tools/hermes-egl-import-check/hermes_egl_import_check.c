@@ -8,14 +8,15 @@
 //     -> glEGLImageTargetTexture2DOES -> FBO readback (proves sampling)
 //     -> cuGraphicsGLRegisterImage (proves the Sunshine/Hermes CUDA interop)
 //
-// This is the exact frame path Hermes uses for NVENC: the encoder imports the
-// captured DMA-BUF through EGL on the render GPU and maps the GL texture into
-// CUDA. VAAPI has its own checker (hermes-kms-import-check); this tool covers
+// This exercises Hermes's opt-in NVENC DMA-BUF consumer. The default NVIDIA
+// capture path still copies through RAM. VAAPI has its own checker; this covers
 // the NVIDIA side of the roadmap ("NVENC/AMF DMA-BUF import validation").
 //
 // Every stage reports PASS / FAIL / SKIPPED / NOT PROVIDED individually and
 // the final RESULT only claims a complete chain when every required stage
-// actually ran and passed.
+// actually ran and passed. It does not execute NVENC encode/decode. Teardown
+// after CUDA is opt-in because of a recorded driver crash; skipping it keeps
+// the exit code incomplete even if all pixel comparisons passed.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -38,6 +39,7 @@
 #include <drm/hermes_kms_drm.h>
 
 #include "../hermes_session.h"
+#include "frame_verify.h"
 
 #include <xf86drm.h>
 
@@ -171,8 +173,8 @@ static void usage(const char *argv0)
 {
 	fprintf(stderr,
 		"Usage: %s [--device /dev/dri/renderDN] [--output N] [--session-file PATH] [--gpu /dev/dri/renderDN] [--wait-ms MS]\n"
-		"       [--no-cuda] [--no-cpu-ref]\n"
-		"Exit codes: 0 = complete chain passed, 1 = a stage failed,\n"
+		"       [--no-cuda] [--no-cpu-ref] [--full-teardown]\n"
+		"Exit codes: 0 = full-frame import checks and cleanup passed, 1 = a stage failed,\n"
 		"            2 = no failures but the chain is incomplete/inconclusive\n",
 		argv0);
 }
@@ -631,6 +633,7 @@ int main(int argc, char **argv)
 	uint32_t wait_ms = 2000;
 	bool do_cuda = true;
 	bool do_cpu_ref = true;
+	bool full_teardown = false;
 	int ret = 1;
 
 	struct stage_results st;
@@ -646,6 +649,8 @@ int main(int argc, char **argv)
 	bool egl_initialized = false;
 	bool gpu_context_faulted = false;
 	bool gpu_cpu_mismatch = false;
+	uint8_t *gpu_pixels = NULL;
+	size_t image_bytes = 0;
 #ifdef HAVE_CUDA
 	CUdevice cuda_dev = 0;
 	bool cuda_ctx_retained = false;
@@ -678,6 +683,8 @@ int main(int argc, char **argv)
 			do_cpu_ref = false;
 		} else if (strcmp(argv[i], "--no-cuda") == 0) {
 			do_cuda = false;
+		} else if (strcmp(argv[i], "--full-teardown") == 0) {
+			full_teardown = true;
 		} else {
 			usage(argv[0]);
 			return 1;
@@ -737,6 +744,11 @@ int main(int argc, char **argv)
 	}
 	GLsizei gl_width = (GLsizei)frame.width;
 	GLsizei gl_height = (GLsizei)frame.height;
+	if (!hermes_frame_bytes(frame.width, frame.height, &image_bytes)) {
+		fprintf(stderr, "FAIL: packed readback size overflows size_t\n");
+		st.acquire = ST_FAIL;
+		goto out;
+	}
 
 	printf("frame: %ux%u format=0x%08x ('%c%c%c%c') modifier=0x%016llx planes=%u pitch0=%u\n",
 	       frame.width, frame.height, frame.format,
@@ -774,7 +786,7 @@ int main(int argc, char **argv)
 	if (!do_cpu_ref) {
 		printf("INFO: CPU reference read skipped (--no-cpu-ref)\n");
 		st.cpu_ref = ST_SKIPPED;
-	} else if ((have_cpu_crc = cpu_crc_rows(&frame, 8, &cpu_crc, &cpu_fault)),
+	} else if ((have_cpu_crc = cpu_crc_rows(&frame, frame.height, &cpu_crc, &cpu_fault)),
 		   cpu_fault == -1) {
 		printf("FAIL: the DMA-BUF never became readable for the CPU within 2s -\n"
 		       "      something still holds it for writing. Re-run with --no-cpu-ref\n"
@@ -785,8 +797,8 @@ int main(int argc, char **argv)
 		printf("FAIL: DMA_BUF_IOCTL_SYNC rejected the CPU reference read\n");
 		st.cpu_ref = ST_FAIL;
 	} else if (have_cpu_crc) {
-		printf("PASS: CPU mmap of plane 0 (canonical BGRA crc32 of first 8 rows: 0x%08x)\n",
-		       cpu_crc);
+		printf("PASS: CPU mmap of plane 0 (canonical BGRA crc32 of all %u rows: 0x%08x)\n",
+		       frame.height, cpu_crc);
 		st.cpu_ref = ST_PASS;
 	} else if (cpu_fault) {
 		printf("FAIL: reading the mapped DMA-BUF faulted (SIG%s) on the exporter's\n"
@@ -969,63 +981,7 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	uint32_t rows = frame.height < 8 ? frame.height : 8;
-	uint8_t *pixels = calloc((size_t) frame.width * rows, 4);
-	if (!pixels) {
-		fprintf(stderr, "FAIL: out of memory for readback buffer\n");
-		st.gl_validate = ST_FAIL;
-		goto out;
-	}
-
-	int fault_sig = 0;
-	if (!guarded_readback(frame.width, rows, pixels, &fault_sig)) {
-		fprintf(stderr,
-			"FAIL: CPU readback of the imported texture faulted (SIG%s) inside the\n"
-			"      GPU driver, on the first byte of its own mapping of the imported\n"
-			"      buffer - the importing driver could not back a CPU mapping of a\n"
-			"      DMA-BUF owned by another driver. This is a limitation of reading\n"
-			"      an imported buffer with the CPU, not evidence that the buffer is\n"
-			"      wrong: the size and stride reported above may be perfectly valid.\n"
-			"\n"
-			"      Hermes never does this. It samples the imported texture on the\n"
-			"      GPU into its own textures and encodes from those, so this stage\n"
-			"      failing does not by itself mean the encode path is broken.\n",
-			fault_sig == SIGBUS ? "BUS" : "SEGV");
-		free(pixels);
-		st.gl_validate = ST_FAIL;
-		gpu_context_faulted = true;
-		goto out;
-	}
-
-	err = glGetError();
-	if (err != GL_NO_ERROR) {
-		fprintf(stderr, "FAIL: glReadPixels from imported texture error=0x%x\n", err);
-		free(pixels);
-		st.gl_validate = ST_FAIL;
-		goto out;
-	}
-
-	uint32_t gpu_crc = 0;
-	for (uint32_t y = 0; y < rows; y++)
-		gpu_crc = crc32_simple(pixels + (size_t) y * frame.width * 4,
-				       frame.width * 4, gpu_crc);
-	free(pixels);
-
-	printf("PASS: GPU readback of imported frame (crc32 of first %u rows: 0x%08x)\n",
-	       rows, gpu_crc);
-	if (have_cpu_crc) {
-		if (gpu_crc == cpu_crc)
-			printf("PASS: GPU readback matches CPU ground truth\n");
-		else {
-			printf("INCONCLUSIVE: GPU/CPU crc mismatch (0x%08x vs 0x%08x); the "
-			       "live buffer may have changed between reads. Use pitch_detect "
-			       "for a drift-filtered verdict.\n",
-			       gpu_crc, cpu_crc);
-			gpu_cpu_mismatch = true;
-		}
-	}
-
-	// --- 6. Emulate the real encoder pipeline --------------------------------
+	// --- 5. Freeze the complete imported image in an own target --------------
 	// Hermes/Sunshine never hands the *imported* texture to CUDA. The GL
 	// converter (egl::sws_t) samples it into textures Sunshine allocated
 	// itself, and only those are registered with CUDA. Reproduce that:
@@ -1062,9 +1018,63 @@ int main(int argc, char **argv)
 		goto out;
 	}
 	printf("PASS: GL converter pass (imported -> own texture)\n");
+
+	// Snapshot the complete, frozen converter target BEFORE CUDA maps it.
+	// GL must not access a resource while CUDA owns its mapping.
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, draw_fbo);
+	uint32_t rows = frame.height;
+	gpu_pixels = calloc(1, image_bytes);
+	if (!gpu_pixels) {
+		fprintf(stderr, "FAIL: out of memory for readback buffer\n");
+		st.gl_validate = ST_FAIL;
+		goto out;
+	}
+
+	int fault_sig = 0;
+	if (!guarded_readback(frame.width, rows, gpu_pixels, &fault_sig)) {
+		fprintf(stderr,
+			"FAIL: reading the own converter target faulted (SIG%s) in the GPU driver\n"
+			"      after the imported frame was copied into it.\n",
+			fault_sig == SIGBUS ? "BUS" : "SEGV");
+		free(gpu_pixels);
+		gpu_pixels = NULL;
+		st.gl_validate = ST_FAIL;
+		gpu_context_faulted = true;
+		goto out;
+	}
+
+	err = glGetError();
+	if (err != GL_NO_ERROR) {
+		fprintf(stderr, "FAIL: glReadPixels from converter target error=0x%x\n", err);
+		free(gpu_pixels);
+		gpu_pixels = NULL;
+		st.gl_validate = ST_FAIL;
+		goto out;
+	}
+
+	uint32_t gpu_crc = 0;
+	for (uint32_t y = 0; y < rows; y++)
+		gpu_crc = crc32_simple(gpu_pixels + (size_t) y * frame.width * 4,
+				       frame.width * 4, gpu_crc);
+
+	printf("PASS: GPU readback of imported frame (crc32 of all %u rows: 0x%08x)\n",
+	       rows, gpu_crc);
+	if (have_cpu_crc) {
+		if (gpu_crc == cpu_crc)
+			printf("PASS: GPU readback matches CPU ground truth\n");
+		else {
+			printf("INCONCLUSIVE: GPU/CPU crc mismatch (0x%08x vs 0x%08x); the "
+			       "live buffer may have changed between reads. Use pitch_detect "
+			       "for a drift-filtered verdict.\n",
+			       gpu_crc, cpu_crc);
+			gpu_cpu_mismatch = true;
+		}
+	}
+
 	st.gl_validate = gpu_cpu_mismatch ? ST_INCONCLUSIVE : ST_PASS;
 
 #ifdef HAVE_CUDA
+	// --- 6. Compare the whole frozen texture through CUDA --------------------
 	if (!do_cuda) {
 		printf("INFO: CUDA stage skipped (--no-cuda)\n");
 		st.cuda_reg = ST_SKIPPED;
@@ -1126,25 +1136,26 @@ int main(int argc, char **argv)
 		}
 
 		CUarray arr;
-		if (cuGraphicsMapResources(1, &res, 0) != CUDA_SUCCESS ||
-		    cuGraphicsSubResourceGetMappedArray(&arr, res, 0, 0) != CUDA_SUCCESS) {
+		cr = cuGraphicsMapResources(1, &res, 0);
+		if (cr != CUDA_SUCCESS) {
 			fprintf(stderr, "FAIL: mapping GL texture into CUDA\n");
 			cuGraphicsUnregisterResource(res);
 			st.cuda_reg = ST_FAIL;
 			goto out;
 		}
+		if (cuGraphicsSubResourceGetMappedArray(&arr, res, 0, 0) != CUDA_SUCCESS) {
+			fprintf(stderr, "FAIL: getting mapped CUDA array\n");
+			cuGraphicsUnmapResources(1, &res, 0);
+			cuGraphicsUnregisterResource(res);
+			st.cuda_reg = ST_FAIL;
+			goto out;
+		}
 
-		// Pull the first row through CUDA and CRC it against the same
-		// row read back through GL: both must see identical bytes of
-		// the same frozen copy (the blit decoupled it from the live
-		// desktop).
-		uint32_t row_bytes = frame.width * 4;
-		uint8_t *cuda_row = malloc(row_bytes);
-		uint8_t *gl_row = malloc(row_bytes);
-		if (!cuda_row || !gl_row) {
-			fprintf(stderr, "FAIL: out of memory for row buffers\n");
-			free(cuda_row);
-			free(gl_row);
+		// Read the entire frozen array. The GL snapshot above predates the
+		// CUDA mapping, so no GL command accesses the mapped resource.
+		uint8_t *cuda_pixels = malloc(image_bytes);
+		if (!cuda_pixels) {
+			fprintf(stderr, "FAIL: out of memory for CUDA snapshot\n");
 			cuGraphicsUnmapResources(1, &res, 0);
 			cuGraphicsUnregisterResource(res);
 			st.cuda_reg = ST_FAIL;
@@ -1156,39 +1167,34 @@ int main(int argc, char **argv)
 		cp.srcMemoryType = CU_MEMORYTYPE_ARRAY;
 		cp.srcArray = arr;
 		cp.dstMemoryType = CU_MEMORYTYPE_HOST;
-		cp.dstHost = cuda_row;
-		cp.dstPitch = row_bytes;
-		cp.WidthInBytes = row_bytes;
-		cp.Height = 1;
-		if (cuMemcpy2D(&cp) != CUDA_SUCCESS) {
-			fprintf(stderr, "FAIL: cuMemcpy2D from mapped array\n");
-			free(cuda_row);
-			free(gl_row);
-			cuGraphicsUnmapResources(1, &res, 0);
-			cuGraphicsUnregisterResource(res);
+		cp.dstHost = cuda_pixels;
+		cp.dstPitch = (size_t)frame.width * 4;
+		cp.WidthInBytes = cp.dstPitch;
+		cp.Height = frame.height;
+		cr = cuMemcpy2D(&cp);
+		const CUresult unmap_result = cuGraphicsUnmapResources(1, &res, 0);
+		const CUresult unregister_result = cuGraphicsUnregisterResource(res);
+		if (cr != CUDA_SUCCESS || unmap_result != CUDA_SUCCESS ||
+		    unregister_result != CUDA_SUCCESS) {
+			fprintf(stderr, "FAIL: CUDA snapshot/copy/unmap/unregister (%d/%d/%d)\n",
+				(int)cr, (int)unmap_result, (int)unregister_result);
+			free(cuda_pixels);
 			st.cuda_reg = ST_FAIL;
 			goto out;
 		}
 
-		glBindFramebuffer(GL_READ_FRAMEBUFFER, draw_fbo);
-		glReadPixels(0, 0, frame.width, 1, GL_RGBA, GL_UNSIGNED_BYTE, gl_row);
-
-		uint32_t cuda_crc = crc32_simple(cuda_row, row_bytes, 0);
-		uint32_t glrow_crc = crc32_simple(gl_row, row_bytes, 0);
-		free(cuda_row);
-		free(gl_row);
-
-		cuGraphicsUnmapResources(1, &res, 0);
-		cuGraphicsUnregisterResource(res);
-
-		printf("PASS: CUDA mapped the converter output (GL interop)\n");
-		st.cuda_reg = ST_PASS;
-		if (cuda_crc == glrow_crc)
-			printf("PASS: CUDA row matches GL row (crc32 0x%08x), data is intact\n",
-			       cuda_crc);
-		else {
-			printf("FAIL: CUDA/GL row crc mismatch (0x%08x vs 0x%08x)\n",
-			       cuda_crc, glrow_crc);
+		size_t mismatch = 0;
+		int comparison = hermes_compare_rgba_bgra(cuda_pixels, gpu_pixels,
+							image_bytes, &mismatch);
+		free(cuda_pixels);
+		if (comparison == 0) {
+			printf("PASS: CUDA matches GL across all %u rows (%zu bytes)\n",
+			       frame.height, image_bytes);
+			st.cuda_reg = ST_PASS;
+		} else {
+			fprintf(stderr, "FAIL: CUDA/GL full-frame mismatch at pixel (%zu,%zu), byte %zu\n",
+				(mismatch / 4) % frame.width,
+				mismatch / ((size_t)frame.width * 4), mismatch);
 			st.cuda_reg = ST_FAIL;
 		}
 	}
@@ -1200,6 +1206,7 @@ cuda_done:;
 #endif
 
 out:
+	free(gpu_pixels);
 	// The verdict must never be lost to a driver teardown quirk: print and
 	// flush it before any EGL/GL/CUDA cleanup runs.
 	printf("\nstage summary:\n");
@@ -1208,7 +1215,12 @@ out:
 	printf("  CPU reference read:  %s\n", stage_name(st.cpu_ref));
 	printf("  EGL import:          %s\n", stage_name(st.egl_import));
 	printf("  OpenGL validation:   %s\n", stage_name(st.gl_validate));
-	printf("  CUDA registration:   %s\n", stage_name(st.cuda_reg));
+	printf("  CUDA full-frame:     %s\n", stage_name(st.cuda_reg));
+	printf("  NVENC encode/decode: NOT TESTED (this tool validates import only)\n");
+	printf("  GPU teardown:        %s\n", full_teardown ? "REQUESTED (verdict follows cleanup)" : "NOT VALIDATED");
+#ifndef HAVE_CUDA
+	(void)full_teardown;
+#endif
 
 	bool any_fail = st.acquire == ST_FAIL || st.fence == ST_FAIL ||
 			st.cpu_ref == ST_FAIL || st.egl_import == ST_FAIL ||
@@ -1223,13 +1235,13 @@ out:
 	if (any_fail) {
 		printf("RESULT: FAIL, the chain is broken at the first failed stage above\n");
 		ret = 1;
-	} else if (complete) {
-		printf("RESULT: PASS, complete NVENC-style import chain "
-		       "(DMA-BUF -> EGL -> GL converter -> CUDA)\n");
+	} else if (complete && full_teardown) {
+		printf("PIXEL CHECKS: PASS, full-frame import comparison "
+		       "(DMA-BUF -> EGL -> GL converter -> CUDA); cleanup follows\n");
 		ret = 0;
 	} else {
-		printf("RESULT: INCOMPLETE, skipped or inconclusive stages keep the "
-		       "chain unvalidated\n");
+		printf("RESULT: INCOMPLETE, skipped/inconclusive stages or untested teardown "
+		       "keep the chain unvalidated (use --full-teardown to test cleanup)\n");
 		ret = 2;
 	}
 	fflush(stdout);
@@ -1254,13 +1266,13 @@ out:
 	// either. This keeps the exit code deterministic, which matters more
 	// for a diagnostic tool than freeing GPU handles a millisecond before
 	// the process ends.
-	if (cuda_interop_ran) {
+	if (cuda_interop_ran && !full_teardown) {
 		fprintf(stderr, "INFO: skipping GPU object teardown after CUDA interop "
 				"(NVIDIA driver workaround)\n");
 		close_frame_fds(&frame);
 		if (hermes_fd >= 0)
 			close(hermes_fd);
-		_exit(ret);
+		_exit(ret == 0 ? 2 : ret);
 	}
 #endif
 
@@ -1277,10 +1289,13 @@ out:
 			GLuint texs[2] = {tex, conv};
 			glDeleteTextures(2, texs);
 		}
-		eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+		if (!eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT))
+			ret = 1;
 		if (ctx != EGL_NO_CONTEXT)
-			eglDestroyContext(dpy, ctx);
-		eglTerminate(dpy);
+			if (!eglDestroyContext(dpy, ctx))
+				ret = 1;
+		if (!eglTerminate(dpy))
+			ret = 1;
 	}
 	if (gbm)
 		gbm_device_destroy(gbm);
@@ -1293,10 +1308,14 @@ out:
 	// Released only now, after the EGL/GL teardown: see the retain comment
 	// in the CUDA stage.
 	if (cuda_ctx_retained) {
-		cuCtxSetCurrent(NULL);
-		cuDevicePrimaryCtxRelease(cuda_dev);
+		if (cuCtxSetCurrent(NULL) != CUDA_SUCCESS ||
+		    cuDevicePrimaryCtxRelease(cuda_dev) != CUDA_SUCCESS)
+			ret = 1;
 	}
 #endif
 
+	if (full_teardown)
+		printf("RESULT after GPU teardown: %s\n", ret == 0 ? "PASS (full-frame import and cleanup; NVENC not tested)" :
+		       ret == 1 ? "FAIL (cleanup or earlier stage failed)" : "INCOMPLETE (skipped/inconclusive stages)");
 	return ret;
 }

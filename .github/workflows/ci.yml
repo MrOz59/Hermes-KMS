@@ -12,6 +12,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  experimental-cuda-checker:
+    if: github.ref == 'refs/heads/experimental/nvidia-zero-copy' || github.base_ref == 'experimental/nvidia-zero-copy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: nvidia/cuda:12.9.1-devel-ubuntu24.04
+    steps:
+      - name: Install checker dependencies
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y \
+            build-essential git pkg-config libdrm-dev libegl-dev libgbm-dev libgl-dev
+      - uses: actions/checkout@v4
+      - name: Test whole-frame comparison without a GPU
+        run: make check-frame-verify
+      - name: Compile the checker with CUDA enabled
+        run: |
+          make tools/hermes-egl-import-check/hermes-egl-import-check \
+            HAVE_CUDA=1 CUDA_CFLAGS=-I/usr/local/cuda/include \
+            CUDA_LIBS='-L/usr/local/cuda/lib64/stubs -lcuda'
+
   userspace-and-packaging:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
