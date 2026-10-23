@@ -12,8 +12,11 @@ int main(void)
 	assert(hermes_gpu_pattern(0, 1, 0) == 0xf89608);
 	assert(hermes_gpu_pattern(2559, 1439, 0x3917ab25) == 0x99cd21);
 	assert(hermes_gpu_pattern(17, 33, UINT32_MAX) == 0xe396f2);
-	const unsigned char vector[] = {0xfd, 0x4e, 0xb7, 255};
+	unsigned char vector[] = {0x8d, 0xe0, 0x34, 255};
 	size_t bad = SIZE_MAX;
+	assert(!hermes_gpu_pattern_verify(vector, 1, 1, 0x3917ab25, &bad));
+	vector[0] = 0x34; vector[2] = 0x8d;
+	assert(hermes_gpu_pattern_verify(vector, 1, 1, 0x3917ab25, &bad) == 1 && bad == 0);
 	assert(hermes_gpu_pattern_verify(vector, 1, 1, 0, &bad) == 1 && bad == 0);
 	assert(hermes_gpu_pattern_verify(NULL, 1, 1, 0, &bad) == -1);
 	assert(hermes_gpu_pattern_verify(vector, 0, 1, 0, &bad) == -1);

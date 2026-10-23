@@ -372,7 +372,8 @@ int main(int argc, char **argv)
 	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE || verify_pixels(&g, 0, w, h)) goto out;
 	for (unsigned int i = 0; i < g.planes; i++)
 		if (drmPrimeFDToHandle(card, g.fd[i], &handles[i])) goto out;
-	uint64_t modifiers[4] = {g.modifier, g.modifier, g.modifier, g.modifier};
+	uint64_t modifiers[4] = {0};
+	for (unsigned int i = 0; i < g.planes; i++) modifiers[i] = g.modifier;
 	if (drmModeAddFB2WithModifiers(card, w, h, FORMAT, handles, g.pitch, g.offset,
 		modifiers, &fb, DRM_MODE_FB_MODIFIERS)) goto out;
 	if (interrupted || ioctl(card, DRM_IOCTL_HERMES_KMS_SET_OUTPUT, &output)) goto out;

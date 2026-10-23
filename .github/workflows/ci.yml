@@ -27,6 +27,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test whole-frame comparison without a GPU
         run: make check-frame-verify check-gpu-pattern
+      - name: Check GPU pattern with address and undefined-behavior sanitizers
+        run: make check-gpu-pattern CFLAGS='-O1 -g -Wall -Wextra -fsanitize=address,undefined'
       - name: Compile GPU-origin producer and exercise argument handling
         run: |
           make tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test
