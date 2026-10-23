@@ -16,6 +16,7 @@ int main(void)
 	size_t bad = SIZE_MAX;
 	assert(!hermes_gpu_pattern_verify(vector, 1, 1, 0x3917ab25, &bad));
 	vector[0] = 0x34; vector[2] = 0x8d;
+	assert(!hermes_gpu_pattern_verify_bgra(vector, 1, 1, HERMES_GPU_PATTERN_SEED, &bad));
 	assert(hermes_gpu_pattern_verify(vector, 1, 1, 0x3917ab25, &bad) == 1 && bad == 0);
 	assert(hermes_gpu_pattern_verify(vector, 1, 1, 0, &bad) == 1 && bad == 0);
 	assert(hermes_gpu_pattern_verify(NULL, 1, 1, 0, &bad) == -1);
@@ -32,6 +33,7 @@ int main(void)
 		pixels[i + 2] = (v >> 16) & 255; pixels[i + 3] = 255;
 	}
 	assert(!hermes_gpu_pattern_verify(pixels, w, h, seed, &bad));
+	assert(hermes_gpu_pattern_verify_bgra(pixels, w, h, seed, &bad) == 1);
 	const size_t corrupt[] = {0, 2 * 1024 * 1024 - 1, 2 * 1024 * 1024,
 		2 * 1024 * 1024 + 1, bytes - 1};
 	for (size_t i = 0; i < sizeof(corrupt) / sizeof(corrupt[0]); i++) {
@@ -42,6 +44,16 @@ int main(void)
 	}
 	/* A wrong seed, vertical origin or channel order must not pass. */
 	assert(hermes_gpu_pattern_verify(pixels, w, h, seed + 1, &bad) == 1);
+	for (size_t i = 0; i < bytes; i += 4) {
+		unsigned char t = pixels[i]; pixels[i] = pixels[i + 2]; pixels[i + 2] = t;
+	}
+	assert(!hermes_gpu_pattern_verify_bgra(pixels, w, h, seed, &bad));
+	pixels[bytes - 1] ^= 1;
+	assert(hermes_gpu_pattern_verify_bgra(pixels, w, h, seed, &bad) == 1 && bad == bytes - 1);
+	pixels[bytes - 1] ^= 1;
+	for (size_t i = 0; i < bytes; i += 4) {
+		unsigned char t = pixels[i]; pixels[i] = pixels[i + 2]; pixels[i + 2] = t;
+	}
 	for (size_t i = 0; i < (size_t)w * 4; i++) {
 		unsigned char t = pixels[i]; pixels[i] = pixels[bytes - (size_t)w * 4 + i];
 		pixels[bytes - (size_t)w * 4 + i] = t;

@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define HERMES_GPU_PATTERN_SEED UINT32_C(0x3917ab25)
+
 /* Same unsigned 32-bit arithmetic as the GLSL shader. Coordinates are GL's
  * bottom-left origin. Every row/page has different data; alpha is opaque. */
 static inline uint32_t hermes_gpu_pattern(uint32_t x, uint32_t y, uint32_t seed)
@@ -17,8 +19,8 @@ static inline uint32_t hermes_gpu_pattern(uint32_t x, uint32_t y, uint32_t seed)
 }
 
 /* Packed RGBA bytes, without alignment or host-endian assumptions. */
-static inline int hermes_gpu_pattern_verify(const unsigned char *rgba,
-	uint32_t width, uint32_t height, uint32_t seed, size_t *bad_byte)
+static inline int hermes_gpu_pattern_verify_order(const unsigned char *rgba,
+	uint32_t width, uint32_t height, uint32_t seed, int bgra, size_t *bad_byte)
 {
 	if (!rgba || !width || !height || (size_t)width > SIZE_MAX / 4 / height)
 		return -1;
@@ -27,7 +29,8 @@ static inline int hermes_gpu_pattern_verify(const unsigned char *rgba,
 			uint32_t v = hermes_gpu_pattern(x, y, seed);
 			size_t i = ((size_t)y * width + x) * 4;
 			for (unsigned int c = 0; c < 4; c++) {
-				unsigned char expected = c == 3 ? 255 : (v >> (c * 8)) & 255;
+				unsigned int channel = bgra && c < 3 ? 2 - c : c;
+				unsigned char expected = c == 3 ? 255 : (v >> (channel * 8)) & 255;
 				if (rgba[i + c] != expected) {
 					if (bad_byte) *bad_byte = i + c;
 					return 1;
@@ -36,5 +39,17 @@ static inline int hermes_gpu_pattern_verify(const unsigned char *rgba,
 		}
 	}
 	return 0;
+}
+
+static inline int hermes_gpu_pattern_verify(const unsigned char *rgba,
+	uint32_t width, uint32_t height, uint32_t seed, size_t *bad_byte)
+{
+	return hermes_gpu_pattern_verify_order(rgba, width, height, seed, 0, bad_byte);
+}
+
+static inline int hermes_gpu_pattern_verify_bgra(const unsigned char *bgra,
+	uint32_t width, uint32_t height, uint32_t seed, size_t *bad_byte)
+{
+	return hermes_gpu_pattern_verify_order(bgra, width, height, seed, 1, bad_byte);
 }
 #endif

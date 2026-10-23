@@ -27,7 +27,7 @@
 #include "pattern.h"
 
 #define FORMAT DRM_FORMAT_ARGB8888
-#define SEED UINT32_C(0x3917ab25)
+#define SEED HERMES_GPU_PATTERN_SEED
 static volatile sig_atomic_t interrupted;
 static void stop(int sig) { interrupted = sig; }
 

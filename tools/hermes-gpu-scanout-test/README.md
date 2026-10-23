@@ -68,7 +68,7 @@ Wait for `READY`. In terminal B, on the same GPU, run the CUDA-enabled checker:
 tools/hermes-egl-import-check/hermes-egl-import-check \
   --device /dev/dri/cardN --gpu /dev/dri/renderDN \
   --session-file "$XDG_RUNTIME_DIR/hermes-gpu-test.session" \
-  --no-cpu-ref --full-teardown
+  --expect-gpu-pattern --full-teardown
 ```
 
 Finish consumers before the hold expires or stopping the producer. The
@@ -77,9 +77,13 @@ printed, and removed during cleanup. The owner session is disabled on exit;
 SIGINT/SIGTERM request orderly cleanup. A forced kill can leave the credential
 file behind; it cannot authorize a replacement session.
 
-`--no-cpu-ref` avoids trying to map GPU-origin tiled storage. The producer
-already checks pixels against the known pattern; the checker separately checks
-the complete GL-to-CUDA image and real interop teardown. Compile that tool with
+`--expect-gpu-pattern` avoids trying to map GPU-origin tiled storage and checks
+every GL-readback pixel against the producer's fixed shader pattern instead.
+Only use it with this producer, not an ordinary desktop. The checker then checks
+the complete GL-to-CUDA image and real interop teardown. It can return success
+only if the known pattern, CUDA comparison and requested cleanup pass. Its
+current import path supports one memory plane; an auxiliary-plane layout is
+rejected explicitly. Compile that tool with
 `HAVE_CUDA=1` as described in its README. Use a disposable test session because
 the previously observed NVIDIA teardown crash is specifically being tested.
 

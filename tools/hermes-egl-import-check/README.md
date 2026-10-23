@@ -28,6 +28,7 @@ stage summary:
   frame acquisition:   PASS
   fence wait:          PASS | FAIL | NOT PROVIDED
   CPU reference read:  PASS | SKIPPED
+  known GPU pattern:   PASS | FAIL | not run
   EGL import:          PASS | FAIL
   OpenGL validation:   PASS | FAIL
   CUDA full-frame:     PASS | FAIL | SKIPPED
@@ -36,7 +37,7 @@ stage summary:
 ```
 
 Exit codes: `0` when all full-frame import checks and requested cleanup passed,
-`1` when a stage failed, `2` when skipped/inconclusive stages or untested
+`1` when a stage failed, `2` when required skipped/inconclusive stages or untested
 teardown keep the chain unvalidated. The CUDA teardown workaround now returns
 `2`, even when every pixel comparison passes. NVENC encoding/decoding is not
 executed by this checker and is never implied by its result.
@@ -69,13 +70,19 @@ cc -O2 -Wall -DHAVE_CUDA -I ../../include/uapi -I/usr/include/libdrm \
 ```
 
 Options: `--device /dev/dri/cardN` (Hermes node), `--gpu /dev/dri/renderDN`
-(import GPU), `--wait-ms MS`, `--no-cuda`, `--no-cpu-ref`, and
+(import GPU), `--wait-ms MS`, `--no-cuda`, `--no-cpu-ref`, `--expect-gpu-pattern`, and
 `--full-teardown`. Secure capture requires `--session-file PATH`.
 
 `--full-teardown` disables the recorded CUDA/GL teardown workaround to exercise
 the real object lifecycle. A driver crash remains a failing process status;
 use it in a disposable test session. The default retains the workaround and
 reports incomplete validation instead of silently approving the lifecycle.
+
+`--expect-gpu-pattern` is only for the matching `hermes-gpu-scanout-test`
+producer. It replaces the CPU mmap reference with a full-image comparison to
+that producer's fixed shader pattern, then still requires the complete CUDA
+comparison and requested teardown for success. Ordinary desktops must not use
+this option. `--no-cpu-ref` by itself still leaves validation incomplete.
 
 The GPU-free `make check-frame-verify` regression deliberately corrupts bytes
 around the 2 MiB boundary and at the image end, including cases that the old

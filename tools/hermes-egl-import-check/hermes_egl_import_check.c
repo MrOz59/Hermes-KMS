@@ -40,6 +40,7 @@
 
 #include "../hermes_session.h"
 #include "frame_verify.h"
+#include "../hermes-gpu-scanout-test/pattern.h"
 
 #include <xf86drm.h>
 
@@ -105,6 +106,7 @@ struct stage_results {
 	enum stage_result acquire;
 	enum stage_result fence;
 	enum stage_result cpu_ref;
+	enum stage_result pattern_ref;
 	enum stage_result egl_import;
 	enum stage_result gl_validate;
 	enum stage_result cuda_reg;
@@ -173,7 +175,7 @@ static void usage(const char *argv0)
 {
 	fprintf(stderr,
 		"Usage: %s [--device /dev/dri/renderDN] [--output N] [--session-file PATH] [--gpu /dev/dri/renderDN] [--wait-ms MS]\n"
-		"       [--no-cuda] [--no-cpu-ref] [--full-teardown]\n"
+		"       [--no-cuda] [--no-cpu-ref] [--expect-gpu-pattern] [--full-teardown]\n"
 		"Exit codes: 0 = full-frame import checks and cleanup passed, 1 = a stage failed,\n"
 		"            2 = no failures but the chain is incomplete/inconclusive\n",
 		argv0);
@@ -633,6 +635,7 @@ int main(int argc, char **argv)
 	uint32_t wait_ms = 2000;
 	bool do_cuda = true;
 	bool do_cpu_ref = true;
+	bool expect_gpu_pattern = false;
 	bool full_teardown = false;
 	int ret = 1;
 
@@ -680,6 +683,9 @@ int main(int argc, char **argv)
 				return 2;
 			}
 		} else if (strcmp(argv[i], "--no-cpu-ref") == 0) {
+			do_cpu_ref = false;
+		} else if (strcmp(argv[i], "--expect-gpu-pattern") == 0) {
+			expect_gpu_pattern = true;
 			do_cpu_ref = false;
 		} else if (strcmp(argv[i], "--no-cuda") == 0) {
 			do_cuda = false;
@@ -784,7 +790,8 @@ int main(int argc, char **argv)
 	bool have_cpu_crc = false;
 
 	if (!do_cpu_ref) {
-		printf("INFO: CPU reference read skipped (--no-cpu-ref)\n");
+		printf("INFO: CPU reference read skipped (%s)\n",
+		       expect_gpu_pattern ? "known GPU pattern requested" : "--no-cpu-ref");
 		st.cpu_ref = ST_SKIPPED;
 	} else if ((have_cpu_crc = cpu_crc_rows(&frame, frame.height, &cpu_crc, &cpu_fault)),
 		   cpu_fault == -1) {
@@ -1072,6 +1079,20 @@ int main(int argc, char **argv)
 	}
 
 	st.gl_validate = gpu_cpu_mismatch ? ST_INCONCLUSIVE : ST_PASS;
+	if (expect_gpu_pattern) {
+		size_t bad = 0;
+		int mismatch = frame.format != DRM_FORMAT_ARGB8888 ? -1 :
+			hermes_gpu_pattern_verify_bgra(gpu_pixels, frame.width, frame.height,
+				HERMES_GPU_PATTERN_SEED, &bad);
+		if (mismatch) {
+			fprintf(stderr, "FAIL: known GPU pattern (requires producer ARGB8888), status=%d first_bad_byte=%zu\n",
+				mismatch, bad);
+			st.pattern_ref = ST_FAIL;
+			goto out;
+		}
+		printf("PASS: every GPU-readback pixel matches the producer's known pattern\n");
+		st.pattern_ref = ST_PASS;
+	}
 
 #ifdef HAVE_CUDA
 	// --- 6. Compare the whole frozen texture through CUDA --------------------
@@ -1213,6 +1234,7 @@ out:
 	printf("  frame acquisition:   %s\n", stage_name(st.acquire));
 	printf("  fence wait:          %s\n", stage_name(st.fence));
 	printf("  CPU reference read:  %s\n", stage_name(st.cpu_ref));
+	printf("  known GPU pattern:   %s\n", stage_name(st.pattern_ref));
 	printf("  EGL import:          %s\n", stage_name(st.egl_import));
 	printf("  OpenGL validation:   %s\n", stage_name(st.gl_validate));
 	printf("  CUDA full-frame:     %s\n", stage_name(st.cuda_reg));
@@ -1223,11 +1245,11 @@ out:
 #endif
 
 	bool any_fail = st.acquire == ST_FAIL || st.fence == ST_FAIL ||
-			st.cpu_ref == ST_FAIL || st.egl_import == ST_FAIL ||
+			st.cpu_ref == ST_FAIL || st.pattern_ref == ST_FAIL || st.egl_import == ST_FAIL ||
 			st.gl_validate == ST_FAIL || st.cuda_reg == ST_FAIL;
 	bool complete = st.acquire == ST_PASS &&
 			(st.fence == ST_PASS || st.fence == ST_NOT_PROVIDED) &&
-			st.cpu_ref == ST_PASS &&
+			(st.cpu_ref == ST_PASS || st.pattern_ref == ST_PASS) &&
 			st.egl_import == ST_PASS &&
 			st.gl_validate == ST_PASS &&
 			st.cuda_reg == ST_PASS;
