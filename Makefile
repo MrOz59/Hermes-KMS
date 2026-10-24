@@ -326,6 +326,7 @@ tools: tools/hermes-kmsctl/hermes-kmsctl tools/hermes-kms-import-check/hermes-km
 	tools/hermes-sysmem-import-check/hermes-sysmem-import-check \
 	tools/hermes-imported-scanout-test/hermes-imported-scanout-test \
 	tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test \
+	tools/hermes-import-cache-check/hermes-import-cache-check \
 	tools/hermes-hdr-metadata-test/hermes-hdr-metadata-test \
 	tools/hermes-pixel-peek/hermes_pixel_peek tools/hermes-cursor-probe/hermes_cursor_probe
 
@@ -347,6 +348,10 @@ tools/hermes-imported-scanout-test/hermes-imported-scanout-test: tools/hermes-im
 tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test: tools/hermes-gpu-scanout-test/hermes_gpu_scanout_test.c tools/hermes-gpu-scanout-test/modifiers.h tools/hermes-gpu-scanout-test/pattern.h tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h
 	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) -std=c11 -Werror $(UAPI_CFLAGS) $(EGL_CHECK_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS)
+
+tools/hermes-import-cache-check/hermes-import-cache-check: tools/hermes-import-cache-check/hermes_import_cache_check.c tools/hermes-gpu-scanout-test/modifiers.h tools/hermes-gpu-scanout-test/pattern.h
+	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }
+	$(CC) $(CFLAGS) -std=c11 -Werror $(EGL_CHECK_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS)
 
 tools/hermes-hdr-metadata-test/hermes-hdr-metadata-test: tools/hermes-hdr-metadata-test/hermes_hdr_metadata_test.c tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h
 	@test -n "$(CURSOR_PROBE_LIBS)" || { printf 'missing libdrm pkg-config metadata\n' >&2; exit 1; }
@@ -457,6 +462,7 @@ clean-tools:
 	$(RM) tools/hermes-sysmem-import-check/hermes-sysmem-import-check
 	$(RM) tools/hermes-imported-scanout-test/hermes-imported-scanout-test
 	$(RM) tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test
+	$(RM) tools/hermes-import-cache-check/hermes-import-cache-check
 	$(RM) tools/hermes-hdr-metadata-test/hermes-hdr-metadata-test
 	$(RM) tools/hermes-pixel-peek/hermes_pixel_peek
 	$(RM) tools/hermes-cursor-probe/hermes_cursor_probe
