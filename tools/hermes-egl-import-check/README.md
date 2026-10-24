@@ -11,9 +11,9 @@ Validates the NVENC-style consumer chain for a live Hermes-KMS frame:
 ACQUIRE_FRAME (DMA-BUF) -> wait on the exported sync file
   -> eglCreateImage(EGL_LINUX_DMA_BUF_EXT)
   -> texture bind (OES, falling back to glEGLImageTargetTexStorageEXT)
-  -> FBO readback (proves sampling)
   -> GL blit into an own texture -> cuGraphicsGLRegisterImage
      (mirrors the Sunshine/Hermes CUDA converter flow)
+  -> whole-frame GL/CUDA comparison of that frozen texture
 ```
 
 The tool follows the driver's synchronization contract: a successful
@@ -28,14 +28,26 @@ stage summary:
   frame acquisition:   PASS
   fence wait:          PASS | FAIL | NOT PROVIDED
   CPU reference read:  PASS | SKIPPED
+  known GPU pattern:   PASS | FAIL | not run
   EGL import:          PASS | FAIL
   OpenGL validation:   PASS | FAIL
-  CUDA registration:   PASS | FAIL | SKIPPED
+  CUDA full-frame:     PASS | FAIL | SKIPPED
+  NVENC encode/decode: NOT TESTED
+  GPU teardown:        REQUESTED | NOT VALIDATED
 ```
 
-Exit codes: `0` when the complete chain ran and passed, `1` when a stage
-failed, `2` when nothing failed but skipped stages keep the chain
-unvalidated (for example `--no-cuda` or a build without CUDA).
+Exit codes: `0` when all full-frame import checks and requested cleanup passed,
+`1` when a stage failed, `2` when required skipped/inconclusive stages or untested
+teardown keep the chain unvalidated. The CUDA teardown workaround now returns
+`2`, even when every pixel comparison passes. NVENC encoding/decoding is not
+executed by this checker and is never implied by its result.
+
+The CPU reference covers every row. GPU readback happens from an own frozen
+GL target, avoiding direct CPU readback of the foreign imported texture. Its
+entire image is compared against CUDA, with explicit RGBA/BGRA swizzling, and
+the GL snapshot is taken before CUDA maps the texture. A live CPU/GPU mismatch
+remains inconclusive because the compositor can update its source between
+reads; use a static producer pattern to investigate import corruption.
 
 The CUDA device is selected with `cuGLGetDevices()` so it matches the GPU
 behind the GL context (`--gpu`), not blindly device 0, and context handling
@@ -58,7 +70,23 @@ cc -O2 -Wall -DHAVE_CUDA -I ../../include/uapi -I/usr/include/libdrm \
 ```
 
 Options: `--device /dev/dri/cardN` (Hermes node), `--gpu /dev/dri/renderDN`
-(import GPU), `--wait-ms MS`, `--no-cuda`.
+(import GPU), `--wait-ms MS`, `--no-cuda`, `--no-cpu-ref`, `--expect-gpu-pattern`, and
+`--full-teardown`. Secure capture requires `--session-file PATH`.
+
+`--full-teardown` disables the recorded CUDA/GL teardown workaround to exercise
+the real object lifecycle. A driver crash remains a failing process status;
+use it in a disposable test session. The default retains the workaround and
+reports incomplete validation instead of silently approving the lifecycle.
+
+`--expect-gpu-pattern` is only for the matching `hermes-gpu-scanout-test`
+producer. It replaces the CPU mmap reference with a full-image comparison to
+that producer's fixed shader pattern, then still requires the complete CUDA
+comparison and requested teardown for success. Ordinary desktops must not use
+this option. `--no-cpu-ref` by itself still leaves validation incomplete.
+
+The GPU-free `make check-frame-verify` regression deliberately corrupts bytes
+around the 2 MiB boundary and at the image end, including cases that the old
+eight-row/one-row checks would miss. `make check` includes that regression.
 
 ## pitch_detect.c
 

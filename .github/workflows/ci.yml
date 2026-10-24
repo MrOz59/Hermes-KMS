@@ -12,6 +12,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  experimental-cuda-checker:
+    if: github.ref == 'refs/heads/experimental/nvidia-zero-copy' || github.base_ref == 'experimental/nvidia-zero-copy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: nvidia/cuda:12.9.1-devel-ubuntu24.04
+    steps:
+      - name: Install checker dependencies
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y \
+            build-essential git pkg-config libdrm-dev libegl-dev libgbm-dev libgl-dev
+      - uses: actions/checkout@v4
+      - name: Test whole-frame comparison without a GPU
+        run: make check-frame-verify check-gpu-pattern check-gpu-modifiers
+      - name: Check GPU pattern and modifiers with address and undefined-behavior sanitizers
+        run: make check-gpu-pattern check-gpu-modifiers CFLAGS='-O1 -g -Wall -Wextra -fsanitize=address,undefined'
+      - name: Compile GPU-origin producer and exercise argument handling
+        run: |
+          make tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test
+          tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test --help
+          expect_invalid() {
+            set +e
+            "$@"
+            status=$?
+            set -e
+            test "$status" -eq 2
+          }
+          expect_invalid tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test --width 0
+          expect_invalid tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test \
+            --device /dev/null --gpu /dev/null --modifiers tiled
+          expect_invalid tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test --list-modifiers
+          expect_invalid tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test \
+            --list-modifiers --gpu /dev/null --hold-seconds 5
+      - name: Compile the cross-process import-cache check and exercise argument handling
+        run: |
+          make tools/hermes-import-cache-check/hermes-import-cache-check
+          tools/hermes-import-cache-check/hermes-import-cache-check --help
+          for args in "" "--gpu /dev/null --buffers 0" "--gpu /dev/null --rounds 1" \
+                      "--gpu /dev/null --modifiers tiled"; do
+            set +e
+            # shellcheck disable=SC2086
+            tools/hermes-import-cache-check/hermes-import-cache-check $args
+            status=$?
+            set -e
+            test "$status" -eq 2
+          done
+      - name: Compile the checker with CUDA enabled
+        run: |
+          make tools/hermes-egl-import-check/hermes-egl-import-check \
+            HAVE_CUDA=1 CUDA_CFLAGS=-I/usr/local/cuda/include \
+            CUDA_LIBS='-L/usr/local/cuda/lib64/stubs -lcuda'
+
   userspace-and-packaging:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -107,6 +160,8 @@ jobs:
           test ! -e tools/hermes-kmsctl/hermes-kmsctl
           test ! -e tools/hermes-sysmem-import-check/hermes-sysmem-import-check
           test ! -e tools/hermes-imported-scanout-test/hermes-imported-scanout-test
+          test ! -e tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test
+          test ! -e tools/hermes-import-cache-check/hermes-import-cache-check
 
       - name: Reject whitespace errors
         run: git diff --check
