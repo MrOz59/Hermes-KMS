@@ -70,7 +70,17 @@ all: modules
 # Opt in to developer diagnostics that need libdrm, VAAPI, GBM, EGL and GL.
 full: modules tools
 
-check: check-uapi check-session check-edid check-edid-conformity check-frame-verify check-gpu-pattern
+check: check-uapi check-session check-edid check-edid-conformity check-frame-verify check-gpu-pattern check-gpu-modifiers
+
+.PHONY: check-gpu-modifiers
+check-gpu-modifiers:
+	@set -eu; \
+		test_tmp="$$(mktemp -d "$${TMPDIR:-/tmp}/hermes-kms-gpu-modifiers.XXXXXX")"; \
+		trap '$(RM) -r -- "$$test_tmp"' EXIT; \
+		trap 'exit 1' HUP INT TERM; \
+		$(CC) $(CFLAGS) -std=c11 -Werror -pedantic \
+			tests/gpu-modifiers.c -o "$$test_tmp/gpu-modifiers"; \
+		"$$test_tmp/gpu-modifiers"
 
 .PHONY: check-gpu-pattern
 check-gpu-pattern:
@@ -334,7 +344,7 @@ tools/hermes-imported-scanout-test/hermes-imported-scanout-test: tools/hermes-im
 	@test -n "$(CURSOR_PROBE_LIBS)" || { printf 'missing libdrm pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(CURSOR_PROBE_CFLAGS) -o $@ $< $(CURSOR_PROBE_LIBS)
 
-tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test: tools/hermes-gpu-scanout-test/hermes_gpu_scanout_test.c tools/hermes-gpu-scanout-test/pattern.h tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h
+tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test: tools/hermes-gpu-scanout-test/hermes_gpu_scanout_test.c tools/hermes-gpu-scanout-test/modifiers.h tools/hermes-gpu-scanout-test/pattern.h tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h
 	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) -std=c11 -Werror $(UAPI_CFLAGS) $(EGL_CHECK_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS)
 

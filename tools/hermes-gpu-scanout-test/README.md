@@ -51,6 +51,43 @@ reported with a different plane count; these fail the experiment rather than
 being flattened, relabelled linear, or copied into system memory. The producer
 does not change the driver's advertised modifiers or any kernel ABI.
 
+## Which layout, and what a compositor could choose
+
+By default the BO may use any modifier the GPU can render into
+(`--modifiers egl`). A compositor is more constrained: when KWin renders on
+one GPU and imports the result into another device's output, it intersects
+that output plane's `IN_FORMATS` with the render GPU's non-external-only
+modifiers. Hermes-KMS accepts any layout at `ADDFB2`, but advertises only
+linear unless `scanout_modifiers=` lists more, so with the defaults KWin can
+only keep a GPU-origin scanout if the GPU renders linear buffers. Two modes
+reproduce that:
+
+- `--modifiers plane` allocates only from the GPU's renderable modifiers that
+  the card's primary plane advertises for ARGB8888. An empty intersection
+  fails with the reason: KWin would fall back to a CPU copy into a dumb
+  buffer.
+- `--modifiers linear` allocates linear only, the default-configuration case.
+
+`--list-modifiers` prints, without touching any output or needing DRM master:
+the GPU's renderable and external-only ARGB8888/XRGB8888 modifiers, decoded
+(NVIDIA block-linear fields, including the GB20x sector layouts); the card's
+plane `IN_FORMATS` and the KWin-style intersection when `--device` is given;
+and a ready `scanout_modifiers=` value (non-linear renderable layouts, at most
+15). Advertising NVIDIA layouts lets the compositor scan out tiled buffers
+that only a GPU import can read, so Hermes's NVENC sessions then need
+`HERMES_KMS_EXPERIMENTAL_NVENC_DMABUF=auto` (or `1`), and encoders on other
+GPUs cannot use those frames.
+
+```sh
+tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test \
+  --list-modifiers --gpu /dev/dri/renderDN --device /dev/dri/cardN
+tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test \
+  --device /dev/dri/cardN --gpu /dev/dri/renderDN --modifiers plane
+```
+
+The modifier decoding, the intersection and the `IN_FORMATS` blob parser are
+covered without a GPU by `make check-gpu-modifiers` (`tests/gpu-modifiers.c`).
+
 ## Attach the GL/CUDA checker
 
 Keep the static producer alive in terminal A, publishing a private capture
@@ -103,6 +140,18 @@ the experimental Hermes consumer for normal sessions.
   accompany every plane, including auxiliary planes.
 - [Kernel buffer exchange contract](https://docs.kernel.org/userspace-api/dma-buf-alloc-exchange.html):
   format/modifier metadata is required; it does not establish memory placement.
+- [NVIDIA GB20x modifiers](https://lkml.iu.edu/hypermail/linux/kernel/2510.3/06153.html):
+  the block-linear sector layout gained bits 27:26 for Blackwell 8/16-bpp
+  surfaces, so layouts are not interchangeable across pre-GB20x and GB20x.
+- [KWin multi-GPU surfaces](https://lxr.kde.org/source/plasma/kwin/src/backends/drm/drm_egl_layer_surface.cpp):
+  import modes Egl, Dmabuf, LinearDmabuf and DumbBuffer are tried in that
+  order; the dma-buf modes filter the plane's modifiers by the render GPU's
+  non-external-only ones.
 
-Branch CI compiles the producer and runs CPU pattern/argument regressions.
-It has no NVIDIA/KMS device, so hardware results remain **unvalidated**.
+Branch CI compiles the producer and runs CPU pattern/modifier/argument
+regressions. It has no NVIDIA/KMS device, so hardware results remain
+**unvalidated**.
+
+Whether an import the consumer keeps across frames observes later renders by
+another process is measured separately, without a Hermes-KMS card, by
+[`hermes-import-cache-check`](../hermes-import-cache-check/README.md).

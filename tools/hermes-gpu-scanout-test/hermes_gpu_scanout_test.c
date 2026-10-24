@@ -24,12 +24,38 @@
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include "../hermes_session.h"
+#include "modifiers.h"
 #include "pattern.h"
+
+#ifndef DRM_PLANE_TYPE_PRIMARY
+#define DRM_PLANE_TYPE_PRIMARY 1
+#endif
 
 #define FORMAT DRM_FORMAT_ARGB8888
 #define SEED HERMES_GPU_PATTERN_SEED
 static volatile sig_atomic_t interrupted;
 static void stop(int sig) { interrupted = sig; }
+
+/*
+ * Where the allocation's candidate modifiers come from:
+ *   egl    every layout the GPU can render into (the original experiment);
+ *   plane  those also in the Hermes-KMS primary plane's IN_FORMATS, which is
+ *          what KWin's dma-buf multi-GPU import can choose from;
+ *   linear linear only, what KWin can choose under the default plane list.
+ */
+enum modifier_source { MODIFIERS_EGL, MODIFIERS_PLANE, MODIFIERS_LINEAR };
+
+struct modifier_list {
+	uint64_t *mods;
+	size_t count;
+};
+
+static void modifier_list_free(struct modifier_list *list)
+{
+	free(list->mods);
+	list->mods = NULL;
+	list->count = 0;
+}
 
 struct gpu {
 	struct gbm_device *gbm;
@@ -70,12 +96,79 @@ static int number(const char *s, uint32_t *v, uint32_t max)
 static void usage(FILE *f, const char *name)
 {
 	fprintf(f, "Usage: %s --device /dev/dri/cardN --gpu /dev/dri/renderDN [options]\n"
+		"       %s --list-modifiers --gpu /dev/dri/renderDN [--device /dev/dri/cardN]\n"
 		"  --width N --height N   default 2560x1440, SDR ARGB8888\n"
 		"  --hold-seconds N       retain static scanout for 0..3600 seconds\n"
 		"  --session-file PATH    publish mode-0600 capture credential during hold\n"
+		"  --modifiers SRC        allocate from egl (default), plane (GPU layouts the\n"
+		"                         card's IN_FORMATS lists, as KWin would) or linear\n"
+		"  --list-modifiers       print GPU/plane layouts and a scanout_modifiers=\n"
+		"                         value, then exit without touching any output\n"
 		"  --allow-other-gpu      permit a non-NVIDIA hardware control test\n"
 		"Requires an unused, single-output Hermes-KMS card; never steals a master.\n"
-		"Exit 0 proves identity/layout/pixels and teardown, not NVENC or VRAM residency.\n", name);
+		"Exit 0 proves identity/layout/pixels and teardown, not NVENC or VRAM residency.\n", name, name);
+}
+
+/*
+ * Modifiers the Hermes-KMS primary plane advertises for `format` through
+ * IN_FORMATS. Reading properties needs no master; universal planes are
+ * enabled only so the primary plane is enumerated.
+ */
+static int read_plane_modifiers(int card, uint32_t format, struct modifier_list *out)
+{
+	drmModePlaneRes *planes;
+	int result = -1;
+
+	out->mods = NULL;
+	out->count = 0;
+	if (drmSetClientCap(card, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1))
+		return -1;
+	planes = drmModeGetPlaneResources(card);
+	if (!planes)
+		return -1;
+	for (uint32_t p = 0; p < planes->count_planes && result < 0; p++) {
+		drmModeObjectProperties *props = drmModeObjectGetProperties(card,
+			planes->planes[p], DRM_MODE_OBJECT_PLANE);
+		uint64_t type = UINT64_MAX, blob_id = 0;
+		if (!props)
+			continue;
+		for (uint32_t i = 0; i < props->count_props; i++) {
+			drmModePropertyRes *prop = drmModeGetProperty(card, props->props[i]);
+			if (!prop)
+				continue;
+			if (!strcmp(prop->name, "type"))
+				type = props->prop_values[i];
+			else if (!strcmp(prop->name, "IN_FORMATS"))
+				blob_id = props->prop_values[i];
+			drmModeFreeProperty(prop);
+		}
+		drmModeFreeObjectProperties(props);
+		if (type != DRM_PLANE_TYPE_PRIMARY || !blob_id || blob_id > UINT32_MAX)
+			continue;
+		drmModePropertyBlobRes *blob = drmModeGetPropertyBlob(card, (uint32_t)blob_id);
+		if (!blob)
+			break;
+		long total = hermes_in_formats_modifiers(blob->data, blob->length, format, NULL, 0);
+		if (total >= 0 && (out->mods = calloc((size_t)total + 1, sizeof(*out->mods)))) {
+			out->count = (size_t)hermes_in_formats_modifiers(blob->data, blob->length,
+				format, out->mods, (size_t)total);
+			result = 0;
+		}
+		drmModeFreePropertyBlob(blob);
+	}
+	drmModeFreePlaneResources(planes);
+	return result;
+}
+
+static void print_modifiers(const char *title, const uint64_t *mods, size_t count)
+{
+	char text[192];
+
+	printf("%s: %zu\n", title, count);
+	for (size_t i = 0; i < count; i++) {
+		hermes_mod_describe(mods[i], text, sizeof(text));
+		printf("  0x%016" PRIx64 "  %s\n", mods[i], text);
+	}
 }
 
 static GLuint shader(GLenum type, const char *source)
@@ -197,7 +290,9 @@ static int import_image(struct gpu *g, int slot, uint32_t w, uint32_t h,
 		glGetError() == GL_NO_ERROR ? 0 : -1;
 }
 
-static int init_gpu(struct gpu *g, int fd, uint32_t w, uint32_t h, int allow_other)
+static int cleanup_gpu(struct gpu *g);
+
+static int init_egl(struct gpu *g, int fd, int allow_other)
 {
 	drmVersionPtr version = drmGetVersion(fd);
 	int nvidia = version && version->name && strcmp(version->name, "nvidia-drm") == 0;
@@ -228,30 +323,68 @@ static int init_gpu(struct gpu *g, int fd, uint32_t w, uint32_t h, int allow_oth
 	printf("GL vendor: %s; renderer: %s\n", vendor ? vendor : "unknown", renderer ? renderer : "unknown");
 	if (!vendor || !renderer || (!allow_other && !strstr(vendor, "NVIDIA")) ||
 	    strstr(renderer, "llvmpipe") || strstr(renderer, "softpipe")) return -1;
+	return 0;
+}
+
+/*
+ * The GPU's modifiers for `format`, split the way compositors use them:
+ * renderable layouts can be EGL render targets, external-only ones can only
+ * be sampled through GL_TEXTURE_EXTERNAL_OES. INVALID is never listed.
+ */
+static int query_render_modifiers(struct gpu *g, uint32_t format,
+	struct modifier_list *renderable, struct modifier_list *external_only)
+{
 	PFNEGLQUERYDMABUFMODIFIERSEXTPROC query =
 		(PFNEGLQUERYDMABUFMODIFIERSEXTPROC)eglGetProcAddress("eglQueryDmaBufModifiersEXT");
-	EGLint count = 0;
-	if (!query || !query(g->display, FORMAT, 0, NULL, NULL, &count) || count < 1 || count > 4096) return -1;
+	EGLint count = 0, returned = 0;
+	int result = -1;
+
+	renderable->mods = NULL; renderable->count = 0;
+	if (external_only) { external_only->mods = NULL; external_only->count = 0; }
+	if (!query || !query(g->display, (EGLint)format, 0, NULL, NULL, &count) ||
+	    count < 1 || count > 4096) return -1;
 	EGLuint64KHR *mods = calloc((size_t)count, sizeof(*mods));
 	EGLBoolean *external = calloc((size_t)count, sizeof(*external));
-	uint64_t *usable = calloc((size_t)count, sizeof(*usable));
-	int usable_count = 0;
-	EGLint returned = 0;
-	if (mods && external && usable && query(g->display, FORMAT, count, mods, external, &returned) &&
+	renderable->mods = calloc((size_t)count, sizeof(*renderable->mods));
+	if (external_only) external_only->mods = calloc((size_t)count, sizeof(*external_only->mods));
+	if (mods && external && renderable->mods && (!external_only || external_only->mods) &&
+	    query(g->display, (EGLint)format, count, mods, external, &returned) &&
 	    returned > 0 && returned <= count) {
-		for (int i = 0; i < returned; i++)
-			if (!external[i] && mods[i] != DRM_FORMAT_MOD_INVALID) usable[usable_count++] = mods[i];
-		if (usable_count) g->bo = gbm_bo_create_with_modifiers2(g->gbm, w, h,
-			FORMAT, usable, (unsigned int)usable_count, GBM_BO_USE_RENDERING);
+		for (int i = 0; i < returned; i++) {
+			if (mods[i] == DRM_FORMAT_MOD_INVALID) continue;
+			if (!external[i]) renderable->mods[renderable->count++] = mods[i];
+			else if (external_only) external_only->mods[external_only->count++] = mods[i];
+		}
+		result = 0;
 	}
-	free(mods); free(external); free(usable);
+	free(mods); free(external);
+	if (result) {
+		modifier_list_free(renderable);
+		if (external_only) modifier_list_free(external_only);
+	}
+	return result;
+}
+
+static int allocate_bo(struct gpu *g, uint32_t w, uint32_t h, const struct modifier_list *candidates)
+{
+	char text[192];
+
+	if (!candidates->count) { fprintf(stderr, "FAIL: no candidate modifiers to allocate from\n"); return -1; }
+	g->bo = gbm_bo_create_with_modifiers2(g->gbm, w, h, FORMAT, candidates->mods,
+		(unsigned int)candidates->count, GBM_BO_USE_RENDERING);
 	if (!g->bo) { fprintf(stderr, "FAIL: no explicitly modified, renderable GBM BO\n"); return -1; }
 	int planes = gbm_bo_get_plane_count(g->bo);
 	if (planes < 1 || planes > 4) return -1;
 	g->planes = (unsigned int)planes;
 	g->modifier = gbm_bo_get_modifier(g->bo);
 	if (g->modifier == DRM_FORMAT_MOD_INVALID) return -1;
-	printf("GPU-origin BO: %ux%u ARGB8888 modifier=0x%016" PRIx64 " planes=%u\n", w, h, g->modifier, g->planes);
+	if (!hermes_mod_contains(candidates->mods, candidates->count, g->modifier)) {
+		fprintf(stderr, "FAIL: GBM chose modifier 0x%016" PRIx64 " outside the candidates\n", g->modifier);
+		return -1;
+	}
+	hermes_mod_describe(g->modifier, text, sizeof(text));
+	printf("GPU-origin BO: %ux%u ARGB8888 modifier=0x%016" PRIx64 " (%s) planes=%u\n",
+		w, h, g->modifier, text, g->planes);
 	for (unsigned int i = 0; i < g->planes; i++) {
 		g->fd[i] = gbm_bo_get_fd_for_plane(g->bo, (int)i);
 		g->pitch[i] = gbm_bo_get_stride_for_plane(g->bo, (int)i);
@@ -260,6 +393,147 @@ static int init_gpu(struct gpu *g, int fd, uint32_t w, uint32_t h, int allow_oth
 		printf("  plane %u: pitch=%u offset=%u\n", i, g->pitch[i], g->offset[i]);
 	}
 	return import_image(g, 0, w, h, g->fd);
+}
+
+/*
+ * The candidate modifiers for `source`, printed. For `plane` an empty
+ * intersection is the finding itself: KWin's dma-buf import would find no
+ * common layout and fall back to a CPU copy into a dumb buffer.
+ */
+static int choose_candidates(struct gpu *g, int card, enum modifier_source source,
+	struct modifier_list *candidates)
+{
+	struct modifier_list renderable = {0}, plane = {0};
+	int result = -1;
+
+	candidates->mods = NULL; candidates->count = 0;
+	if (query_render_modifiers(g, FORMAT, &renderable, NULL)) {
+		fprintf(stderr, "FAIL: eglQueryDmaBufModifiersEXT(ARGB8888)\n");
+		return -1;
+	}
+	print_modifiers("GPU renderable ARGB8888 modifiers", renderable.mods, renderable.count);
+	switch (source) {
+	case MODIFIERS_EGL:
+		*candidates = renderable;
+		renderable.mods = NULL;
+		result = candidates->count ? 0 : -1;
+		break;
+	case MODIFIERS_PLANE:
+		if (read_plane_modifiers(card, FORMAT, &plane)) {
+			fprintf(stderr, "FAIL: cannot read the Hermes-KMS primary plane's IN_FORMATS\n");
+			break;
+		}
+		print_modifiers("Hermes-KMS plane IN_FORMATS (ARGB8888)", plane.mods, plane.count);
+		candidates->mods = calloc(renderable.count + 1, sizeof(*candidates->mods));
+		if (!candidates->mods) break;
+		candidates->count = hermes_mod_intersect(renderable.mods, renderable.count,
+			plane.mods, plane.count, candidates->mods, renderable.count, NULL);
+		if (!candidates->count)
+			fprintf(stderr, "FAIL: no layout is both renderable here and advertised by the plane;\n"
+				"      KWin would fall back to a CPU copy into a dumb buffer\n");
+		result = candidates->count ? 0 : -1;
+		break;
+	case MODIFIERS_LINEAR:
+		if (!hermes_mod_contains(renderable.mods, renderable.count, DRM_FORMAT_MOD_LINEAR)) {
+			fprintf(stderr, "FAIL: this GPU cannot render into linear ARGB8888 through EGL\n");
+			break;
+		}
+		candidates->mods = calloc(1, sizeof(*candidates->mods));
+		if (!candidates->mods) break;
+		candidates->mods[0] = DRM_FORMAT_MOD_LINEAR;
+		candidates->count = 1;
+		result = 0;
+		break;
+	}
+	if (!result)
+		print_modifiers("allocation candidates", candidates->mods, candidates->count);
+	else
+		modifier_list_free(candidates);
+	modifier_list_free(&renderable);
+	modifier_list_free(&plane);
+	return result;
+}
+
+/*
+ * --list-modifiers: what the GPU can produce, what the card advertises and the
+ * scanout_modifiers= value that would let KWin keep the GPU's own layouts.
+ * Changes no output state and needs no DRM master.
+ */
+static int list_modifiers(const char *card_path, const char *gpu_path, int allow_other)
+{
+	static const struct { uint32_t format; const char *name; } formats[] = {
+		{DRM_FORMAT_ARGB8888, "ARGB8888"}, {DRM_FORMAT_XRGB8888, "XRGB8888"},
+	};
+	struct gpu g = {.display = EGL_NO_DISPLAY, .context = EGL_NO_CONTEXT,
+		.image = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR}, .fd = {-1, -1, -1, -1}};
+	uint64_t suggestion_input[2 * 4096], suggested[HERMES_MAX_EXTRA_SCANOUT_MODIFIERS];
+	size_t suggestion_count = 0, dropped = 0;
+	int card = -1, gpu_fd = -1, result = 1;
+	char title[96];
+
+	if (card_path) {
+		card = open(card_path, O_RDONLY | O_CLOEXEC);
+		if (card < 0 || hermes_session_require_driver(card)) {
+			fprintf(stderr, "FAIL: %s is not a Hermes-KMS card\n", card_path);
+			goto out;
+		}
+	}
+	gpu_fd = open(gpu_path, O_RDWR | O_CLOEXEC);
+	if (gpu_fd < 0 || drmGetNodeTypeFromFd(gpu_fd) != DRM_NODE_RENDER || init_egl(&g, gpu_fd, allow_other)) {
+		fprintf(stderr, "FAIL: EGL/GL setup on %s\n", gpu_path);
+		goto out;
+	}
+	for (size_t f = 0; f < sizeof(formats) / sizeof(formats[0]); f++) {
+		struct modifier_list renderable = {0}, external = {0}, plane = {0};
+		if (query_render_modifiers(&g, formats[f].format, &renderable, &external)) {
+			printf("%s: not importable on this GPU\n", formats[f].name);
+			continue;
+		}
+		snprintf(title, sizeof(title), "GPU renderable %s modifiers", formats[f].name);
+		print_modifiers(title, renderable.mods, renderable.count);
+		snprintf(title, sizeof(title), "GPU external-only %s modifiers (sample-only)", formats[f].name);
+		print_modifiers(title, external.mods, external.count);
+		for (size_t i = 0; i < renderable.count && suggestion_count < sizeof(suggestion_input) / sizeof(suggestion_input[0]); i++)
+			suggestion_input[suggestion_count++] = renderable.mods[i];
+		if (card >= 0) {
+			if (read_plane_modifiers(card, formats[f].format, &plane)) {
+				printf("Hermes-KMS plane IN_FORMATS (%s): unreadable\n", formats[f].name);
+			} else {
+				uint64_t *common = calloc(renderable.count + 1, sizeof(*common));
+				size_t n = common ? hermes_mod_intersect(renderable.mods, renderable.count,
+					plane.mods, plane.count, common, renderable.count, NULL) : 0;
+				snprintf(title, sizeof(title), "Hermes-KMS plane IN_FORMATS (%s)", formats[f].name);
+				print_modifiers(title, plane.mods, plane.count);
+				snprintf(title, sizeof(title), "KWin dma-buf import can allocate (%s)", formats[f].name);
+				print_modifiers(title, common, n);
+				free(common);
+			}
+		}
+		modifier_list_free(&renderable);
+		modifier_list_free(&external);
+		modifier_list_free(&plane);
+	}
+	size_t count = hermes_mod_suggest_scanout(suggestion_input, suggestion_count, suggested, &dropped);
+	if (!count) {
+		printf("\nNo extra layouts to advertise: this GPU renders only linear buffers.\n");
+	} else {
+		printf("\nSuggested Hermes-KMS parameter (%zu extra layout%s%s):\n  scanout_modifiers=",
+			count, count == 1 ? "" : "s", dropped ? ", truncated to the kernel limit" : "");
+		for (size_t i = 0; i < count; i++)
+			printf("%s0x%016" PRIx64, i ? "," : "", suggested[i]);
+		printf("\n  e.g. 'options hermes_kms scanout_modifiers=...' in /etc/modprobe.d, or the same\n"
+			"  list in /sys/kernel/config/hermes-kms/<card>/scanout_modifiers before enabling it.\n"
+			"NOTE: with NVIDIA layouts advertised, a compositor rendering on this GPU can scan out\n"
+			"      tiled buffers that only a GPU import can read: Hermes then needs\n"
+			"      HERMES_KMS_EXPERIMENTAL_NVENC_DMABUF=auto (or 1) for NVENC sessions, and\n"
+			"      encoders on other GPUs cannot import them at all.\n");
+	}
+	result = 0;
+out:
+	if (cleanup_gpu(&g)) result = 1;
+	if (gpu_fd >= 0) close(gpu_fd);
+	if (card >= 0) close(card);
+	return result;
 }
 
 static int verify_pixels(struct gpu *g, int slot, uint32_t w, uint32_t h)
@@ -311,11 +585,13 @@ int main(int argc, char **argv)
 {
 	const char *card_path = NULL, *gpu_path = NULL, *session_path = NULL;
 	uint32_t w = 2560, h = 1440, hold = 0;
-	int allow_other = 0, opt;
+	int allow_other = 0, list = 0, opt;
+	enum modifier_source source = MODIFIERS_EGL;
 	static const struct option options[] = {
 		{"device", required_argument, NULL, 'd'}, {"gpu", required_argument, NULL, 'g'},
 		{"width", required_argument, NULL, 'w'}, {"height", required_argument, NULL, 'h'},
 		{"hold-seconds", required_argument, NULL, 't'}, {"session-file", required_argument, NULL, 's'},
+		{"modifiers", required_argument, NULL, 'm'}, {"list-modifiers", no_argument, NULL, 'l'},
 		{"allow-other-gpu", no_argument, NULL, 'a'}, {"help", no_argument, NULL, '?'}, {NULL, 0, NULL, 0}
 	};
 	while ((opt = getopt_long(argc, argv, "", options, NULL)) != -1) {
@@ -327,9 +603,21 @@ int main(int argc, char **argv)
 		case 't': if (number(optarg, &hold, 3600)) goto invalid; break;
 		case 's': session_path = optarg; break;
 		case 'a': allow_other = 1; break;
+		case 'l': list = 1; break;
+		case 'm':
+			if (!strcmp(optarg, "egl")) source = MODIFIERS_EGL;
+			else if (!strcmp(optarg, "plane")) source = MODIFIERS_PLANE;
+			else if (!strcmp(optarg, "linear")) source = MODIFIERS_LINEAR;
+			else goto invalid;
+			break;
 		case '?': if (!strcmp(argv[optind - 1], "--help")) { usage(stdout, argv[0]); return 0; } goto invalid;
 		default: goto invalid;
 		}
+	}
+	if (list) {
+		if (!gpu_path || optind != argc || session_path || hold || source != MODIFIERS_EGL)
+			goto invalid;
+		return list_modifiers(card_path, gpu_path, allow_other);
 	}
 	if (!card_path || !gpu_path || optind != argc || (session_path && !hold) ||
 	    (size_t)w > SIZE_MAX / 4 / h) goto invalid;
@@ -344,6 +632,7 @@ int main(int argc, char **argv)
 	int master = 0, owned = 0, scanout = 0, session_created = 0;
 	uint32_t fb = 0, handles[4] = {0};
 	drmModeConnector *connector = NULL;
+	struct modifier_list candidates = {0};
 	struct sigaction action = {.sa_handler = stop};
 	sigemptyset(&action.sa_mask);
 	if (sigaction(SIGINT, &action, NULL) || sigaction(SIGTERM, &action, NULL)) goto out;
@@ -366,7 +655,8 @@ int main(int argc, char **argv)
 	// Finish GPU setup before publishing any connected output.
 	gpu_fd = open(gpu_path, O_RDWR | O_CLOEXEC);
 	if (gpu_fd < 0 || drmGetNodeTypeFromFd(gpu_fd) != DRM_NODE_RENDER ||
-	    init_gpu(&g, gpu_fd, w, h, allow_other) || render_pattern(&g, w, h)) goto out;
+	    init_egl(&g, gpu_fd, allow_other) || choose_candidates(&g, card, source, &candidates) ||
+	    allocate_bo(&g, w, h, &candidates) || render_pattern(&g, w, h)) goto out;
 	glGenTextures(1, &g.tex[2]);
 	glBindTexture(GL_TEXTURE_2D, g.tex[2]);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
@@ -458,6 +748,7 @@ out:
 	for (int i = 0; i < 4; i++) if (frame.dma_buf_fd[i] >= 0) close(frame.dma_buf_fd[i]);
 	if (frame.sync_file_fd >= 0) close(frame.sync_file_fd);
 	if (gpu_fd >= 0) close(gpu_fd);
+	modifier_list_free(&candidates);
 	if (!result) printf("PASS: GPU-origin PRIME passthrough, full pixels, real teardown\n"
 		"NVENC encode/decode and physical memory residency: NOT TESTED\n");
 	return result;
