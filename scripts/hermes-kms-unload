@@ -1,13 +1,37 @@
 #!/bin/sh
-# Detach static DRM cards before trying to unload the module. A compositor can
-# keep a disconnected card open long after the capture client has exited.
+# Detach Hermes-KMS cards, then unload the module once nothing references it.
+#
+# A Wayland compositor adopts every KMS device on its seat. KWin 6.7.4 and
+# later keep such a device open until udev reports it removed, even with every
+# connector disconnected (earlier versions closed a secondary GPU as soon as its
+# last output went away), so after Hermes exits the compositor, logind and
+# Xwayland still hold the card. Unbinding the cards is that removal: those
+# clients close their descriptors and the module can go.
+#
+# Whatever still references the module after detaching is reported from the
+# descriptors and mappings that remain at that point, never from a snapshot
+# taken while the cards were still attached.
 set -eu
+
+state_dir=/run/hermes-kms
+state="$state_dir/unload-nodes"
 
 [ "$(id -u)" -eq 0 ] || {
 	printf 'run hermes-kms-unload as root\n' >&2
 	exit 1
 }
-[ -d /sys/module/hermes_kms ] || exit 0
+if [ ! -d /sys/module/hermes_kms ]; then
+	rm -f "$state"
+	exit 0
+fi
+
+timeout=${HERMES_KMS_UNLOAD_TIMEOUT:-10}
+case $timeout in
+'' | *[!0-9]*)
+	printf 'HERMES_KMS_UNLOAD_TIMEOUT must be a whole number of seconds\n' >&2
+	exit 1
+	;;
+esac
 
 configfs=/sys/kernel/config/hermes-kms
 if [ -d "$configfs" ]; then
@@ -18,20 +42,31 @@ if [ -d "$configfs" ]; then
 	done
 fi
 
-# Record openers while the device nodes still exist; after unbind, fuser can no
-# longer resolve their names even if a process keeps a stale descriptor open.
-openers=
-set --
+# Record every node as major:minor:inode:path (major and minor in hex, the way
+# stat prints them) while it still exists. Unbinding deletes the nodes, but a
+# descriptor or mapping opened through one keeps referring to the same inode,
+# which is how holders are recognised once the cards are gone. The list is kept
+# under /run so a rerun can still name holders of cards detached earlier.
+nodes=
+if [ -r "$state" ]; then
+	nodes=$(cat "$state")
+fi
 for platform in /sys/devices/platform/hermes-kms*; do
 	[ -L "$platform/driver" ] || continue
 	for sysnode in "$platform"/drm/card[0-9]* "$platform"/drm/renderD[0-9]*; do
 		[ -e "$sysnode" ] || continue
 		node="/dev/dri/${sysnode##*/}"
-		[ -c "$node" ] && set -- "$@" "$node"
+		[ -c "$node" ] || continue
+		id=$(stat -L -c '%t:%T:%i' "$node" 2>/dev/null) || continue
+		case " $nodes " in
+		*" $id:$node "*) ;;
+		*) nodes="${nodes:+$nodes }$id:$node" ;;
+		esac
 	done
 done
-if command -v fuser >/dev/null 2>&1; then
-	[ "$#" -eq 0 ] || openers=$(fuser -v "$@" 2>&1 || true)
+if [ -n "$nodes" ]; then
+	mkdir -p "$state_dir"
+	printf '%s\n' "$nodes" > "$state"
 fi
 
 if command -v systemctl >/dev/null 2>&1; then
@@ -49,18 +84,113 @@ if command -v udevadm >/dev/null 2>&1; then
 	udevadm settle
 fi
 
-attempt=0
-while [ "$attempt" -lt 5 ]; do
-	if error=$(modprobe -r hermes_kms 2>&1); then
+# Removal is asynchronous: the compositor drops the GPU from its udev monitor,
+# logind frees the session device, and Xwayland closes its lease descriptor
+# only after a Wayland round trip. Give them the timeout, polling the module's
+# reference count rather than spamming modprobe errors.
+refcnt()
+{
+	cat /sys/module/hermes_kms/refcnt 2>/dev/null || printf 'unknown\n'
+}
+
+error=
+elapsed=0
+while :; do
+	if [ ! -d /sys/module/hermes_kms ]; then
+		rm -f "$state"
 		printf 'Hermes-KMS unloaded.\n'
 		exit 0
 	fi
-	attempt=$((attempt + 1))
-	[ "$attempt" -lt 5 ] && sleep 1
+	count=$(refcnt)
+	if [ "$count" = 0 ] || [ "$count" = unknown ]; then
+		if error=$(modprobe -r hermes_kms 2>&1); then
+			rm -f "$state"
+			printf 'Hermes-KMS unloaded.\n'
+			exit 0
+		fi
+	fi
+	[ "$elapsed" -lt "$timeout" ] || break
+	elapsed=$((elapsed + 1))
+	sleep 1
 done
 
-printf 'Hermes-KMS cards were detached, but the module is still in use: %s\n' "$error" >&2
-[ -z "$openers" ] || printf 'Openers seen before detaching:\n%s\n' "$openers" >&2
-printf 'Close processes still holding Hermes-KMS resources, then run this command again.\n' >&2
+# Print "pid<TAB>description" for every descriptor or mapping that still refers
+# to a recorded node.
+find_holders()
+{
+	[ -n "$nodes" ] || return 0
+
+	# stat follows /proc/PID/fd/N to the open file itself, so a node that has
+	# since been deleted still reports its device number and inode.
+	stat -L -c '%n %t:%T:%i' /proc/[0-9]*/fd/* 2>/dev/null |
+		while read -r fd id; do
+			case " $nodes " in
+			*" $id:"*) ;;
+			*) continue ;;
+			esac
+			rest=" $nodes "
+			rest=${rest#*" $id:"}
+			pid=${fd#/proc/}
+			printf '%s\t%s open as fd %s\n' "${pid%%/*}" "${rest%% *}" \
+				"${fd##*/}"
+		done
+
+	# A mapping keeps the device file alive after its descriptor is closed.
+	# /proc/PID/maps names the node (with " (deleted)" once it is gone) and
+	# gives the inode in the fifth column.
+	for entry in $nodes; do
+		inode=${entry#*:*:}
+		path=${inode#*:}
+		inode=${inode%%:*}
+		grep -H -F -e "$path" /proc/[0-9]*/maps 2>/dev/null |
+			while IFS= read -r line; do
+				file=${line%%:*}
+				# Split the line into fields (the fifth is the inode)
+				# without letting a path expand as a glob.
+				set -f
+				# shellcheck disable=SC2086
+				set -- ${line#*:}
+				set +f
+				[ "$#" -ge 6 ] && [ "$5" = "$inode" ] || continue
+				pid=${file#/proc/}
+				printf '%s\t%s mapped\n' "${pid%%/*}" "$path"
+			done
+	done
+}
+
+holders=$(find_holders | sort -u)
+count=$(refcnt)
+
+printf 'Hermes-KMS cards were detached, but the module is still in use' >&2
+if [ "$count" != unknown ]; then
+	printf ' (%s reference(s) after %s s)' "$count" "$timeout" >&2
+fi
+printf '.\n' >&2
+[ -z "$error" ] || printf '%s\n' "$error" >&2
+
+if [ -n "$holders" ]; then
+	printf 'Still referencing the detached devices:\n' >&2
+	printf '%s\n' "$holders" | while IFS="$(printf '\t')" read -r pid what; do
+		comm=$(cat "/proc/$pid/comm" 2>/dev/null) || comm='?'
+		user=$(stat -c '%U' "/proc/$pid" 2>/dev/null) || user='?'
+		printf '  PID %s %s (%s): %s\n' "$pid" "$comm" "$user" "$what" >&2
+	done
+	printf 'Detaching cannot close descriptors that another process holds.\n' >&2
+	printf 'Exit those programs and run this command again. If the desktop compositor\n' >&2
+	printf 'or Xwayland is listed, it did not release the removed card: save your work,\n' >&2
+	printf 'log out, and rerun from another session or a text console. Do not kill\n' >&2
+	printf 'systemd or systemd-logind; they release what they hold when the session does.\n' >&2
+elif [ -z "$nodes" ]; then
+	printf 'The cards were detached before their device nodes could be recorded, so the\n' >&2
+	printf 'processes still holding them cannot be named. Logging out of the desktop\n' >&2
+	printf 'session, or rebooting, releases them.\n' >&2
+else
+	printf 'No process holds a Hermes-KMS device node any more. The remaining\n' >&2
+	printf 'references are buffers exported by Hermes-KMS that a process or another GPU\n' >&2
+	printf 'driver still holds, for example frames a compositor imported to compose the\n' >&2
+	printf 'virtual display on another GPU. They are released when that process frees\n' >&2
+	printf 'them or exits; logging out of the desktop session releases those held by\n' >&2
+	printf 'the compositor.\n' >&2
+fi
 printf 'To restore the cards instead, run hermes-kms-rebind.\n' >&2
 exit 1

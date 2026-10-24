@@ -385,11 +385,20 @@ until the groups are removed. Statically configured cards and the session pool
 are unaffected and keep working exactly as before.
 
 Compositors and Xwayland can also hold static cards open while disconnected.
-`hermes-kms-unload` unbinds those cards before calling `modprobe -r`, giving
-userspace a removal event and a chance to close its descriptors. If a process
-keeps a stale descriptor open, the kernel still protects the module from unload;
-the helper reports the earlier openers and leaves the cards detached until the
-process exits or `hermes-kms-rebind` restores them.
+Since KWin 6.7.4 (upstream "backends/drm: don't remove GPUs without outputs"),
+KWin keeps an adopted GPU until udev reports it removed. Before that release,
+it dropped a secondary GPU when its last connector disconnected. Every open DRM
+file pins the module through `fops.owner`, and every dma-buf exported from the
+device pins it through the export's owner. DRM has no way to revoke either, so
+the driver cannot force an unload. `hermes-kms-unload` therefore unbinds the
+cards before calling `modprobe -r`, giving userspace the removal event it waits
+for. It records each node's device number and inode first, because the nodes
+vanish on unbind while descriptors and mappings opened through them keep that
+identity. If the reference count does not reach zero within the timeout, the
+helper names the processes that still hold a descriptor or mapping. When no
+such process is left, it reports the remaining references as exported buffers.
+In both cases it leaves the cards detached until the holders go away or
+`hermes-kms-rebind` restores them.
 
 Status: **Prototype**. `scripts/vm-configfs-test.sh` validates creation and
 removal alongside a static card, role and seat metadata reaching sysfs and

@@ -28,6 +28,18 @@ subject to change between minor releases.
 
 ### Fixed
 
+- `hermes-kms-unload` now reports the processes that actually still reference
+  the detached cards. It used to report a `fuser` snapshot taken before
+  detaching. That snapshot listed processes that may already have let go, and
+  it could not show what remained. Holders are matched by the device number and inode recorded before unbind,
+  so descriptors and mappings of the now-deleted nodes are still found. A rerun
+  still sees cards detached earlier, and a residual reference count with no
+  holder is attributed to exported buffers. The helper also polls the module
+  reference count for up to `HERMES_KMS_UNLOAD_TIMEOUT` seconds (default 10)
+  instead of trying `modprobe -r` five times. Documentation now explains why
+  plain `modprobe -r` fails under KWin 6.7.4 and later, which keeps an adopted
+  GPU open until udev removes it (#7).
+
 - Render-node access is read-only for both active-seat and explicitly assigned
   users. Hermes-KMS private ioctls, DMA-BUF export and sync-file export work on
   an `O_RDONLY` fd, whereas Chromium/Electron discover candidate render GPUs by

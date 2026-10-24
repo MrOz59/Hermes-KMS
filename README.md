@@ -338,13 +338,22 @@ journalctl -k -g hermes-kms
 sudo scripts/hermes-kms-unload
 ```
 
-A desktop compositor or Xwayland may keep the DRM card open after Hermes exits,
-even when its connector is disconnected. `hermes-kms-unload` first unbinds the
-cards (which sends a device-removal event), waits briefly, and then removes the
-module. If a process keeps an old descriptor open, the script leaves the cards
-detached and reports the earlier openers; close that process and rerun it. Use
-`sudo hermes-kms-rebind` to restore detached cards without rebooting. Configfs
-cards must be removed by their creator before unloading.
+Plain `modprobe -r hermes_kms` fails while a desktop compositor has adopted the
+card, even after Hermes exits with the connector disconnected. KWin 6.7.4 and
+later keep every KMS device open until udev reports it removed; earlier
+versions closed a secondary GPU when its last output went away. The compositor's
+logind session device and Xwayland's DRM-lease descriptor stay open with it.
+`hermes-kms-unload` first unbinds the cards, which is that removal event. It
+then waits up to `HERMES_KMS_UNLOAD_TIMEOUT` seconds (default 10) for the
+references to drop and removes the module. If something still references the
+module, the script leaves the cards detached. It lists the processes that
+still hold a descriptor or mapping of the detached nodes, found by device
+number and inode after detaching, and the remaining reference count. If no
+process holds a node, the remaining references are exported buffers held
+elsewhere. Close the listed process and rerun the script. If the compositor
+itself is listed, log out first. Use `sudo hermes-kms-rebind` to restore
+detached cards without rebooting. Configfs cards must be removed by their
+creator before unloading.
 
 Active output state and capture are capability-protected. For command-line
 diagnostics, keep an owner running in one terminal and publish its credential
@@ -484,7 +493,8 @@ module, drives a `modetest` producer, and verifies the DMA-BUF/sync_file path.
 Other validation scripts (run as root, in the virtme-ng VM or on the host):
 
 - `scripts/vm-access-unload-test.sh` — checks host/private render-node access,
-  a DRM descriptor held after client exit, safe detach, rebind, and unload;
+  a DRM descriptor held after client exit, safe detach, the post-detach holder
+  report (also on a rerun), rebind, and unload;
 - `scripts/vm-session-lifecycle-test.sh` — checks token rotation, one-shot
   binding revocation, binding accounting, and that a blocked `WAIT_FRAME` on a
   revoked descriptor is woken with `EACCES` rather than left to time out;

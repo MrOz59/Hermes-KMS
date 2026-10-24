@@ -84,6 +84,7 @@ for _ in {1..30}; do
 done
 [ -f "$TMP/ready" ] || { printf 'test fd holder did not start\n' >&2; exit 1; }
 
+export HERMES_KMS_UNLOAD_TIMEOUT=2
 if "$REPO/scripts/hermes-kms-unload" >"$TMP/first-unload" 2>&1; then
 	printf 'module unloaded while a DRM fd was still open\n' >&2
 	exit 1
@@ -97,11 +98,28 @@ grep -q 'still in use' "$TMP/first-unload" || {
 	printf 'unload did not explain the remaining reference\n' >&2
 	exit 1
 }
-grep -q "$HOLDER" "$TMP/first-unload" || {
-	printf 'unload did not identify the open DRM fd holder\n' >&2
+# The report must come from what is still open after detaching: the holder's
+# descriptor now points at a deleted node, which the unload helper has to match
+# by the device number and inode it recorded before unbinding.
+grep -q "PID $HOLDER .*$card open as fd" "$TMP/first-unload" || {
+	printf 'unload did not identify the post-detach DRM fd holder\n' >&2
+	cat "$TMP/first-unload" >&2
 	exit 1
 }
 printf 'ok: busy module leaves its DRM card detached and reports the blocker\n'
+
+# A rerun finds no bound card to inspect, so it must remember the nodes it
+# detached the first time.
+if "$REPO/scripts/hermes-kms-unload" >"$TMP/second-unload" 2>&1; then
+	printf 'module unloaded on rerun while a DRM fd was still open\n' >&2
+	exit 1
+fi
+grep -q "PID $HOLDER .*$card open as fd" "$TMP/second-unload" || {
+	printf 'rerun lost track of the detached card holder\n' >&2
+	cat "$TMP/second-unload" >&2
+	exit 1
+}
+printf 'ok: a rerun still names the holder of an already detached card\n'
 
 "$REPO/scripts/hermes-kms-rebind" >/dev/null
 [ -L "$platform/driver" ] || {
@@ -115,6 +133,10 @@ wait "$HOLDER" 2>/dev/null || true
 HOLDER=
 "$REPO/scripts/hermes-kms-unload" >/dev/null
 [ ! -d /sys/module/hermes_kms ] || { printf 'module remained loaded\n' >&2; exit 1; }
+[ ! -e /run/hermes-kms/unload-nodes ] || {
+	printf 'successful unload left its detached-node list behind\n' >&2
+	exit 1
+}
 printf 'ok: unload succeeds after the external DRM fd closes\n'
 
 insmod "$KO" initial_enabled=0 outputs=1 session_devices=2
