@@ -36,6 +36,13 @@ subject to change between minor releases.
   the `EACCES` failure from #6. The host node remains `root:root`, logind still
   selects the active seat user, and the ACL helper now grants assigned private
   cards `r--` rather than `rw-`.
+- The private seat brokers (`hermes-kms-seatd@.service`) no longer bind to a
+  virtual terminal. seatd is VT-bound by default, so each broker adopted the
+  VT active on seat0 - the host's - and changed its switching, keyboard and
+  graphics/text mode as isolated sessions opened and closed; a desktop started
+  with `startx` on tty1 was switched to text mode under it (Hermes#57). The
+  unit now sets `SEATD_VTBOUND=0` and drops `CAP_SYS_TTY_CONFIG`, which only
+  those VT ioctls needed.
 
 ## [0.4.0] - 2026-09-22
 
