@@ -5,20 +5,25 @@ reference consumer, but neither the capture interface nor its authorization
 model depends on that application, Steam, or any process name. It does not
 manage EVDI; EVDI remains a supported fallback for consumers that choose it.
 
+The current driver is 0.4.0 with UAPI v14. This document describes `main`;
+[CHANGELOG.md](../CHANGELOG.md) distinguishes the latest tag from subsequent
+fixes. See [references.md](references.md) for upstream mechanisms and
+[configfs.md](configfs.md) for the complete per-card configuration interface.
+
 ## Target architecture
 
 ```text
 Compositor / game
     ↓
-HERMES-1..N DRM/KMS virtual connectors
+DRM/KMS virtual connectors (HERMES-* static; configurable runtime names)
     ↓
-GPU-backed framebuffer / GEM object
+GEM framebuffer (system memory or imported GPU buffer)
     ↓
 PRIME / DMA-BUF export
     ↓
 Capture/streaming/recording consumer
     ↓
-VAAPI / future NVENC import
+Backend import/conversion (VAAPI; current NVENC CPU-copy fallback)
     ↓
 stream
 ```
@@ -38,12 +43,12 @@ forward the changed region to the capture consumer.
 ### Scanout formats
 
 The primary plane offers `XRGB8888`/`ARGB8888` and the four `2101010` variants.
-The driver stores no pixels and reports the fourcc verbatim through
+The driver does not render or convert pixels and reports the fourcc verbatim through
 `ACQUIRE_FRAME`, so the list only has to cover what a compositor might compose
 into and an encoder might import.
 
-The ten-bit entries are the prerequisite for wide gamut and HDR, and are inert
-by default: a compositor will not drive an output deeper than its sink claims to
+The ten-bit entries allow higher-precision wide-gamut and HDR scanout. They do
+not themselves select either encoding and are normally unused by default: a compositor will not drive an output deeper than its sink claims to
 accept, and the synthetic EDID advertises eight bits per primary unless
 `color_depth=` says otherwise. Raising it is therefore a deliberate choice, and
 consumers must be prepared for a ten-bit fourcc when it is made.
@@ -54,8 +59,8 @@ Static Metadata Data Block (PQ) and a BT2020 Colorimetry Data Block, and the
 connector attaches both the `HDR_OUTPUT_METADATA` property and a `Colorspace`
 property advertising BT2020 — the signals a compositor requires together to
 treat the output as HDR-capable, always enabled or disabled as one unit. All of
-them are needed because KWin treats an output as HDR-capable through a two-gate
-chain: it sets `WideColorGamut` only when the connector has a `Colorspace` property
+them were needed by the KWin integration used during HDR implementation, which
+checked a two-gate chain: it sets `WideColorGamut` only when the connector has a `Colorspace` property
 advertising BT2020 and the EDID reports BT2020 (via the Colorimetry block), and
 only then sets `HighDynamicRange`, which additionally needs `HDR_OUTPUT_METADATA`
 and the EDID's PQ HDR Static Metadata block. An earlier iteration carrying only
@@ -63,73 +68,45 @@ the HDR Static Metadata block and `HDR_OUTPUT_METADATA` left HDR off on hardware
 because the Colorimetry block and `Colorspace` property were missing, so the
 `WideColorGamut` gate was never satisfied.
 
-This is advertisement only, and the feature is incomplete beyond it. `hdr_enable`
-does not activate HDR; it tells a compositor the output *can* do HDR. The gap
-that matters is on the capture side: Hermes' capture UAPI reports the framebuffer
-format but carries no colorspace, EOTF or HDR metadata alongside a captured
-frame, so a consumer reading only that interface cannot determine the frame's
-colour encoding. If the compositor switches to PQ/BT.2020 and the consumer keeps
-treating the frame as SDR, the colours are wrong. `color_depth=10` does not close
-this — ten-bit frames carry no more colour signalling than eight-bit ones.
+Advertisement does not activate HDR; the compositor chooses the output encoding.
+The capture-side contract is implemented in UAPI v14: `ACQUIRE_FRAME2` returns
+the framebuffer and its committed colour state in the same snapshot, gated by
+`HERMES_KMS_CAP_FRAME_COLOR`. Static HDR10 uses BT.2020 RGB, ST2084/PQ and
+CTA type-1 metadata. A colour-only change advances `frame_sequence`, wakes
+waiters and invalidates damage; cursor-only updates with unchanged colour do not.
 
-DRM does hold the negotiated state: `Colorspace` and `HDR_OUTPUT_METADATA` live
-on the connector, and a consumer with the primary KMS node can query them. That
-is not a substitute. Those properties are unreachable through the render node
-that consumers actually hold, and querying them separately does not associate the
-metadata atomically with a given captured frame — the compositor can change
-colorimetry between the query and the frame. Carrying colour metadata in the
-capture UAPI, associated with the frame, is the real fix and is follow-up work;
-it needs an agreed representation before it is worth implementing.
-
-Whether a compositor additionally needs ten-bit scanout (`color_depth=10`) set
-before it will enable HDR is untested; the two have not been validated as a pair.
+The legacy `ACQUIRE_FRAME` cannot identify HDR encoding and remains unchanged.
+Reading connector properties separately would race the frame and is not a
+substitute. `color_depth=10` selects advertised storage precision, not a transfer
+function. Both eight-bit and ten-bit HDR advertisements are exercised by driver
+tests; end-to-end validation still needs the target compositor, conversion,
+encoder, client and display. See [hdr-capture.md](hdr-capture.md) for the exact
+representation, atomic lifetime, units and release gates.
 
 #### EDID conformity
 
-The generated EDID decodes correctly and both block checksums are valid:
-`edid-decode` reports the HDR Static Metadata and BT2020 Colorimetry blocks as
-intended, with no checksum errors. That is not the same as a clean conformity
-check, and `edid-decode --check` does not pass. `scripts/check-edid-conformity.sh`
-runs both over the generated bytes, so the tables below stay a tracked artifact
-rather than a snapshot that quietly goes stale.
+The generated EDID is checked in eight configurations by
+[`scripts/check-edid-conformity.sh`](../scripts/check-edid-conformity.sh):
+base/default, base/ten-bit, generic identity, a 720p profile, and their HDR
+variants. With the recorded `edid-decode 1.32.0`, the baseline contains warnings
+and **no conformity failures**. Earlier sRGB, undefined-size, VIC 1 and VCDB
+failures are no longer current: the generator now signals sRGB, avoids a DTD
+size when no physical size was configured, and supplies the CTA video and
+quantization declarations.
 
-Which conformity rules `edid-decode` implements varies by version, so the script
-splits what it enforces. It always checks what the parser *decodes* — that both
-data blocks are present with PQ and BT2020 RGB when `hdr_enable=1`, that neither
-is when it is off, and that no block has a checksum error — because that
-describes the bytes rather than a rule set, and it is the part worth guarding.
-The exact `--check` finding set below is compared only when the running
-`edid-decode` matches the version that recorded it, and reported as
-informational otherwise; an older parser reporting fewer findings is a
-difference in the parser, not in the EDID.
-
-These findings predate `hdr_enable` and are present on the base block alone, at
-default parameters:
-
-| Finding | Kind |
+| Remaining baseline warning | Applies to |
 | --- | --- |
-| The serial number is one of the known dummy values | warning |
-| The chromaticities match sRGB, but sRGB is not signaled | failure |
-| The DTD max image size is set, but the display size is not specified | failure |
+| Known dummy serial value | Static/test fixtures using serial 1; not the generic profile fixture |
+| Prefer native detailed modes = 1 | Default and generic HDR fixtures |
+| VIC 1 and first DTD differ | HDR 720p profile fixture |
 
-The last one disappears when `physical_width_mm=` and `physical_height_mm=` are
-set; it reflects the default of leaving the panel size undefined.
-
-Adding the CTA-861 extension introduces these, because a CTA block brings
-CTA-861's own conformity rules with it. They are absent when `hdr_enable=0`:
-
-| Finding | Kind |
-| --- | --- |
-| Required 640x480p60 timings missing in established timings and the SVD list (VIC 1) | failure |
-| Missing VCDB, needed for Set Selectable RGB Quantization | failure |
-| DTD #1 is identical to VIC 16, which is not present in the CTA Ext Block | warning |
-| IT Video Formats are overscanned by default, but should normally be underscanned | warning |
-
-None of them stopped KWin from recognising the output as HDR-capable, and no
-parser is known to reject the block over them. They are recorded here rather than
-fixed because closing the VIC 1 failure means publishing a Video Data Block, and
-that adds CEA modes to the connector's mode list — a change to what the output
-advertises, not just to how it describes itself.
+The script requires `EDID conformity: PASS` with no `failure|` findings for every
+variant, regardless of parser version, and always checks decoded HDR blocks and
+checksums. The exact warning baseline is compared only when the parser version
+matches; otherwise it reports PARTIAL after the version-independent checks.
+Missing `edid-decode` produces SKIP, not proof of conformity. The authoritative
+finding list is [`tests/edid-conformity.expected`](../tests/edid-conformity.expected).
+Do not refresh the baseline to hide a new failure.
 
 ### Scanout layouts
 
@@ -218,7 +195,7 @@ Output selection and authorization are scoped to a DRM file descriptor:
 4. on a separate capture fd, call `SESSION_ACCESS(BIND)` with the output index,
    session ID and token. This selects and authorizes the active output
    atomically; do not precede it with `SELECT_OUTPUT`;
-5. use the authorized fd for `WAIT_FRAME`, `ACQUIRE_FRAME`, `WAIT_UPDATE`,
+5. use the authorized fd for `WAIT_FRAME`, `ACQUIRE_FRAME2`/`ACQUIRE_FRAME`, `WAIT_UPDATE`,
    `ACQUIRE_CURSOR`, status and metrics, with one fd for every simultaneous
    output.
 
@@ -226,8 +203,8 @@ A newly opened fd defaults to output 0, preserving UAPI v7 output-selection
 behavior for older clients. UAPI v11 authorization is still required for
 protected operations. `SELECT_OUTPUT` cannot move a foreign fd onto an active,
 owned output; `SESSION_ACCESS(BIND)` is the atomic authorized path for that
-case. Rebinding an fd that owns an enabled output is also rejected. The friendly
-identities are `HERMES-1`, `HERMES-2`, and so on; each connector has a distinct
+case. Rebinding an fd that owns an enabled output is also rejected. Static
+friendly identities are `HERMES-1`, `HERMES-2`, and so on; each connector has a distinct
 EDID serial for compositor layout persistence. Compatibility was smoke-tested
 with the unmodified v0.1.2 control client against the v8 module.
 
@@ -244,9 +221,9 @@ separate devices allow separate compositors to hold DRM master concurrently.
 Each device owns its complete set of KMS objects, output/session state, frame
 queues, and platform-device lifetime.
 
-The identity ioctl reports a stable 0-based `device_index` and total
+For a static topology, the identity ioctl reports a 0-based `device_index` and total
 `device_count`. Friendly output names and EDID serials remain globally unique
-across devices. The intended isolated-session layout is `devices=N outputs=1`;
+across devices. The legacy isolated-session layout is `devices=N outputs=1`;
 the older shared-desktop layout remains `devices=1 outputs=N`.
 For compatibility, `devices=1` retains the original `hermes-kms` platform path
 and host seat. Multi-device paths use `hermes-kms.0..7`, which the packaged
@@ -273,8 +250,13 @@ reports a stable 1-based `session_index`; udev maps that index to
 `hermes-kms-N` and requests the matching private seat broker.
 Session-role primary nodes and unconfigured private render nodes are root-only
 mode 0600. The host render node is also root-owned but gets a `uaccess` ACL for
-the active local seat0 user. The root broker opens the primary node and passes access over its
-per-session socket. It creates its own private mount namespace rather than
+the active local seat0 user. The root broker opens the primary node and passes
+access over its
+per-session socket. The packaged service sets `SEATD_VTBOUND=0` so private
+sessions cannot take over the host's active VT, including a desktop started with
+`startx`. A custom launcher must preserve that environment. The service no longer
+needs `CAP_SYS_TTY_CONFIG`. The launcher creates its own private mount namespace
+rather than
 requiring the caller to supply one, which is what lets it bind its per-instance
 runtime directory over `/run` without any risk to the host's, and it runs under
 a syscall filter with a reduced capability set; global `video` membership and
@@ -308,22 +290,34 @@ without requiring `seat` group membership.
 
 ## Runtime card creation
 
-Every topology above is chosen at module load, which means a host can only draw
+Every static topology above is chosen at module load, which means a host can only draw
 from a pool decided in advance, and changing that pool means reloading a module
 a compositor is holding. configfs removes that constraint, and is the interface
-vkms adopted upstream for the same problem:
+[VKMS uses upstream](references.md#kernel-and-buffer-contracts) for runtime
+configuration. Hermes-KMS has its own attributes; this is not the VKMS ABI.
+Run configuration writes as root, after mounting configfs if needed:
 
 ```bash
-mkdir  /sys/kernel/config/hermes-kms/stream-1
-echo 1 > /sys/kernel/config/hermes-kms/stream-1/outputs
-echo session > /sys/kernel/config/hermes-kms/stream-1/role
-echo 3 > /sys/kernel/config/hermes-kms/stream-1/session_index
-echo 1000 > /sys/kernel/config/hermes-kms/stream-1/access_uid
-echo 1 > /sys/kernel/config/hermes-kms/stream-1/enabled
-cat    /sys/kernel/config/hermes-kms/stream-1/card         # cardN
-cat    /sys/kernel/config/hermes-kms/stream-1/render_node  # renderDN
-rmdir  /sys/kernel/config/hermes-kms/stream-1
+sudo modprobe hermes_kms
+mountpoint -q /sys/kernel/config || sudo mount -t configfs none /sys/kernel/config
+sudo sh -eu <<'CONFIG'
+card=/sys/kernel/config/hermes-kms/stream-1
+mkdir "$card"
+echo 1 > "$card/outputs"
+echo session > "$card/role"
+echo 3 > "$card/session_index"
+echo 1000 > "$card/access_uid"  # replace with the intended local account's UID
+echo 1 > "$card/enabled"
+cat "$card/card"               # cardN
+cat "$card/render_node"        # renderDN
+CONFIG
 ```
+
+Use an unused session index; the packaged pool already reserves its slots.
+`enabled=1` creates a DRM card, while `initial_enabled`/`SET_OUTPUT` controls
+whether its connector is connected. The default connector is disconnected.
+The full attribute list, generic/custom naming, stable serials, a runtime-only
+`devices=0` setup and teardown are in [configfs.md](configfs.md).
 
 ### Per-card render-node access
 
@@ -352,8 +346,8 @@ that does not exist remains root-only rather than falling back to a wider grant.
 Primary nodes keep their role-based policy: a session card's `card*` node stays
 root-only and is reached through its private seat broker.
 
-`outputs`, `role`, `session_index` and `access_uid` are writable only while the
-card is disabled, because the KMS object graph is built once at probe; writing them on a
+`outputs`, `role`, `session_index`, `access_uid` and the per-card display
+profile attributes are writable only while the card is disabled, because the KMS object graph is built once at probe; writing them on a
 live card returns `EBUSY`. Everything an identity needs is therefore settled
 before the card exists, so a dynamically created session card lands on the same
 `hermes-kms-N` seat and private broker a pool card would. A `session` role with
@@ -402,7 +396,7 @@ and a three-card pool created and removed in one run.
 Hermes-KMS is controlled through explicit DRM ioctls, not by scraping logs or
 guessing connector names. The UAPI is public and consumer-neutral.
 
-The current UAPI is version 11 and lives in
+The current UAPI is version 14 and lives in
 `include/uapi/drm/hermes_kms_drm.h`. It provides:
 
 - version discovery;
@@ -410,8 +404,9 @@ The current UAPI is version 11 and lives in
 - capability discovery;
 - current output status;
 - requested output enable/disable and preferred mode;
-- generic session-capability handoff;
-- frame wait/acquire with DMA-BUF and explicit synchronization;
+- generic session-capability handoff, token rotation and binding revocation;
+- frame wait/acquire with DMA-BUF and explicit synchronization, including
+  `ACQUIRE_FRAME2` for frame-associated colour and static HDR10 metadata;
 - independently sequenced cursor wait/acquire with DMA-BUF and explicit
   synchronization;
 - capture, output-lifecycle and vblank metrics. Visible width is
@@ -440,8 +435,9 @@ the documented ioctls or MIT helper without becoming a Hermes application.
 For example, a real DRM writeback connector would require a new, explicit UAPI
 extension; the driver does not advertise a placeholder capability for it.
 
-The stable driver output names are `HERMES-1` through `HERMES-N`. DRM connector
-names can still be core-generated `Virtual-*`; consumers should use
+Static driver output names are `HERMES-1` through `HERMES-N`; runtime cards
+default to `VIRTUAL-*` and support a custom prefix. DRM connector names can still
+be core-generated `Virtual-*`; consumers should use
 `GET_IDENTITY`, `GET_CAPS.output_count`, and object IDs instead of scraping
 connector names. When `HERMES_KMS_CAP_CURSOR_CAPTURE` is advertised,
 `GET_IDENTITY.cursor_plane_id` identifies the associated cursor plane.
@@ -540,7 +536,7 @@ republishes.
 
 The driver latches the current primary scanout framebuffer and its metadata as
 one coherent snapshot during atomic flush, and exposes it through `GET_STATUS`
-and `ACQUIRE_FRAME`.
+and both frame-acquisition ioctls.
 
 Tracked fields include:
 
@@ -551,14 +547,19 @@ Tracked fields include:
 - framebuffer size;
 - DRM fourcc format;
 - modifier;
-- per-plane pitch and offset.
+- per-plane pitch and offset;
+- validated colour state and static HDR10 metadata, returned by `ACQUIRE_FRAME2`.
 
 The same tracked framebuffer is refcounted and used for DMA-BUF export, sync_file
 export, latest-frame waits, and status/debug metadata.
 
 ## Frame acquire contract
 
-`DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME` is the userspace-facing frame contract.
+`DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME` is the legacy frame contract.
+`DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME2` embeds that unchanged descriptor plus a
+colour snapshot. Require `HERMES_KMS_CAP_FRAME_COLOR` before using the extended
+command; it shares authorization, synchronization, damage and retry semantics.
+See [hdr-capture.md](hdr-capture.md) for the complete colour contract.
 
 Current behavior:
 
@@ -597,9 +598,10 @@ Expected capture loop (after `SESSION_ACCESS(BIND)`):
 last_sequence = 0
 while streaming:
     WAIT_FRAME(last_sequence, timeout_ms)
-    ACQUIRE_FRAME(HERMES_KMS_FRAME_REQUEST_DMABUF |
-                  HERMES_KMS_FRAME_REQUEST_SYNC_FILE)
-    import the returned DMA-BUF into VAAPI/NVENC/AMF
+    acquire the latest frame with REQUEST_DMABUF | REQUEST_SYNC_FILE
+      (ACQUIRE_FRAME2 when FRAME_COLOR is advertised, else ACQUIRE_FRAME)
+    wait on the returned producer fence
+    import/convert for the selected encoder and close all returned fds
     last_sequence = acquired.sequence
 ```
 
@@ -661,8 +663,9 @@ to be sampled again, including possible in-place pixel changes.
 
 Framebuffer replacement can race the work required to install DMA-BUF or
 sync_file fds. In that case `ACQUIRE_FRAME` or `ACQUIRE_CURSOR` returns
-`-ESTALE` instead of mixing stale metadata with a new fd. A consumer discards
-that attempt and retries the latest-state acquire with a small bounded loop.
+`-ESTALE` instead of mixing stale metadata with a new fd. `ACQUIRE_FRAME2`
+uses the same sequence check for its combined frame/colour response. A consumer
+discards that attempt and retries the latest-state acquire with a small bounded loop.
 The interface is a latest-state channel, not a queue, so skipped intermediate
 cursor positions are expected when the consumer is slower than the compositor.
 
@@ -714,7 +717,7 @@ The module supports these topology and initial-state parameters:
 - `physical_width_mm`, `physical_height_mm`
 - `color_depth`
 - `outputs` (1–8, default 1, fixed until the module is reloaded)
-- `devices` (1–8, legacy multi-device topology)
+- `devices` (0–8; default 1, 0 creates no static cards for a configfs-only setup)
 - `session_devices` (0 disables the pool; 1–8 creates that many private cards
   plus a host card, mutually exclusive with an explicit `devices` topology)
 - `hotplug_events`
@@ -722,7 +725,10 @@ The module supports these topology and initial-state parameters:
 - `hdr_enable` (advertise HDR; gates a CTA-861 EDID extension carrying both an
   HDR Static Metadata block and a BT2020 Colorimetry block, plus the
   `HDR_OUTPUT_METADATA` and `Colorspace` connector properties, all together;
-  default off, load-time only, untested together with `color_depth=10`)
+  default off, load-time only for static cards; per-card configurable in configfs)
+- `huge_gem` (experimental, default off; huge-page-backed local dumb buffers
+  where the target kernel exposes `drm_gem_huge_mnt_create()`; not a validated
+  NVIDIA import fix and not an allocator for imported GPU buffers)
 - `scanout_modifiers` (up to 15 extra `IN_FORMATS` layouts; linear is always
   advertised and every modifier is accepted regardless of this list)
 
@@ -781,7 +787,7 @@ a framebuffer directly.
 
 Seat assignment is deliberately handled outside the kernel driver. Tags such as
 `seat` and `master-of-seat`, plus `ID_SEAT` and `ID_AUTOSEAT`, are udev/logind
-policy, not DRM driver state. Development and packaging install
+policy, not DRM driver state. Only the opt-in development installation uses
 `udev/99-hermes-kms-ignore-seat.rules` after the standard seat rules so local
 test cards are not offered to the active desktop session until a test controller
 owns the stream lifecycle. The rule controls local device-node permissions so
@@ -789,31 +795,28 @@ tests can run without making application identity part of the kernel UAPI.
 
 ## Current status
 
-Implemented and validated for the original single-output path: explicit
-CRTC/encoder/plane modeset with a software vblank timer (60/120/144 Hz,
-lockdep-clean, deterministic pacing), cursor plane, damage tracking, render node
-for masterless zero-copy consumption, scanout tracking, owner-fd lifecycle,
-stable output identity, DMA-BUF + sync_file export, strict atomic check, and
-debugfs telemetry. End-to-end zero-copy is validated on VAAPI (XRGB8888,
-linear). Generic UAPI v11 session-capability binding, separate cursor capture,
-and native/ILP32 ABI checks are also implemented.
+Implemented: explicit KMS pipelines, software vblank pacing, separate cursor
+capture, sequence-safe damage, DMA-BUF/producer-fence export, owner-bound
+sessions and generic capabilities, token rotation/revocation, multi-output and
+multi-card topologies, automatic session pools, dynamic per-card profiles, and
+UAPI v14 frame-associated HDR10 colour metadata. ABI checks cover native and
+ILP32 layouts when a multilib toolchain is available.
 
-Implemented and VM-validated as a prototype: multiple independent KMS
-pipelines on one DRM device and per-fd output selection. This is not yet
-validated with KWin and real encoders on the host.
+The established end-to-end zero-copy validation is linear XRGB8888 through
+VAAPI. The NVIDIA consumer uses a CPU-copy fallback; the
+[experimental branch](https://github.com/MrOz59/Hermes-KMS/tree/experimental/nvidia-zero-copy)
+adds GPU-origin/import/cache-coherence diagnostics rather than a validated
+production replacement. `huge_gem` remains an experiment.
 
-Not yet implemented:
+Runtime scripts cover the driver contracts in disposable VMs: configfs,
+independent modesets, concurrent Weston compositors, GNOME cursor capture,
+labwc/wlroots with pixman, HDR metadata, authorization, pacing and export stress.
+A script's presence is not a passing run on every compositor/GPU version; CI
+primarily builds and checks userspace/packaging and target kernel headers.
+Hyprland uses Aquamarine and is not certified by the labwc test.
 
-- a real DRM writeback connector;
-- NVENC/AMF import validation (VAAPI is validated);
-- NV12/P010 scanout (the compositor composes in RGB; the encoder does RGB→NV12
-  on the real GPU today);
-- full compositor recovery handling beyond owner-fd disconnect and hotplug.
-
-Implemented but not yet validated end to end: HDR advertisement. `hdr_enable=1`
-makes a compositor recognise the output as HDR-capable, but the capture UAPI
-carries no colour metadata, so a consumer cannot interpret an HDR frame. See
-[Scanout formats](#scanout-formats) above for the
-mechanisms, the capture-side gap, and the EDID conformity findings. `tests/edid.c`
-covers the generated bytes, both checksums and the published EDID length under
-`make check`.
+Remaining work includes real concurrent streams/input isolation, broader GPU
+format/modifier import and HDR client/display validation, NV12/P010 scanout,
+encoder use of damage, a real writeback connector and compositor recovery beyond
+owner-fd disconnect/hotplug. See [roadmap.md](roadmap.md),
+[hdr-capture.md](hdr-capture.md) and [references.md](references.md).
