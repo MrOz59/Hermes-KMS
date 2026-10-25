@@ -2,33 +2,56 @@
 
 Hermes-KMS is a Linux DRM/KMS virtual display driver.
 
-It is an EVDI alternative: a virtual display backend that streams the
-compositor's scanout straight into a hardware encoder as a DMA-BUF, with no CPU
-readback. Hermes is the reference consumer, but the driver is not tied to it —
-any program that speaks its DRM ioctl UAPI can consume frames (see
+It is an EVDI alternative: a virtual display backend that exports the
+compositor's scanout as a DMA-BUF without driver-side CPU readback. End-to-end
+zero-copy depends on the consumer's GPU import path; NVIDIA currently uses a
+CPU-copy fallback in Hermes. Hermes is the reference consumer, but the driver
+is not tied to it — any program that speaks its DRM ioctl UAPI can consume frames (see
 [Using it in other projects](#using-it-in-other-projects)).
+
+## Current state
+
+This documentation describes `main`, reviewed on 2026-10-25. The driver reports
+version **0.4.0** and **UAPI v14**; `main` also contains fixes made after the
+`v0.4.0` tag. Use [the changelog](CHANGELOG.md) to distinguish released changes
+from unreleased fixes.
+
+| Area | Implemented behavior and validation limits |
+| --- | --- |
+| Capture | Session-authorized DMA-BUF and producer-fence export; end-to-end VAAPI zero-copy validated for linear XRGB8888. Other format/modifier/backend combinations need their own validation. |
+| HDR | `ACQUIRE_FRAME2` carries frame-associated colour and static HDR10 metadata. Driver/VM tests cover the contract; GPU, encoder and client/display validation remains a separate integration requirement. |
+| Runtime displays | Configfs creates cards with per-card modes, identity, HDR and access policy, including a `devices=0` runtime-only setup. |
+| Concurrent sessions | Multi-output, independent cards and host-compatible session pools are implemented with VM regressions. Real concurrent streaming and input isolation still need product-level validation. |
+| Access and brokers | Capture opens use `O_RDONLY`; private seatd services run with `SEATD_VTBOUND=0` so they do not take over the host VT. |
+| NVIDIA | Current Hermes uses a CPU scanout copy with hardware conversion/encoding. The separate `experimental/nvidia-zero-copy` branch contains diagnostic experiments, not a validated replacement path. |
+
+Documentation: [driver design](docs/driver-design.md),
+[configfs attributes and examples](docs/configfs.md),
+[HDR capture contract](docs/hdr-capture.md), [roadmap](docs/roadmap.md), and
+[upstream references](docs/references.md).
 
 ## What this is
 
 - A Linux kernel DRM/KMS driver (`hermes_kms.ko`).
 - An EVDI alternative for low-latency screen capture, used by Hermes today.
 - A virtual display that exposes independently controlled outputs
-  (`HERMES-1`, `HERMES-2`, ...) which a desktop
-  compositor (KWin/GNOME) drives like a normal monitor.
+  (`HERMES-1`, `HERMES-2`, ... for static cards; configurable for runtime cards)
+  which a desktop compositor (KWin/GNOME) drives like a normal monitor.
 - A zero-copy DMA-BUF source for VAAPI/other hardware encoders.
 
 ## What this is not
 
 - It is not an EVDI manager or a userspace wrapper around EVDI.
 - It is not a render GPU: it exports the compositor's framebuffer; the encode
-  still runs on a real GPU that imports the exported DMA-BUF.
+  still runs on a real GPU, using direct import or the consumer's copy fallback.
 
 ## How it works
 
 The compositor owns the card and the capture consumer only reads frames:
 
-1. The driver exposes a **render node** (`DRIVER_RENDER`). Without it, compositors
-   skip the GPU and never enumerate the virtual connector.
+1. The driver exposes a primary KMS node for the compositor and a **render node**
+   (`DRIVER_RENDER`) for control/capture without taking DRM master. It provides
+   no hardware rendering engine; compositor adoption depends on its backend.
 2. A userspace owner opens the **render node** (never the primary node, which
    would steal DRM master and EBUSY-block the compositor), claims an output,
    and obtains an opaque session capability.
@@ -37,12 +60,15 @@ The compositor owns the card and the capture consumer only reads frames:
    framebuffer.
 4. The owner hands the capability to a capture fd over an application-defined
    trusted channel. The bound fd pulls the current scanout as DMA-BUFs via
-   `ACQUIRE_FRAME`; the kernel never checks an application or process name.
-5. A real GPU imports those DMA-BUFs and encodes them. The frame never leaves
-   the GPU.
+   `ACQUIRE_FRAME2` (or legacy `ACQUIRE_FRAME`); the kernel never checks an
+   application or process name.
+5. The consumer imports those DMA-BUFs into a real GPU for conversion/encoding
+   when supported. A fallback may copy the pixels; the kernel export alone
+   does not prove that the complete pipeline is zero-copy.
 
-Measured capture cost on KWin at 720p: ~8 us/frame (`ACQUIRE_FRAME`) versus
-~180 us/frame for EVDI's CPU copy, and constant regardless of resolution.
+An earlier KWin/720p measurement was ~8 us/frame for `ACQUIRE_FRAME` versus
+~180 us/frame for EVDI's CPU copy. This measures acquisition overhead, not
+end-to-end streaming latency or every GPU/resolution combination.
 
 ## Using it in other projects
 
@@ -57,7 +83,7 @@ or your own tool — can use it by talking the same UAPI, with no fork required:
    `DRM_IOCTL_VERSION` ioctl (or libdrm's `drmGetVersion()`); require the exact
    driver name `hermes-kms` before issuing any Hermes-KMS private ioctl. Private
    DRM command numbers are driver-local and are not safe device probes. Then use
-   `GET_VERSION` / `GET_CAPS`. The current interface is UAPI v13; require
+   `GET_VERSION` / `GET_CAPS`. The current interface is UAPI v14; require
    `HERMES_KMS_CAP_SESSION_TOKEN` before using the protected capture path, and
    `HERMES_KMS_CAP_SESSION_LIFECYCLE` before relying on token rotation or
    binding revocation.
@@ -79,12 +105,15 @@ or your own tool — can use it by talking the same UAPI, with no fork required:
    each separate capture fd, call `SESSION_ACCESS(BIND)` with the output index,
    token and session ID. `BIND` selects the active output and authorizes the fd
    atomically; do not call `SELECT_OUTPUT` first on that capture fd.
-6. A primary-frame-only consumer runs `WAIT_FRAME` → `ACQUIRE_FRAME` and
-   imports the returned DMA-BUF into its encoder.
+6. A primary-frame-only consumer runs `WAIT_FRAME` → `ACQUIRE_FRAME2` when
+   `HERMES_KMS_CAP_FRAME_COLOR` is present. The extended acquire associates
+   colour state with the buffer, sequence and fence. Legacy `ACQUIRE_FRAME`
+   remains available, but cannot safely identify HDR samples.
 7. A consumer that needs the hardware cursor requires
    `HERMES_KMS_CAP_CURSOR_CAPTURE`, waits on both streams with `WAIT_UPDATE`,
-   acquires the current primary frame and cursor with `ACQUIRE_FRAME` and
-   `ACQUIRE_CURSOR`, waits on their sync_file fds, and composites the cursor.
+   acquires the primary frame with `ACQUIRE_FRAME2` (legacy `ACQUIRE_FRAME`
+   when needed) and the cursor with `ACQUIRE_CURSOR`, then waits on their
+   producer fences and composites the cursor in the correct colour space.
    `GET_STATUS` and `GET_METRICS` use the same binding.
 8. To cut off access without ending the stream, the owner calls
    `SESSION_ACCESS(ROTATE_TOKEN)` — which retires the token while every bound
@@ -105,17 +134,19 @@ self-contained reference consumers you can read or copy. The UAPI is documented
 in [include/uapi/drm/hermes_kms_drm.h](include/uapi/drm/hermes_kms_drm.h) and in
 [Userspace communication](#userspace-communication) below.
 
-What is currently fixed (and would need a fork to rebrand, though not to use):
-the output name prefix is `HERMES-` and the UAPI symbols are prefixed
-`HERMES_KMS_`.
+Runtime cards default to `VIRTUAL-` output names and a `VRT` / `Virtual KMS`
+EDID identity. Configfs can change `output_prefix`, `manufacturer`,
+`monitor_name` and `serial_base` without a fork. Static cards retain the
+`HERMES-` prefix; the DRM driver name (`hermes-kms`) and public `HERMES_KMS_`
+symbols remain the protocol identity regardless of display branding.
 
-What is currently validated: VAAPI with `XRGB8888`, linear. NVENC/AMF and
-NV12/P010 are not validated yet — see the [Roadmap](#roadmap). HDR is
-*advertised* but not deliverable end to end: `hdr_enable=1` makes a compositor
-recognise the output as HDR-capable, but the capture UAPI carries no colour
-metadata, so a consumer cannot interpret an HDR frame correctly — see
-[HDR advertisement](#hdr-advertisement). Forks and contributions extending those
-paths are welcome under the project's license.
+The established zero-copy validation is VAAPI with linear `XRGB8888`.
+NVIDIA DMA-BUF import has known correctness issues on the tested configuration;
+NVENC through Hermes's CPU-copy path is a different integration. AMF direct
+import and NV12/P010 scanout are not validated. HDR advertisement and per-frame
+colour metadata are implemented; a consumer must support the
+[HDR capture contract](docs/hdr-capture.md) and validate its conversion, encoder
+and client. See the [roadmap](docs/roadmap.md) for remaining work.
 
 The kernel module is GPL-2.0, while the installed UAPI has the Linux syscall-note
 exception and the optional userspace session helper is MIT-licensed. This keeps
@@ -143,17 +174,19 @@ an independently developed consumer separate from the Hermes application; see
   virtual displays on demand instead of drawing from a pool fixed at module
   load. Role and session index are settable before the card exists, so a
   dynamic card lands on the same seat and broker a pool card would, and the
-  `card`/`render_node` attributes report the nodes it received;
+  `card`/`render_node` attributes report the nodes it received. Runtime cards
+  also support per-card display profiles and generic/custom EDID identity;
 - per-card render-node ACLs (`access_uid`), so several mutually untrusted
   consumers can each hold their own card instead of sharing the one uid the
   packaged pool grants every Hermes node;
-- 1–8 independent DRM cards (`devices=`, default 1), each with its own
+- 0–8 static DRM cards (`devices=`, default 1; 0 for configfs-only use), each with its own
   DRM-master domain so separate compositors can back separate graphical
   sessions. The legacy `devices=N outputs=1` layout remains available;
 - UAPI v10 automatic session pools (`session_devices=1..8`). A pool adds one
   host card that remains on seat0 plus the requested private cards, so the
   existing host-desktop path and isolated sessions can coexist without
-  reloading the module. The packaged default is four inert session cards.
+  reloading the module. The core package defaults to no private cards; the
+  optional setup helper defaults to four inert session cards.
   Scanout buffers are allocated only while a client owns a card;
 - role-aware udev rules map only private cards to stable
   `hermes-kms-1..8` seats and ask systemd to start the matching private seat
@@ -163,11 +196,12 @@ an independently developed consumer separate from the Hermes application; see
   while keeping the framebuffer pitch independently aligned for DMA-BUF;
 - eight- and ten-bit scanout formats (`XRGB8888`/`ARGB8888` and the `2101010`
   variants), with the advertised EDID depth selected by `color_depth=`;
-- optional HDR *advertisement* (`hdr_enable=1`, default off), which adds a
+- optional HDR advertisement (`hdr_enable=1`, default off), which adds a
   CTA-861 EDID extension (HDR Static Metadata + BT2020 Colorimetry data blocks)
   and the `HDR_OUTPUT_METADATA` and `Colorspace` connector properties as one
-  unit. Advertisement only — the capture UAPI carries no colour metadata, so
-  end-to-end HDR is incomplete; see [HDR advertisement](#hdr-advertisement);
+  unit, plus UAPI v14 `ACQUIRE_FRAME2` for atomic frame/colour snapshots;
+  see [HDR advertisement](#hdr-advertisement) and the
+  [HDR capture contract](docs/hdr-capture.md);
 - scanout modifier pass-through: any tiled or compressed layout the compositor's
   render GPU produces is accepted, and `scanout_modifiers=` publishes the extra
   layouts an `IN_FORMATS`-driven compositor can negotiate;
@@ -218,6 +252,7 @@ build, no root and no hardware — and are what CI runs on every push:
 
 ```bash
 make check
+make check-hdr-build
 ```
 
 That covers `check-uapi` (public struct sizes, alignment-sensitive offsets and
@@ -230,13 +265,21 @@ libdrm's pkg-config metadata, and both SKIP their 32-bit half when no multilib
 compiler is available; `check-edid-conformity` SKIPs cleanly when `edid-decode`
 (v4l-utils) is not installed.
 
+`check-hdr-build` compiles the DRM/HDR integration tests without running them.
+CI also builds the optional tools, checks staged installation and packaged
+configuration, and compiles the module against Arch rolling, Ubuntu LTS and
+Fedora headers. These build checks do not exercise a loaded driver, compositor
+or hardware encoder. The runtime scripts below belong in a disposable VM or
+explicitly prepared test host.
+
 ### Install
 
 The Arch/CachyOS build produces a DKMS package with the host access policy and
 an optional `seatd` package for private session cards:
 
 ```bash
-makepkg -si
+makepkg -s
+sudo pacman -U ./hermes-kms-dkms-git-*.pkg.tar.zst
 ```
 
 The default load creates one seat0 host card. Its render node remains owned by
@@ -252,8 +295,16 @@ read-only render-node ACLs, without udev's deprecated non-system `OWNER`
 assignment:
 
 ```bash
+sudo pacman -U ./hermes-kms-seatd-git-*.pkg.tar.zst
 sudo /usr/lib/hermes-kms/hermes-kms-setup configure --user auto
 ```
+
+The split packages are `hermes-kms-dkms-git` (module, core runtime policy and
+public headers) and `hermes-kms-seatd-git` (private brokers and setup helper).
+The `-git` PKGBUILD fetches the default branch; it does not pin a release tag.
+Build optional diagnostic tools separately with `make tools`; the packages do
+not install the `hermes-kmsctl` executable. If the helper is missing, check
+`pacman -Q hermes-kms-seatd-git` and install the broker package above.
 
 For a source installation, `sudo make dkms-install` installs the core policy.
 Use `sudo make INSTALL_BROKER=1 dkms-install` to install the optional private-seat
@@ -264,12 +315,12 @@ If you installed the temporary `99-hermes-kms-uaccess.rules` workaround from
 issue #6, remove it; it matches private render nodes too and would override
 their restricted access policy.
 
-### Image-based systems (Bazzite, Silverblue, SteamOS)
+### Image-based systems (Bazzite and compatible bootc/ostree images)
 
-DKMS does not work on an image-based distribution. Its whole model is to rebuild
-the module on the installed system whenever the kernel changes, and there `/usr`
-is read-only at runtime, so that moment never arrives. The module has to be
-built into the image instead.
+The repository provides a build-time image integration instead of a runtime
+DKMS workflow for a read-only `/usr`. Distribution-specific mechanisms such as
+akmods are separate integrations; the Containerfile is a Bazzite/Fedora example,
+not a universal Silverblue or SteamOS installer.
 
 `packaging/bazzite/Containerfile` does that: it compiles `hermes_kms.ko` against
 the image's kernel and installs it to `/usr/lib/modules/<kver>/extra`, which is
@@ -280,12 +331,18 @@ podman build -t localhost/bazzite-hermes:latest -f packaging/bazzite/Containerfi
 sudo bootc switch --transport containers-storage localhost/bazzite-hermes:latest
 ```
 
-Reboot into the new image and the module autoloads. Push the image to a registry
-and rebase from there if you want it to follow Bazzite's own updates.
+Run the build and switch with access to the same Podman image store (for example,
+use `sudo podman build` if `sudo bootc` cannot see a rootless build). Reboot into
+the new image and the module autoloads. Rebuild and redeploy the derived image
+for kernel updates; publishing it once does not automatically track base-image
+changes. See the [bootc references](docs/references.md#installation).
+The Containerfile defaults to `WITH_SEAT_BROKER=1`; pass
+`--build-arg WITH_SEAT_BROKER=0` for core-only installation. After a broker-enabled
+installation, run the same setup helper to configure the private pool.
 
-**Secure Boot.** Bazzite ships with Secure Boot enabled, signed with the
-Universal Blue key. A module built this way is unsigned, and an enforcing Secure
-Boot will refuse to load it. Either enroll your own MOK and pass it to the build:
+**Secure Boot.** If the target enforces trusted module signatures, an unsigned
+module will not load. Enroll a signing certificate through the distribution's
+supported workflow, then pass its matching key and certificate to the build:
 
 ```bash
 podman build \
@@ -298,7 +355,8 @@ podman build \
 Both secrets are required together. They are mounted only in the discarded
 build stage and are never copied into the build context or final image.
 
-…or turn Secure Boot off in firmware. There is no way around that pair.
+Alternatively, disable Secure Boot in firmware. Signing alone does not enroll
+the certificate; see the [kernel module-signing reference](docs/references.md#installation).
 
 The two Makefile targets behind it work for any image build, not only Bazzite:
 
@@ -388,8 +446,8 @@ gates every mechanism together, so the output never advertises a subset: the
 CTA-861 HDR Static Metadata and BT2020 Colorimetry data blocks in the EDID, and
 the `HDR_OUTPUT_METADATA` and `Colorspace` connector properties. All of them are
 needed because compositors gate HDR behind a chain rather than a single signal;
-[`docs/driver-design.md`](docs/driver-design.md) walks through KWin's version of
-that chain and why each mechanism is load-bearing.
+[`docs/driver-design.md`](docs/driver-design.md) walks through the KWin integration
+used when implementing that chain and why each mechanism is load-bearing.
 
 ```bash
 sudo modprobe hermes_kms hdr_enable=1
@@ -402,29 +460,28 @@ To apply it at every module load, drop a file in `/etc/modprobe.d`:
 options hermes_kms hdr_enable=1
 ```
 
-**This feature is incomplete.** `hdr_enable=1` advertises HDR capability to
-compositors. Hermes does not yet include colorspace, EOTF, or HDR metadata in its
-capture UAPI. Consumers relying only on that interface cannot determine the
-captured frame's colour encoding. End-to-end HDR streaming remains incomplete,
-including with `color_depth=10`.
+For a ten-bit HDR10 setup, use `hdr_enable=1 color_depth=10` together and keep
+the normal `initial_enabled=0` owner-controlled lifecycle. Store the HDR options
+in a separate `/etc/modprobe.d/hermes-kms-hdr.conf` and reboot if the module is
+already loaded. Configfs cards can set the same options before card creation.
 
-Concretely, that means:
+UAPI v14 implements the capture side: `HERMES_KMS_CAP_FRAME_COLOR` advertises
+`ACQUIRE_FRAME2`, which returns the frame and its committed colour/HDR metadata
+as one snapshot. Colour-only changes advance the frame sequence and invalidate
+damage. The old `ACQUIRE_FRAME` deliberately remains colour-blind and
+binary-compatible; querying current connector properties separately is not a
+safe replacement for frame-associated metadata.
 
-- `hdr_enable=1` only advertises support — it does not itself activate HDR.
-- If the compositor switches to PQ/BT.2020 and the consumer keeps interpreting
-  the frame as SDR, colours will be wrong. This applies to ten-bit frames too;
-  `color_depth=10` does not supply the missing signalling.
-- DRM does store the negotiated `Colorspace` and `HDR_OUTPUT_METADATA` on the
-  connector, and a consumer holding the primary KMS node can read them. That is
-  not reachable through the render node, and it does not associate the metadata
-  atomically with a captured frame.
-- Whether a given compositor needs `color_depth=10` set alongside `hdr_enable=1`
-  is untested. If one still reports "HDR: incapable" with both set, CRTC
-  colour-management properties are the next area to look at; that is outside this
-  feature's scope.
+Advertisement still does not activate HDR: the compositor chooses PQ/BT.2020.
+Ten-bit storage alone is not HDR. The driver preserves RGB pixels and static
+HDR10 metadata; it performs no RGB-to-P010 conversion, tone mapping or encoding.
+A compatible consumer must do those steps and signal its client correctly.
+See [docs/hdr-capture.md](docs/hdr-capture.md) for flags, units, cursor constraints,
+tests and end-to-end release gates, and
+[Hermes's integration guide](https://github.com/MrOz59/Hermes/blob/main/docs/hermes_kms_hdr.md)
+for that consumer's setup and GPU paths.
 
-Carrying colour metadata alongside the captured frame is a capture-UAPI change
-and is deliberately left to follow-up work.
+### Private session brokers
 
 Independent compositors use the packaged
 `72-hermes-kms-session-seats.rules` and one private seat broker per session
@@ -439,6 +496,11 @@ The sockets are exposed as
 `/run/hermes-kms-seatd/2/seatd.sock`, and so on. Each service runs the stock
 `seatd` daemon inside its own mount namespace because the daemon has a
 compile-time socket path and only permits one active compositor per daemon.
+The packaged service sets `SEATD_VTBOUND=0`: private sessions have no host VT,
+and allowing seatd to bind one can switch a `startx` desktop to text mode.
+Keep the packaged setting when overriding or copying the service. The launcher
+creates a private mount namespace even when invoked directly; that alone does
+not set the service's VT environment for a hand-written launch command.
 The pool's host-role card stays on seat0, so existing KWin/GNOME use is
 unchanged. These private brokers are experimental session plumbing, not a
 security boundary between mutually untrusted local users.
@@ -447,18 +509,23 @@ There are two ways to drive the output, for two different purposes.
 
 ### Compositor-driven (real streaming)
 
-This is the path Hermes uses. Load the module enabled and let the desktop
-compositor adopt the connector:
+This is the normal owner-controlled path. Load the module disconnected, then
+hold an output from the render node and let the desktop adopt its hotplug:
 
 ```bash
-sudo insmod kernel/hermes-kms/hermes_kms.ko initial_enabled=1
+sudo modprobe hermes_kms initial_enabled=0
+session_file="${XDG_RUNTIME_DIR:?}/hermes-kms-session"
+tools/hermes-kmsctl/hermes-kmsctl --session-file "$session_file" hold 1920x1080@60
 ```
 
-The card must stay on the active logind seat so the compositor opens it — do
-**not** install the dev seat-ignore rule for this. KWin/GNOME enable `HERMES-1`,
-commit a framebuffer, and Hermes pulls frames from the render node. A userspace
-owner may still call `SET_OUTPUT` (via the render node) to request the client's
-exact mode; that owner does not take DRM master, so the compositor keeps it.
+For an uninstalled source build, use `sudo insmod
+kernel/hermes-kms/hermes_kms.ko initial_enabled=0` instead of `modprobe`.
+The card must stay on the active logind seat so the compositor opens it; do
+not install the dev seat-ignore rule for this. The compositor commits a
+framebuffer, and the authorized consumer captures it through the render node.
+`hold` calls `SET_OUTPUT` and keeps the owner fd alive without taking DRM master.
+`initial_enabled=1` remains available for standalone modeset tests, but it does
+not establish the capture owner's authorization.
 
 ### Isolated `modetest` (driver validation, no compositor)
 
@@ -516,7 +583,14 @@ Other validation scripts (run as root, in the virtme-ng VM or on the host):
   `hdr_enable=1 color_depth=10`, and verifies the published EDID length (128 vs
   256 bytes), the CTA extension's HDR Static Metadata and BT2020 Colorimetry
   blocks, and that `HDR_OUTPUT_METADATA` and `Colorspace` appear on the
-  connector only when enabled. Needs no GPU or compositor;
+  connector only when enabled, then verifies committed colour metadata through
+  `ACQUIRE_FRAME2`. Needs no GPU or compositor;
+- `scripts/vm-hdr-capture-test.sh` — exercises ten-bit SDR/HDR capture,
+  metadata-only and nonblocking commits, invalid state, old ABI access,
+  producer fences and session revocation;
+- `scripts/vm-wlroots-test.sh` — exercises labwc's wlroots DRM backend on a
+  private card with the pixman renderer; this is not a GPU-rendering or
+  Hyprland/Aquamarine compatibility test;
 - `scripts/vm-cursor-gnome-test.sh` — starts a GNOME/Mutter session against a
   Hermes card, moves the pointer, and records whether Mutter uses the cursor
   plane and whether the independent cursor DMA-BUF stream reports coherent
@@ -545,8 +619,9 @@ sudo make uninstall-dev-udev
 
 The seat exclusion cannot live inside the kernel driver: `seat`,
 `master-of-seat`, `ID_SEAT`, and `ID_AUTOSEAT` are udev/logind userspace
-policy. The dev udev rule also sets `GROUP="video"`, `MODE="0660"`, and
-`TAG+="uaccess"` so a local test controller can run without root.
+policy. The dev udev rule adjusts primary-node seat/permissions for isolated test
+controllers. Render nodes retain the packaged read-only ACL policy; inspect
+`udev/99-hermes-kms-ignore-seat.rules` before using it on a test host.
 
 ## Userspace communication
 
@@ -580,7 +655,7 @@ name `hermes-kms`. Do not use a private ioctl as the initial probe: private DRM
 command numbers have meaning only after the core driver identity is known and
 can overlap with another driver's commands.
 
-The current interface is UAPI v13. Its ioctls are:
+The current interface is UAPI v14. Its ioctls are:
 
 - `DRM_IOCTL_HERMES_KMS_GET_VERSION`
 - `DRM_IOCTL_HERMES_KMS_GET_IDENTITY`
@@ -588,6 +663,7 @@ The current interface is UAPI v13. Its ioctls are:
 - `DRM_IOCTL_HERMES_KMS_GET_STATUS`
 - `DRM_IOCTL_HERMES_KMS_SET_OUTPUT`
 - `DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME`
+- `DRM_IOCTL_HERMES_KMS_ACQUIRE_FRAME2` (UAPI v14, frame-associated colour)
 - `DRM_IOCTL_HERMES_KMS_WAIT_FRAME`
 - `DRM_IOCTL_HERMES_KMS_GET_METRICS`
 - `DRM_IOCTL_HERMES_KMS_SELECT_OUTPUT` (UAPI v8)
@@ -598,8 +674,8 @@ The current interface is UAPI v13. Its ioctls are:
 `GET_CAPS.output_count` reports the number of independent outputs.
 `SELECT_OUTPUT` binds all output-scoped ioctls on that fd to a 0-based output;
 new fds default to output 0 for compatibility. `GET_IDENTITY` then exposes the
-selected stable driver-facing name (`HERMES-1`, `HERMES-2`, ...) while the DRM
-core may still expose connector objects as `Virtual-*`.
+selected driver-facing name (`HERMES-*` on static cards, configurable on runtime
+cards), while the DRM core may expose connector objects as `Virtual-*`.
 UAPI v9 also exposes `GET_IDENTITY.device_index` and `device_count`. UAPI v10
 adds `device_role`, `session_index`, and `session_device_count` in words that
 were previously reserved. Consumers must check
@@ -614,6 +690,10 @@ removed at runtime through configfs, so a consumer should enumerate cards rather
 than assume the set fixed at module load.
 `HERMES_KMS_CAP_SESSION_LIFECYCLE` (UAPI v13) means the owner can rotate the
 session token and revoke bindings without ending the session.
+`HERMES_KMS_CAP_FRAME_COLOR` (UAPI v14) advertises `ACQUIRE_FRAME2`. Zero the
+whole `drm_hermes_kms_acquire_frame2` and set only `frame.flags` on input;
+`frame` and `color` describe one captured state. Check colour validity flags
+before interpreting the HDR blob. See [the HDR contract](docs/hdr-capture.md).
 
 UAPI v11 advertises `HERMES_KMS_CAP_SESSION_TOKEN` and protects active output
 state, frame capture, waits and metrics with a generic session capability.
@@ -706,7 +786,9 @@ wake it:
 
 ```text
 WAIT_FRAME(after_sequence, timeout_ms)
-ACQUIRE_FRAME(HERMES_KMS_FRAME_REQUEST_DMABUF | HERMES_KMS_FRAME_REQUEST_SYNC_FILE)
+ACQUIRE_FRAME2 with frame.flags = REQUEST_DMABUF | REQUEST_SYNC_FILE
+  (legacy ACQUIRE_FRAME only when FRAME_COLOR is unavailable)
+wait on the returned producer fence
 import DMA-BUF into encoder
 after_sequence = returned sequence
 ```
@@ -770,10 +852,16 @@ premultiplied cursor over the primary image. If the compositor uses a software
 cursor instead of the KMS cursor plane, no separate visible cursor buffer is
 reported because those pixels are already part of the primary framebuffer.
 
+`ACQUIRE_FRAME2` uses the same buffer, fence, damage, session and `ESTALE`
+contracts, adding colour metadata for that exact primary state. Prefer it when
+`HERMES_KMS_CAP_FRAME_COLOR` is present. An HDR consumer must also resolve
+cursor colour semantics; see [the HDR contract](docs/hdr-capture.md).
+
 This hands userspace a shared buffer with no driver-side CPU readback. The
-reference consumer validates end-to-end zero-copy on VAAPI today (XRGB8888, linear): the captured
-DMA-BUF is imported by a real GPU and encoded directly. NVENC/AMF still need
-their own format/modifier/import validation.
+reference consumer validates end-to-end zero-copy on VAAPI (XRGB8888, linear).
+NVIDIA currently uses a CPU-copy fallback; direct NVENC/AMF import needs its
+own format/modifier/content validation. Successful import alone does not prove
+correct full-frame sampling or encoding.
 
 `GET_METRICS` reports counters and timestamps for frame updates, frame waits,
 acquires, DMA-BUF exports, sync_file exports, hotplug events, output lifecycle,

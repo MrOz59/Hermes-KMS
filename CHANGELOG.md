@@ -26,6 +26,13 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Documentation
+
+- Refresh README, architecture, HDR and roadmap for UAPI v14, current read-only
+  capture access, VT-free private brokers, generic configfs display profiles,
+  the current EDID conformity baseline and NVIDIA import limitations. Add a
+  complete configfs attribute reference and links to the upstream APIs.
+
 ### Fixed
 
 - Render-node access is read-only for both active-seat and explicitly assigned

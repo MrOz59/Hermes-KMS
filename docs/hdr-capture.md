@@ -1,5 +1,10 @@
 # HDR capture contract (UAPI v14)
 
+This contract is implemented in `main` (driver 0.4.0, UAPI v14); it is not a
+proposal. Driver contract coverage and full HDR streaming validation are separate.
+See [the README](../README.md#current-state) for current status and
+[upstream references](references.md) for the external APIs.
+
 ## Scope and representation
 
 Hermes-KMS is a pixel-preserving virtual RGB sink. The HDR path supports static
@@ -7,7 +12,9 @@ HDR10 signalling: BT.2020 RGB, ST2084/PQ, and CTA type-1 static metadata. It doe
 not implement HLG, Dolby Vision, HDR10+, YUV scanout, tone mapping or encoding.
 Those are separate features, not synonyms for ten-bit framebuffer support.
 
-Enable advertisement with `hdr_enable=1 color_depth=10`. The default stays SDR.
+Enable advertisement with `hdr_enable=1 color_depth=10`. For static cards these
+are load-time options; runtime configfs cards can set both attributes before
+creation (see [configfs.md](configfs.md)). The default stays SDR.
 The existing CTA blocks advertise PQ and BT.2020, and the connector exposes
 `Colorspace` and `HDR_OUTPUT_METADATA`. The compositor chooses its output state.
 Eight-bit PQ is permitted (for compositor dithering); format and transfer function
@@ -62,8 +69,9 @@ returned fd even when conversion or encoding fails.
 
 ## Consumer integration and production release gates
 
-The accompanying Hermes changes consume `ACQUIRE_FRAME2`, preserve ten-bit RGB,
-and reinitialize encoding when frame colour state changes. Updating the driver
+[Hermes's integration](https://github.com/MrOz59/Hermes/blob/main/docs/hermes_kms_hdr.md)
+consumes `ACQUIRE_FRAME2`, preserves ten-bit RGB, and reinitializes encoding when
+frame colour state changes. Updating the driver
 alone cannot enable correct HDR streaming in an older consumer. A consumer must:
 
 1. Discover the new capability and acquire colour metadata with every frame.
@@ -88,8 +96,8 @@ The initial release target is KDE/KWin, AMD VAAPI and NVIDIA NVENC. NVIDIA
 retains the existing CPU scanout copy; colour conversion and encoding remain
 hardware accelerated. NVIDIA/KWin zero-copy work is explicitly deferred.
 Release validation requires each compositor and GPU backend claimed by the
-product, and an
-HDR-capable client/display. Test ramps (no eight-bit truncation), reference white,
+product, an HDR-capable client/display, and an encoder with a supported ten-bit
+profile. Test ramps (no eight-bit truncation), reference white,
 near-black, saturated BT.2020 colours, clipping, metadata changes, SDR fallback,
 reconnects, multi-output isolation, dropped frames and cursor visibility. Inspect
 encoded bitstream metadata as well as visual output. A headless VM can validate
@@ -98,12 +106,16 @@ DRM and UAPI behaviour, but cannot establish these GPU/display properties.
 ## Reproducible checks
 
 `make check` pins the public ABI, session helper and generated EDID. Parser
-conformity compares the existing tracked findings; it does not claim a pristine
-EDID conformity report. `make check-hdr-build` compiles the integration test.
+conformity requires PASS with no failures for all eight variants;
+the recorded baseline has warnings only. Exact warning comparison is
+parser-version-dependent; see [EDID conformity](driver-design.md#edid-conformity).
+`make check-hdr-build` compiles the integration test.
 `tests/hdr-capture.c` is run by `scripts/vm-hdr-capture-test.sh` only in a disposable
 VM. It covers ten-bit SDR, metadata-only HDR commits, TEST_ONLY, rejection of
 malformed/unsupported state, nonblocking transitions, old ABI access and token
 revocation. No compositor or hardware encoder is required for this test.
 
-Reference: [Linux DRM/KMS connector properties and atomic state](https://docs.kernel.org/gpu/drm-kms.html)
-and [DRM userspace HDR metadata definitions](https://docs.kernel.org/gpu/drm-uapi.html).
+References: [Linux DRM/KMS connector properties and atomic state](https://docs.kernel.org/gpu/drm-kms.html),
+[the public HDR metadata definitions in `drm_mode.h`](https://github.com/torvalds/linux/blob/master/include/uapi/drm/drm_mode.h),
+and [DMA-BUF synchronization](https://docs.kernel.org/driver-api/dma-buf.html).
+See [references.md](references.md) for consumer APIs and hardware capability references.
