@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
+
+  draft:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release identity
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: bash scripts/check-release-version.sh "$RELEASE_TAG"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hermes-kms-release-assets
+          path: release-assets
+
+      - name: Verify release assets
+        run: |
+          cd release-assets
+          test "$(cat SOURCE_COMMIT)" = "$GITHUB_SHA"
+          sha256sum --check SHA256SUMS
+
+      - name: Create reviewable draft and upload assets
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const tag = context.ref.replace('refs/tags/', '');
+            const body = fs.readFileSync(`docs/releases/${tag}.md`, 'utf8');
+            // Never modify an existing draft or published release on a rerun.
+            // A partial draft can be inspected/deleted before retrying.
+            const { data: release } = await github.rest.repos.createRelease({
+              ...context.repo, tag_name: tag, target_commitish: context.sha,
+              name: `Hermes-KMS ${tag}`, body, draft: true, prerelease: false
+            });
+            for (const name of fs.readdirSync('release-assets').sort()) {
+              await github.rest.repos.uploadReleaseAsset({
+                ...context.repo, release_id: release.id, name,
+                data: fs.readFileSync(`release-assets/${name}`)
+              });
+            }
+            core.notice(`Draft ready for review: ${release.html_url}`);
