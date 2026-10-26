@@ -134,6 +134,7 @@ jobs:
       - name: Prepare exact-commit package sources
         shell: bash
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           version=$(bash scripts/check-release-version.sh)
           build_dir=$(mktemp -d /tmp/hermes-kms-packages.XXXXXX)
           printf 'PACKAGE_BUILD_DIR=%s\n' "$build_dir" >> "$GITHUB_ENV"
@@ -143,6 +144,8 @@ jobs:
           # Seed makepkg's VCS cache with the checkout, including PR merge
           # commits that are not reachable from the public default branch.
           git clone --mirror . "$build_dir/Hermes-KMS"
+          git -C "$build_dir/Hermes-KMS" remote set-url origin \
+            https://github.com/MrOz59/Hermes-KMS.git
           git -C "$build_dir/Hermes-KMS" cat-file -e "$GITHUB_SHA^{commit}"
           mkdir -p release-assets
           git archive --format=tar --prefix=Hermes-KMS/ HEAD |
