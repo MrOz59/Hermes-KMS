@@ -1,0 +1,45 @@
+name: Publish October RC1
+
+on:
+  push:
+    branches: ['release/october-2026-rc1']
+    paths: ['.github/rc/**', '.github/workflows/publish-rc.yml']
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-october-2026-rc1
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify successful CI and immutable artifact provenance
+        id: verify
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await require('./.github/rc/verify-rc.js')({ github, context, core });
+
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.verify.outputs.run_id }}
+          path: incoming
+
+      - name: Verify original checksums and stage RC assets
+        run: python3 .github/rc/stage-rc.py
+
+      - name: Publish the complete candidate as a prerelease
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await require('./.github/rc/publish-rc.js')({ github, context, core });

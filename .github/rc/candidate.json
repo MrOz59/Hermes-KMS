@@ -1,0 +1,23 @@
+{
+  "component": "Hermes-KMS",
+  "repository": "MrOz59/Hermes-KMS",
+  "tag": "october-2026-rc1",
+  "source_sha": "8c8aa0812783437c91e6d65ff8073fdbe57068b2",
+  "build_run": 40264831106,
+  "check_runs": [],
+  "build_version": "0.4.1",
+  "artifacts": [
+    {
+      "id": 12626066414,
+      "name": "hermes-kms-release-assets",
+      "digest": "sha256:91b1e6834ef48631793ca19785655b3d71027b6ed1bd334fe3f7993417dd3306"
+    }
+  ],
+  "groups": {
+    "*.pkg.tar.zst": 2,
+    "*-source.tar.gz": 1,
+    "PKGBUILD": 1,
+    "*.install": 2,
+    "SOURCE_COMMIT": 1
+  }
+}
