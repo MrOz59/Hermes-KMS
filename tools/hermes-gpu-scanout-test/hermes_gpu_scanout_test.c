@@ -25,6 +25,7 @@
 #include <GL/glext.h>
 #include "../hermes_session.h"
 #include "modifiers.h"
+#include "../hermes_nvidia_version.h"
 #include "pattern.h"
 
 #ifndef DRM_PLANE_TYPE_PRIMARY
@@ -617,10 +618,12 @@ int main(int argc, char **argv)
 	if (list) {
 		if (!gpu_path || optind != argc || session_path || hold || source != MODIFIERS_EGL)
 			goto invalid;
+		hermes_nvidia_print_version(stdout);
 		return list_modifiers(card_path, gpu_path, allow_other);
 	}
 	if (!card_path || !gpu_path || optind != argc || (session_path && !hold) ||
 	    (size_t)w > SIZE_MAX / 4 / h) goto invalid;
+	hermes_nvidia_print_version(stdout);
 	struct gpu g = {.display = EGL_NO_DISPLAY, .context = EGL_NO_CONTEXT,
 		.image = {EGL_NO_IMAGE_KHR, EGL_NO_IMAGE_KHR}, .fd = {-1, -1, -1, -1}};
 	struct drm_hermes_kms_acquire_frame frame = {.dma_buf_fd = {-1, -1, -1, -1}, .sync_file_fd = -1};

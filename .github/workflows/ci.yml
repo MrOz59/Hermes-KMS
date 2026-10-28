@@ -26,9 +26,9 @@ jobs:
             build-essential git pkg-config libdrm-dev libegl-dev libgbm-dev libgl-dev
       - uses: actions/checkout@v4
       - name: Test whole-frame comparison without a GPU
-        run: make check-frame-verify check-gpu-pattern check-gpu-modifiers
-      - name: Check GPU pattern and modifiers with address and undefined-behavior sanitizers
-        run: make check-gpu-pattern check-gpu-modifiers CFLAGS='-O1 -g -Wall -Wextra -fsanitize=address,undefined'
+        run: make check-frame-verify check-gpu-pattern check-gpu-modifiers check-nvidia-version
+      - name: Check GPU pattern, modifiers and driver-version parsing with address and undefined-behavior sanitizers
+        run: make check-gpu-pattern check-gpu-modifiers check-nvidia-version CFLAGS='-O1 -g -Wall -Wextra -fsanitize=address,undefined'
       - name: Compile GPU-origin producer and exercise argument handling
         run: |
           make tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test

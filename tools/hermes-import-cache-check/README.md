@@ -62,6 +62,12 @@ as a control on AMD/Intel); software rasterizers are always rejected. The
 default 2560x1440 frame is larger than the 2 MiB boundary of the known NVIDIA
 system-memory corruption; `--width`/`--height` change it.
 
+Every report starts with the loaded NVIDIA kernel module's version and flavour.
+The retention this check watches for was reported on 595.71 through 610.43,
+all older than the 2026-09-30 security releases (580.178.04, 595.91.07,
+610.57.04, 615.71.09), so a result is only comparable with one from the same
+driver.
+
 | Exit | Meaning |
 | --- | --- |
 | 0 | every cached re-sample showed the latest completed render |

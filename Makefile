@@ -70,7 +70,17 @@ all: modules
 # Opt in to developer diagnostics that need libdrm, VAAPI, GBM, EGL and GL.
 full: modules tools
 
-check: check-release-version check-uapi check-session check-edid check-edid-conformity check-frame-verify check-gpu-pattern check-gpu-modifiers
+check: check-release-version check-uapi check-session check-edid check-edid-conformity check-frame-verify check-gpu-pattern check-gpu-modifiers check-nvidia-version
+
+.PHONY: check-nvidia-version
+check-nvidia-version:
+	@set -eu; \
+		test_tmp="$$(mktemp -d "$${TMPDIR:-/tmp}/hermes-kms-nvidia-version.XXXXXX")"; \
+		trap '$(RM) -r -- "$$test_tmp"' EXIT; \
+		trap 'exit 1' HUP INT TERM; \
+		$(CC) $(CFLAGS) -std=c11 -Werror -pedantic \
+			tests/nvidia-version.c -o "$$test_tmp/nvidia-version"; \
+		"$$test_tmp/nvidia-version"
 
 .PHONY: check-gpu-modifiers
 check-gpu-modifiers:
@@ -341,7 +351,7 @@ tools/hermes-kms-import-check/hermes-kms-import-check: tools/hermes-kms-import-c
 	@test -n "$(IMPORT_CHECK_LIBS)" || { printf 'missing libva/libva-drm/libdrm pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(IMPORT_CHECK_CFLAGS) -o $@ $< $(IMPORT_CHECK_LIBS)
 
-tools/hermes-egl-import-check/hermes-egl-import-check: tools/hermes-egl-import-check/hermes_egl_import_check.c tools/hermes-egl-import-check/frame_verify.h tools/hermes-gpu-scanout-test/pattern.h tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h
+tools/hermes-egl-import-check/hermes-egl-import-check: tools/hermes-egl-import-check/hermes_egl_import_check.c tools/hermes-egl-import-check/frame_verify.h tools/hermes-gpu-scanout-test/pattern.h tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h tools/hermes_nvidia_version.h
 	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(EGL_CHECK_CFLAGS) $(EGL_CHECK_CUDA_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS) $(EGL_CHECK_CUDA_LIBS)
 
@@ -349,11 +359,11 @@ tools/hermes-imported-scanout-test/hermes-imported-scanout-test: tools/hermes-im
 	@test -n "$(CURSOR_PROBE_LIBS)" || { printf 'missing libdrm pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(CURSOR_PROBE_CFLAGS) -o $@ $< $(CURSOR_PROBE_LIBS)
 
-tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test: tools/hermes-gpu-scanout-test/hermes_gpu_scanout_test.c tools/hermes-gpu-scanout-test/modifiers.h tools/hermes-gpu-scanout-test/pattern.h tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h
+tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test: tools/hermes-gpu-scanout-test/hermes_gpu_scanout_test.c tools/hermes-gpu-scanout-test/modifiers.h tools/hermes-gpu-scanout-test/pattern.h tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h tools/hermes_nvidia_version.h
 	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) -std=c11 -Werror $(UAPI_CFLAGS) $(EGL_CHECK_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS)
 
-tools/hermes-import-cache-check/hermes-import-cache-check: tools/hermes-import-cache-check/hermes_import_cache_check.c tools/hermes-gpu-scanout-test/modifiers.h tools/hermes-gpu-scanout-test/pattern.h
+tools/hermes-import-cache-check/hermes-import-cache-check: tools/hermes-import-cache-check/hermes_import_cache_check.c tools/hermes-gpu-scanout-test/modifiers.h tools/hermes-gpu-scanout-test/pattern.h tools/hermes_nvidia_version.h
 	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) -std=c11 -Werror $(EGL_CHECK_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS)
 

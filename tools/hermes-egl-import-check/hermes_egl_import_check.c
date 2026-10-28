@@ -39,6 +39,7 @@
 #include <drm/hermes_kms_drm.h>
 
 #include "../hermes_session.h"
+#include "../hermes_nvidia_version.h"
 #include "frame_verify.h"
 #include "../hermes-gpu-scanout-test/pattern.h"
 
@@ -696,6 +697,8 @@ int main(int argc, char **argv)
 			return 1;
 		}
 	}
+
+	hermes_nvidia_print_version(stdout);
 
 	// --- 1. Acquire a frame from Hermes-KMS ---------------------------------
 	if (!session_file) {

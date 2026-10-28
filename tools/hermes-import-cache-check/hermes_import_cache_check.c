@@ -46,6 +46,7 @@
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include "../hermes-gpu-scanout-test/modifiers.h"
+#include "../hermes_nvidia_version.h"
 #include "../hermes-gpu-scanout-test/pattern.h"
 
 #define FORMAT DRM_FORMAT_ARGB8888
@@ -633,6 +634,7 @@ int main(int argc, char **argv)
 	if (!o.gpu_path || optind != argc)
 		goto invalid;
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	hermes_nvidia_print_version(stdout);
 
 	int sv[2];
 	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) {

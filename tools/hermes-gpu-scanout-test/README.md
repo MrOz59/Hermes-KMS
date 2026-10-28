@@ -31,8 +31,9 @@ validate concurrent compositor/consumer scheduling or benchmark latency.
 
 Needs libdrm, GBM (with `gbm_bo_create_with_modifiers2`), desktop GL 3.3 and EGL
 with GBM, surfaceless/no-config contexts and DMA-BUF modifier import. NVIDIA's
-GBM backend and DRM KMS must be available. The tool reports DRM driver, GL
-vendor/renderer and allocated layout. It rejects non-NVIDIA drivers by default;
+GBM backend and DRM KMS must be available. The tool reports the loaded NVIDIA
+kernel module's version and flavour (`nvidia driver: 610.57.04 (open kernel
+module)`), DRM driver, GL vendor/renderer and allocated layout. It rejects non-NVIDIA drivers by default;
 `--allow-other-gpu` permits a hardware control test, rejecting known Mesa
 software rasterizers.
 

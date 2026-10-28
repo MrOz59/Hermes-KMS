@@ -19,7 +19,8 @@ ACQUIRE_FRAME (DMA-BUF) -> wait on the exported sync file
   -> whole-frame GL/CUDA comparison of that frozen texture
 ```
 
-On a UAPI 15 driver the frame line is followed by its origin: `imported
+The report starts with the loaded NVIDIA kernel module's version and flavour,
+and the frame line is followed by its origin on a UAPI 15 driver: `imported
 from <exporter>` for a compositor's GPU buffer, `Hermes-KMS dumb buffer` for the
 driver's own system-memory buffer. That tells a linear GPU-origin scanout from
 a dumb buffer, which the modifier alone cannot.

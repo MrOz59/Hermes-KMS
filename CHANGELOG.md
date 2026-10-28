@@ -38,6 +38,9 @@ UAPI **15** on the `experimental/nvidia-zero-copy` branch.
   told from a system-memory dumb buffer. `hermes-kmsctl`, debugfs and the
   first-scanout log show it, and `hermes-gpu-scanout-test` requires it on a
   driver that advertises the capability.
+- `hermes-egl-import-check`, `hermes-gpu-scanout-test` and
+  `hermes-import-cache-check` print the loaded NVIDIA kernel module's version
+  and flavour (open or proprietary) with every report.
 
 ### Fixed
 
