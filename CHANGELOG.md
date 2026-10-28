@@ -27,6 +27,12 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- The 32-bit compat `GET_STATUS` path copied its 48-byte reserved tail from a
+  40-byte field, reading eight bytes past the native structure on the kernel
+  stack. It now copies the words an LP64 client of the same UAPI sees.
+
 ## [0.4.1] - Unreleased
 
 UAPI remains **14**, unchanged from 0.4.0. This is a maintenance release.

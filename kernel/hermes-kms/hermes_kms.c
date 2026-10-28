@@ -3860,6 +3860,13 @@ static_assert(offsetof(struct drm_hermes_kms_status_v10_compat,
 static_assert(sizeof(struct drm_hermes_kms_acquire_frame_v10_compat) == 172);
 static_assert(offsetof(struct drm_hermes_kms_acquire_frame_v10_compat,
 		       reserved) == 124);
+/*
+ * The v10 status tail maps onto what now follows bound_fd_count in the native
+ * structure, word for word, as it does for an unmodified LP64 v10 client.
+ */
+static_assert(sizeof_field(struct drm_hermes_kms_status_v10_compat, reserved) ==
+	      sizeof(struct drm_hermes_kms_status) -
+	      offsetof(struct drm_hermes_kms_status, bound_fd_count));
 
 #define DRM_IOCTL_HERMES_KMS_GET_STATUS_V10_COMPAT \
 	DRM_IOR(DRM_COMMAND_BASE + DRM_HERMES_KMS_GET_STATUS, \
@@ -3886,7 +3893,18 @@ static long hermes_kms_compat_get_status(struct file *filp, unsigned long arg)
 	status32.session_id = status.session_id;
 	status32.owner_pid = status.owner_pid;
 	status32.reserved0 = status.reserved0;
-	memcpy(status32.reserved, status.reserved, sizeof(status32.reserved));
+	/*
+	 * The v10 tail was six reserved words. In the native structure the same
+	 * 48 bytes now start at bound_fd_count, which UAPI 13 took from the first
+	 * of them. Copy from there: compat clients see exactly what an unmodified
+	 * LP64 v10 client reads, and the copy never runs past the native
+	 * structure (copying 48 bytes from reserved did, by eight bytes of kernel
+	 * stack).
+	 */
+	memcpy(status32.reserved,
+	       (const u8 *)&status + offsetof(struct drm_hermes_kms_status,
+					      bound_fd_count),
+	       sizeof(status32.reserved));
 
 	if (copy_to_user(compat_ptr(arg), &status32, sizeof(status32)))
 		return -EFAULT;
