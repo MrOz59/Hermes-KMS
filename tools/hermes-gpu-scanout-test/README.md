@@ -9,7 +9,11 @@ CPU pixel upload, source `mmap`, dumb buffer or udmabuf is used. It then:
 3. Acquires it through a token-bound Hermes-KMS render descriptor and waits for
    the returned sync_file.
 4. Requires the original DMA-BUF `st_dev`/`st_ino`, dimensions, format, modifier,
-   plane count, pitches and offsets to survive the round trip unchanged.
+   plane count, pitches and offsets to survive the round trip unchanged. On a
+   UAPI 15 driver it also requires both `ACQUIRE_FRAME` and `GET_STATUS` to
+   report the scanout as imported and to name the same exporter
+   (`PASS: scanout reported as imported from nvidia_drm`); older drivers print
+   `SKIP`.
 5. Imports the returned descriptors on the originating GPU, blits to an own
    RGBA8 target, and checks every pixel against the shader's expected pattern.
    The source is checked independently before scanout, separating producer

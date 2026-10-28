@@ -27,6 +27,18 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+UAPI **15** on the `experimental/nvidia-zero-copy` branch.
+
+### Added
+
+- `HERMES_KMS_CAP_FRAME_ORIGIN`: `GET_STATUS` and `ACQUIRE_FRAME` report
+  whether the scanout is a PRIME-imported buffer and which module exported it
+  (`STATUS_FRAMEBUFFER_IMPORTED`, `FRAME_IMPORTED`, `framebuffer_exporter`,
+  `exporter`), taken from reserved words. A linear GPU-origin scanout can now be
+  told from a system-memory dumb buffer. `hermes-kmsctl`, debugfs and the
+  first-scanout log show it, and `hermes-gpu-scanout-test` requires it on a
+  driver that advertises the capability.
+
 ### Fixed
 
 - The 32-bit compat `GET_STATUS` path copied its 48-byte reserved tail from a

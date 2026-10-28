@@ -761,6 +761,27 @@ int main(int argc, char **argv)
 	       frame.format & 0xff, (frame.format >> 8) & 0xff,
 	       (frame.format >> 16) & 0xff, (frame.format >> 24) & 0xff,
 	       (unsigned long long) frame.modifier, frame.plane_count, frame.pitch[0]);
+	/*
+	 * A linear modifier alone cannot tell a compositor's GPU buffer from one
+	 * of the driver's system-memory dumb buffers; UAPI 15 says which it is.
+	 */
+	{
+		struct drm_hermes_kms_caps origin_caps = {0};
+		const bool origin_known =
+			ioctl(hermes_fd, DRM_IOCTL_HERMES_KMS_GET_CAPS, &origin_caps) == 0 &&
+			(origin_caps.flags & HERMES_KMS_CAP_FRAME_ORIGIN);
+
+		if (!origin_known)
+			printf("origin: unknown (driver predates UAPI 15)\n");
+		else if (!(frame.flags & HERMES_KMS_FRAME_IMPORTED))
+			printf("origin: Hermes-KMS dumb buffer (system memory)\n");
+		else if (!frame.exporter[0])
+			printf("origin: imported from an unnamed exporter\n");
+		else
+			printf("origin: imported from %.*s (allocated by that driver)\n",
+			       (int)strnlen(frame.exporter, sizeof(frame.exporter)),
+			       frame.exporter);
+	}
 
 	/*
 	 * How much memory actually backs plane 0, against the minimum the

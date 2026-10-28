@@ -704,6 +704,23 @@ int main(int argc, char **argv)
 		}
 	}
 	printf("PASS: original DMA-BUF identity and layout preserved on all %u planes\n", g.planes);
+	if (caps.flags & HERMES_KMS_CAP_FRAME_ORIGIN) {
+		// A PRIME-imported scanout must be reported as such, by both the frame
+		// and the status, so consumers can route it without guessing from the
+		// modifier.
+		struct drm_hermes_kms_status origin = {0};
+		if (!(frame.flags & HERMES_KMS_FRAME_IMPORTED) || !frame.exporter[0] ||
+		    ioctl(card, DRM_IOCTL_HERMES_KMS_GET_STATUS, &origin) ||
+		    !(origin.flags & HERMES_KMS_STATUS_FRAMEBUFFER_IMPORTED) ||
+		    strncmp(origin.framebuffer_exporter, frame.exporter, sizeof(frame.exporter))) {
+			fprintf(stderr, "FAIL: driver does not report the PRIME-imported scanout as imported\n");
+			goto out;
+		}
+		printf("PASS: scanout reported as imported from %.*s\n",
+		       (int)strnlen(frame.exporter, sizeof(frame.exporter)), frame.exporter);
+	} else {
+		printf("SKIP: scanout origin (driver predates UAPI 15)\n");
+	}
 	if (import_image(&g, 1, w, h, frame.dma_buf_fd) || verify_pixels(&g, 1, w, h)) goto out;
 	if (session_path) {
 		if (hermes_session_write_file(session_path, &credentials)) goto out;

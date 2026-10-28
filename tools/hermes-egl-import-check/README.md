@@ -19,6 +19,11 @@ ACQUIRE_FRAME (DMA-BUF) -> wait on the exported sync file
   -> whole-frame GL/CUDA comparison of that frozen texture
 ```
 
+On a UAPI 15 driver the frame line is followed by its origin: `imported
+from <exporter>` for a compositor's GPU buffer, `Hermes-KMS dumb buffer` for the
+driver's own system-memory buffer. That tells a linear GPU-origin scanout from
+a dumb buffer, which the modifier alone cannot.
+
 The tool follows the driver's synchronization contract: a successful
 ACQUIRE_FRAME only means the frame was exported, so the checker waits on the
 returned sync file (the framebuffer's write fence) before reading anything,
