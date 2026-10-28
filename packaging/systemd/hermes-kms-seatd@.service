@@ -13,6 +13,13 @@ PrivateMounts=yes
 RuntimeDirectory=hermes-kms-seatd/%i
 RuntimeDirectoryMode=0711
 ExecStart=/usr/lib/hermes-kms/hermes-kms-seatd-instance %i auto root
+# A private seat has no virtual terminal. Left VT-bound - seatd's default -
+# this daemon adopts whichever VT is active on seat0 and, as sessions open and
+# close, takes over its switching mode and flips its keyboard and its
+# graphics/text mode. That VT is the host's: a desktop started with startx on
+# tty1 had tty1 switched to text mode under it by an isolated session
+# (reported in Hermes#57). With the binding off seatd never opens a terminal.
+Environment=SEATD_VTBOUND=0
 Restart=on-failure
 RestartSec=1s
 UMask=0077
@@ -49,7 +56,9 @@ SystemCallErrorNumber=EPERM
 # (their own mount namespace link and PID 1's); nothing here needs the kernel
 # information files.
 ProcSubset=pid
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SYS_ADMIN CAP_SYS_TTY_CONFIG
+# CAP_SYS_TTY_CONFIG was only ever for the VT ioctls, which SEATD_VTBOUND=0
+# above rules out.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SYS_ADMIN
 # The launcher creates/owns the common runtime root before binding the
 # instance directory over its private /run.
 ReadWritePaths=/run/hermes-kms-seatd

@@ -13,21 +13,43 @@ The canonical version lives in the driver source as three defines in
 ```c
 #define HERMES_KMS_DRIVER_MAJOR 0
 #define HERMES_KMS_DRIVER_MINOR 4
-#define HERMES_KMS_DRIVER_PATCH 0
+#define HERMES_KMS_DRIVER_PATCH 1
 ```
 
-The DKMS config, the PKGBUILD, and the `GET_VERSION` ioctl all read from these,
-so the module, the package, and the UAPI report the same version. A release is
-cut by bumping those defines, updating this file, and pushing an annotated git
-tag `vMAJOR.MINOR.PATCH`.
+The `GET_VERSION` ioctl and generated DKMS/package versions read these defines.
+The checked-in DKMS and PKGBUILD defaults must be updated with them;
+`scripts/check-release-version.sh` verifies that all three agree. A release is
+cut after validation by pushing an annotated git tag `vMAJOR.MINOR.PATCH`;
+the release workflow prepares a draft with packages pinned to that commit.
 
 While the major version is `0`, the UAPI and on-disk/ioctl interfaces are still
 subject to change between minor releases.
 
 ## [Unreleased]
 
+## [0.4.1] - Unreleased
+
+UAPI remains **14**, unchanged from 0.4.0. This is a maintenance release.
+
+### Packaging
+
+- Build both Arch/CachyOS split packages in CI, pin release builds to the exact
+  source commit, validate the packaged DKMS source and ship source/recipe
+  artifacts with SHA-256 checksums. A tag produces a draft release only after
+  all CI jobs pass.
+
+### Documentation
+
+- Refresh README, architecture, HDR and roadmap for UAPI v14, current read-only
+  capture access, VT-free private brokers, generic configfs display profiles,
+  the current EDID conformity baseline and NVIDIA import limitations. Add a
+  complete configfs attribute reference and links to the upstream APIs.
+
 ### Fixed
 
+- Build with the target kernel's `hrtimer_setup()` when `hrtimer_init()` is
+  unavailable, including Linux 6.17/6.18 without the DRM-owned vblank timer.
+  Older kernels retain the original initialization path (#12, @SOVLOOKUP).
 - Render-node access is read-only for both active-seat and explicitly assigned
   users. Hermes-KMS private ioctls, DMA-BUF export and sync-file export work on
   an `O_RDONLY` fd, whereas Chromium/Electron discover candidate render GPUs by
@@ -36,6 +58,13 @@ subject to change between minor releases.
   the `EACCES` failure from #6. The host node remains `root:root`, logind still
   selects the active seat user, and the ACL helper now grants assigned private
   cards `r--` rather than `rw-`.
+- The private seat brokers (`hermes-kms-seatd@.service`) no longer bind to a
+  virtual terminal. seatd is VT-bound by default, so each broker adopted the
+  VT active on seat0 - the host's - and changed its switching, keyboard and
+  graphics/text mode as isolated sessions opened and closed; a desktop started
+  with `startx` on tty1 was switched to text mode under it (Hermes#57). The
+  unit now sets `SEATD_VTBOUND=0` and drops `CAP_SYS_TTY_CONFIG`, which only
+  those VT ioctls needed.
 
 ## [0.4.0] - 2026-09-22
 

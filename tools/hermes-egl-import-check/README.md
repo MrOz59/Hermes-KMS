@@ -1,7 +1,10 @@
 # hermes-egl-import-check / pitch_detect
 
-Diagnostic consumers for the NVENC/EGL side of the roadmap item
-"NVENC/AMF DMA-BUF import validation".
+Diagnostic consumers for direct NVIDIA/EGL DMA-BUF import validation.
+These tools describe `main`; successful kernel export or EGL image creation
+alone is not proof of correct full-frame sampling, NVENC encoding or zero-copy.
+Current Hermes uses a CPU-copy fallback for NVIDIA capture. See the
+[roadmap](../../docs/roadmap.md) and [upstream references](../../docs/references.md).
 
 ## hermes_egl_import_check.c
 
@@ -69,8 +72,33 @@ cc -O2 -Wall -DHAVE_CUDA -I ../../include/uapi -I/usr/include/libdrm \
   -ldrm -lgbm -lEGL -lGL -lcuda
 ```
 
-Options: `--device /dev/dri/cardN` (Hermes node), `--gpu /dev/dri/renderDN`
-(import GPU), `--wait-ms MS`, `--no-cuda`, `--no-cpu-ref`, `--expect-gpu-pattern`, and
+Options: `--session-file PATH` (required by the protected capture path),
+`--device /dev/dri/renderDN` (Hermes capture node), `--output N` (1-based),
+`--gpu /dev/dri/renderDN` (real import GPU), `--wait-ms MS`, `--no-cuda`, and
+`--no-cpu-ref`, `--expect-gpu-pattern`, and `--full-teardown`. The capture node is opened `O_RDONLY`; the real GPU is a different
+node with its normal rendering permissions. Identify nodes with `hermes-kmsctl`
+and do not infer roles from a fixed render-node number.
+
+In one terminal, keep an output owner alive:
+
+```bash
+session_file="${XDG_RUNTIME_DIR:?}/hermes-kms-import-session"
+tools/hermes-kmsctl/hermes-kmsctl --session-file "$session_file" hold 2560x1440@60
+```
+
+Once a compositor is scanning out, run from another terminal:
+
+```bash
+session_file="${XDG_RUNTIME_DIR:?}/hermes-kms-import-session"
+tools/hermes-egl-import-check/hermes-egl-import-check --session-file "$session_file"
+tools/hermes-egl-import-check/pitch-detect --session-file "$session_file"
+```
+
+Use explicit `--device`/`--gpu` selections when several cards exist. These
+checkers use legacy `ACQUIRE_FRAME` and do not validate UAPI v14 colour/HDR
+interpretation; use the [HDR tests](../../docs/hdr-capture.md#reproducible-checks)
+for that contract.
+
 `--full-teardown`. Secure capture requires `--session-file PATH`.
 
 `--full-teardown` disables the recorded CUDA/GL teardown workaround to exercise
@@ -96,7 +124,7 @@ flip, R/B swap, brute-forced pitch scan, drift-filtered rows). Waits on the
 exported sync file and brackets both CPU snapshots with
 `DMA_BUF_IOCTL_SYNC` so the reference cannot be an in-flight frame.
 
-Options: `--session-file PATH` (required), `--device /dev/dri/cardN`,
+Options: `--session-file PATH` (required), `--device /dev/dri/renderDN`,
 `--gpu /dev/dri/renderDN`. The session file is the mode-0600 credential
 published by the output owner (for example, via `hermes-kmsctl --session-file
 PATH hold ...`). It authorizes this separate capture file descriptor without
@@ -104,13 +132,15 @@ coupling the tool or driver to any particular application.
 
 ## Known finding (2026-08, NVIDIA 595.84, RTX 5060 Ti)
 
-The NVIDIA proprietary driver imports these system-memory DMA-BUFs via
+On that tested configuration, the NVIDIA proprietary driver imported system-memory DMA-BUFs via
 `EGL_EXT_image_dma_buf_import` (with the TexStorageEXT bind), but the
 sampled content is only correct for roughly the first contiguous ~2 MB of
 the buffer; beyond that the GPU reads the wrong pages while the CPU view
 (`mmap`) of the very same DMA-BUF is pixel-perfect. Visible as diagonal
-stripe corruption at larger modes. The Hermes NVIDIA fork therefore uses a
-CPU-copy capture path for NVENC sessions until this is resolved.
+stripe corruption at larger modes. Current Hermes therefore retains a CPU-copy capture path for NVENC sessions.
+This is a historical reproduction, not a claim that every NVIDIA GPU/driver
+has the same defect; retest and record the exact kernel, driver, GPU, format,
+modifier and full-frame result before changing the fallback.
 
 ### Narrowing it down
 
@@ -145,7 +175,7 @@ NVIDIA machine; run them at a mode that shows the corruption, such as
 
 2. With Hermes-KMS itself: load the driver with `huge_gem=1` and repeat
    `hermes-egl-import-check` and `pitch-detect` against a live output at the
-   same mode. `huge_gem` backs buffers with 2 MiB folios where memory allows,
+   same mode. `huge_gem` backs locally allocated dumb buffers with 2 MiB folios where memory allows,
    on kernels that have `drm_gem_huge_mnt_create()`; dmesg says whether it
    took effect. In a VM a 1440p buffer got seven 2 MiB folios (all but its
    last partial block) and a 4K buffer fifteen, and the export-stress and HDR
@@ -159,3 +189,12 @@ last). Without the CUDA stage the identical teardown runs clean. The
 checker therefore skips the GPU object teardown after CUDA interop and
 leaves the release to process cleanup via `_exit`, keeping its exit code
 deterministic.
+
+## Separate experimental branch
+
+[`experimental/nvidia-zero-copy`](https://github.com/MrOz59/Hermes-KMS/tree/experimental/nvidia-zero-copy)
+contains additional GPU-origin scanout, modifier, full-frame CUDA-content and
+cross-process import-cache coherence probes. Their flags and availability must
+be checked on that branch; they are not tools shipped by `main`. A synthetic
+producer passing does not establish that KWin chooses the same allocation or
+that a complete streaming/teardown path is safe to replace.

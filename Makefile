@@ -70,7 +70,7 @@ all: modules
 # Opt in to developer diagnostics that need libdrm, VAAPI, GBM, EGL and GL.
 full: modules tools
 
-check: check-uapi check-session check-edid check-edid-conformity check-frame-verify check-gpu-pattern check-gpu-modifiers
+check: check-release-version check-uapi check-session check-edid check-edid-conformity check-frame-verify check-gpu-pattern check-gpu-modifiers
 
 .PHONY: check-gpu-modifiers
 check-gpu-modifiers:
@@ -101,6 +101,10 @@ check-frame-verify:
 		$(CC) $(CFLAGS) -std=c11 -Werror -pedantic \
 			tests/frame-verify.c -o "$$test_tmp/frame-verify"; \
 		"$$test_tmp/frame-verify"
+
+.PHONY: check-release-version
+check-release-version:
+	@bash scripts/check-release-version.sh
 
 # Pin public structure layouts and ioctl encodings on the native userspace ABI.
 # When a compiler with 32-bit headers is present, compile the compat ABI too.

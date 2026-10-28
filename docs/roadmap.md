@@ -1,6 +1,11 @@
 # Hermes-KMS roadmap
 
-## Done
+This roadmap describes the 0.4.1 release candidate (UAPI v14), reviewed on
+2026-10-26. The latest published release is 0.4.0.
+Implemented driver features, VM coverage and end-to-end product validation are
+separate milestones. See [the changelog](../CHANGELOG.md) for release history.
+
+## Implemented
 
 - Out-of-tree DRM/KMS module with a virtual `HERMES-1` connector and synthetic
   EDID.
@@ -49,9 +54,9 @@
   upstream. Cards no longer have to be drawn from a pool fixed at module load,
   and a project that only wants a virtual display can create one without
   writing any ioctl code.
-- Per-card render-node ownership. A configfs-created card names the uid that
-  owns it with `access_uid`, so several mutually untrusted consumers each hold
-  their own card instead of sharing the one uid the packaged pool grants every
+- Per-card render-node access. A configfs-created card names the uid that
+  receives a read-only ACL with `access_uid`, so separate consumers can each
+  hold their own card instead of sharing the one uid the packaged pool grants every
   Hermes render node.
 - UAPI v13 session-capability lifecycle. `SESSION_ACCESS(ROTATE_TOKEN)` retires
   a token without interrupting the consumers already bound, and
@@ -64,38 +69,63 @@
   extension carrying HDR Static Metadata (PQ) and BT2020 Colorimetry data
   blocks, plus the `HDR_OUTPUT_METADATA` and `Colorspace` connector properties,
   gated as one unit so the output never advertises a subset. This is what makes
-  a compositor recognize the output as HDR-capable; it is not end-to-end HDR
-  (see Next).
+  a compositor recognize the output as HDR-capable; activation is still the
+  compositor's decision.
 - Synthetic EDID pinned against a real parser, not only against its own test.
   `make check-edid-conformity` runs `edid-decode --check` over the generated
-  bytes in all four configurations and compares the findings to a recorded
-  baseline, so a new conformity failure surfaces as a diff instead of in
-  someone else's parser.
+  bytes in eight configurations and compares the findings to a recorded
+  baseline when parser versions match. Every version must report conformity
+  PASS with no failures; decoded HDR blocks/checksums are also always checked.
+- UAPI v14 frame-associated colour and static HDR10 metadata through
+  `ACQUIRE_FRAME2`, including colour-only sequence updates and unchanged legacy
+  ioctl layouts. Driver/VM tests cover atomic metadata delivery, authorization,
+  malformed state and nonblocking transitions. Full GPU/client HDR validation
+  remains an integration task; see [hdr-capture.md](hdr-capture.md).
+- Generic runtime display profiles: per-card modes, physical size, HDR,
+  modifiers, custom EDID identity/output prefix and stable serial selection.
+  `devices=0` supports runtime-only use. See [configfs.md](configfs.md).
+- Read-only capture ACLs so Chromium/Electron do not select the capture-only
+  render node as a renderer, while active-seat/private users retain capture.
+- VT-free private seat brokers (`SEATD_VTBOUND=0`), preserving the host VT.
+- Header-based compatibility selection for DRM atomic/vblank/shmem/platform
+  helper differences; CI builds Arch rolling, Ubuntu LTS and Fedora kernels.
 
-## Next
+## Next: integration and hardware validation
 
-- Colour metadata in the capture UAPI, which is what HDR is still missing.
-  `hdr_enable=1` gets a compositor to treat the output as HDR-capable, but a
-  frame arrives at the consumer with no colorspace, EOTF or HDR metadata
-  alongside it, so it cannot tell how to interpret those pixels. Advertisement
-  is therefore in place and end-to-end HDR is not, including with
-  `color_depth=10`, which is untested together with `hdr_enable=1`.
 - Real-host validation of the two concurrency models: KWin adoption and
   persistence for `devices=1 outputs=N`, plus two simultaneous Moonlight
   sessions for `devices=N outputs=1`. Disposable VM tests already validate
   simultaneous owners/DRM masters, two concurrent Weston compositors, distinct
   framebuffer/DMA-BUF channels, independent disconnect, and clean unload.
-- NVENC/AMF DMA-BUF import validation (VAAPI is validated).
+- Correct full-frame direct NVIDIA DMA-BUF import and AMF import validation.
+  Current Hermes NVENC uses a CPU scanout copy with hardware conversion/encoding;
+  that is separate from direct import or zero-copy. Keep that fallback until
+  pixel correctness, synchronization, reuse and teardown pass on real NVIDIA
+  hardware.
 - NV12/P010 scanout. The compositor composes in RGB and the encoder does
   RGB→NV12 on the real GPU today, so this is an optimization, not a blocker.
 - Encoder consumption of the damage rectangle for partial-frame encode.
 - Real-host compositor coverage beyond KWin. Weston (two concurrent DRM
   compositors) and GNOME/Mutter (cursor plane, imported scanout buffers) are
   covered by VM regressions; what is missing is the same on real hardware, and
-  wlroots is untested either way.
+  `scripts/vm-wlroots-test.sh` exercises labwc's DRM backend with pixman in a
+  VM. GPU rendering and Hyprland/Aquamarine need their own validation.
 - Real-host validation of separate cursor composition, including clipped cursor
   edges, hotspot placement, visibility transitions, and in-place image updates.
 - Compositor recovery handling beyond owner-fd disconnect and hotplug.
+
+## Separate experiments
+
+The [`experimental/nvidia-zero-copy`](https://github.com/MrOz59/Hermes-KMS/tree/experimental/nvidia-zero-copy)
+branch adds GPU-origin scanout/passthrough probes, full-frame EGL/CUDA content
+checks, modifier inspection and cross-process import-cache coherence experiments.
+These tools do not establish that KWin allocates the same layout or that a full
+NVENC streaming path is correct. They are not part of `main`.
+
+`main` contains the opt-in `huge_gem` allocation experiment and system-memory
+import diagnostics. Huge-page allocation depends on kernel support and available
+memory; it is not a proven NVIDIA fix. The historical import finding and
+reproduction steps are in the [EGL checker guide](../tools/hermes-egl-import-check/README.md).
 
 ## Out of scope (for now)
 
