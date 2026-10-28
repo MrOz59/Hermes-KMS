@@ -385,6 +385,13 @@ struct hermes_kms_output {
 	u32 framebuffer_pitch[4];
 	u32 framebuffer_offset[4];
 	u64 framebuffer_modifier;
+	/*
+	 * Whether the latched framebuffer's first plane was PRIME-imported from
+	 * another device, and who exported it. Latched with the rest of the frame
+	 * metadata so GET_STATUS and ACQUIRE_FRAME agree. Protected by state_lock.
+	 */
+	bool framebuffer_imported;
+	char framebuffer_exporter[HERMES_KMS_EXPORTER_NAME_LEN];
 	atomic64_t cursor_sequence;
 	u64 cursor_image_sequence;
 	u64 cursor_generation;
@@ -494,11 +501,14 @@ struct hermes_kms_file {
 /* Keep ioctl numbers/layouts identical on LP64 and newly compiled ILP32. */
 static_assert(sizeof(struct drm_hermes_kms_status) == 208);
 static_assert(offsetof(struct drm_hermes_kms_status, framebuffer_modifier) == 136);
+static_assert(offsetof(struct drm_hermes_kms_status, framebuffer_exporter) == 168);
+static_assert(offsetof(struct drm_hermes_kms_status, reserved) == 184);
 static_assert(HERMES_KMS_COLORSPACE_DEFAULT == DRM_MODE_COLORIMETRY_DEFAULT);
 static_assert(HERMES_KMS_COLORSPACE_BT2020_RGB == DRM_MODE_COLORIMETRY_BT2020_RGB);
 static_assert(sizeof(struct drm_hermes_kms_acquire_frame2) == 224);
 static_assert(sizeof(struct drm_hermes_kms_acquire_frame) == 176);
-static_assert(offsetof(struct drm_hermes_kms_acquire_frame, reserved) == 128);
+static_assert(offsetof(struct drm_hermes_kms_acquire_frame, exporter) == 128);
+static_assert(offsetof(struct drm_hermes_kms_acquire_frame, reserved) == 144);
 static_assert(sizeof(struct drm_hermes_kms_metrics) == 312);
 static_assert(sizeof(struct drm_hermes_kms_session_access) == 72);
 static_assert(sizeof(struct drm_hermes_kms_acquire_cursor) == 224);
@@ -890,6 +900,50 @@ static void hermes_kms_clear_frame_locked(struct hermes_kms_output *output)
 	memset(output->framebuffer_pitch, 0, sizeof(output->framebuffer_pitch));
 	memset(output->framebuffer_offset, 0, sizeof(output->framebuffer_offset));
 	output->framebuffer_modifier = 0;
+	output->framebuffer_imported = false;
+	memset(output->framebuffer_exporter, 0,
+	       sizeof(output->framebuffer_exporter));
+}
+
+/*
+ * Record whether @fb scans out of a buffer this device imported, and from
+ * whom. A compositor rendering on a real GPU can hand that GPU's buffer to
+ * ADDFB2 here (gem_prime_import attaches without mapping); everything else is
+ * one of our own shmem dumb buffers. Userspace cannot tell the two apart from
+ * the layout alone, since both may be linear, and they need different import
+ * paths on some GPUs.
+ *
+ * The exporter is the module that owns the DMA-BUF. drm_gem_prime_export()
+ * sets that to the exporting driver and reports "drm" as exp_name for every
+ * DRM driver, so the module is the useful name; a built-in exporter has no
+ * module and falls back to exp_name. The dma_buf holds a reference on its
+ * owner, and the framebuffer holds the GEM object that holds the attachment,
+ * so both pointers are live for the caller.
+ */
+static void hermes_kms_set_frame_origin_locked(struct hermes_kms_output *output,
+					       struct drm_framebuffer *fb)
+{
+	struct drm_gem_object *obj = drm_gem_fb_get_obj(fb, 0);
+	struct dma_buf *dmabuf;
+	const char *name = NULL;
+
+	output->framebuffer_imported = false;
+	memset(output->framebuffer_exporter, 0,
+	       sizeof(output->framebuffer_exporter));
+	if (!obj || !obj->import_attach)
+		return;
+
+	output->framebuffer_imported = true;
+	dmabuf = obj->import_attach->dmabuf;
+	if (!dmabuf)
+		return;
+	if (dmabuf->owner)
+		name = module_name(dmabuf->owner);
+	else
+		name = dmabuf->exp_name;
+	if (name)
+		strscpy(output->framebuffer_exporter, name,
+			sizeof(output->framebuffer_exporter));
 }
 
 static void hermes_kms_set_frame_metadata_locked(struct hermes_kms_output *output,
@@ -908,6 +962,7 @@ static void hermes_kms_set_frame_metadata_locked(struct hermes_kms_output *outpu
 	output->framebuffer_height = fb->height;
 	output->framebuffer_format = fb->format->format;
 	output->framebuffer_modifier = fb->modifier;
+	hermes_kms_set_frame_origin_locked(output, fb);
 
 	if (fb->format->num_planes > ARRAY_SIZE(output->framebuffer_pitch))
 		plane_count = ARRAY_SIZE(output->framebuffer_pitch);
@@ -937,6 +992,8 @@ static void hermes_kms_track_frame(struct hermes_kms_output *output,
 	bool log_frame_connected = false;
 	bool log_frame_disconnected = false;
 	bool log_color_change = false;
+	bool logged_imported = false;
+	char logged_exporter[HERMES_KMS_EXPORTER_NAME_LEN] = { 0 };
 	struct drm_hermes_kms_frame_color logged_color = { 0 };
 
 	if (fb)
@@ -997,19 +1054,24 @@ static void hermes_kms_track_frame(struct hermes_kms_output *output,
 	if (fb && !old_fb_id) {
 		output->last_logged_framebuffer_id = fb->base.id;
 		log_frame_connected = true;
+		logged_imported = output->framebuffer_imported;
+		memcpy(logged_exporter, output->framebuffer_exporter,
+		       sizeof(logged_exporter));
 	} else if (!fb && old_fb_id) {
 		output->last_logged_framebuffer_id = 0;
 		log_frame_disconnected = true;
 	} else if (fb && output->last_logged_framebuffer_id != fb->base.id) {
 		output->last_logged_framebuffer_id = fb->base.id;
 		drm_dbg_kms(drm,
-			    "%s scanout framebuffer changed: id=%u size=%ux%u format=0x%08x modifier=0x%016llx planes=%u sequence=%llu\n",
+			    "%s scanout framebuffer changed: id=%u size=%ux%u format=0x%08x modifier=0x%016llx planes=%u origin=%s%s sequence=%llu\n",
 			    output->output_name, output->framebuffer_id,
 			    output->framebuffer_width,
 			    output->framebuffer_height,
 			    output->framebuffer_format,
 				    (unsigned long long)output->framebuffer_modifier,
 				    output->framebuffer_plane_count,
+				    output->framebuffer_imported ? "imported:" : "dumb",
+				    output->framebuffer_exporter,
 				    (unsigned long long)sequence);
 	}
 	mutex_unlock(&output->state_lock);
@@ -1048,10 +1110,12 @@ static void hermes_kms_track_frame(struct hermes_kms_output *output,
 
 	if (log_frame_connected)
 		drm_info(drm,
-			 "%s first active scanout framebuffer: id=%u size=%ux%u format=0x%08x modifier=0x%016llx planes=%u sequence=%llu\n",
+			 "%s first active scanout framebuffer: id=%u size=%ux%u format=0x%08x modifier=0x%016llx planes=%u origin=%s%s sequence=%llu\n",
 			 output->output_name, fb->base.id, fb->width, fb->height,
 			 fb->format->format,
 			 (unsigned long long)fb->modifier, fb->format->num_planes,
+			 logged_imported ? "imported:" : "dumb",
+			 logged_exporter,
 			 (unsigned long long)sequence);
 	else if (log_frame_disconnected)
 		drm_info(drm, "%s cleared active scanout framebuffer\n",
@@ -2003,6 +2067,7 @@ static int hermes_kms_ioctl_get_caps(struct drm_device *drm, void *data,
 			      HERMES_KMS_CAP_SESSION_TOKEN |
 			      HERMES_KMS_CAP_SESSION_LIFECYCLE |
 			      HERMES_KMS_CAP_FRAME_COLOR |
+			      HERMES_KMS_CAP_FRAME_ORIGIN |
 			      HERMES_KMS_CAP_CURSOR_CAPTURE |
 			      HERMES_KMS_CAP_ZERO_COPY_TARGET |
 		      HERMES_KMS_CAP_SYNC_FILE;
@@ -2169,6 +2234,10 @@ static int hermes_kms_ioctl_get_status(struct drm_device *drm, void *data,
 	status->session_id = output->session_id;
 	status->owner_pid = output->owner_pid ? output->owner_pid : -1;
 	status->bound_fd_count = output->bound_count;
+	if (output->framebuffer_imported)
+		status->flags |= HERMES_KMS_STATUS_FRAMEBUFFER_IMPORTED;
+	memcpy(status->framebuffer_exporter, output->framebuffer_exporter,
+	       sizeof(status->framebuffer_exporter));
 	if (output->framebuffer_id)
 		status->flags |= HERMES_KMS_STATUS_FRAME_VALID;
 	if (output->framebuffer)
@@ -2864,6 +2933,7 @@ static int hermes_kms_acquire_frame(struct drm_device *drm, void *data,
 				HERMES_KMS_FRAME_REQUEST_SYNC_FILE))
 		return -EINVAL;
 	if (frame->reserved0 ||
+	    memchr_inv(frame->exporter, 0, sizeof(frame->exporter)) ||
 	    memchr_inv(frame->reserved, 0, sizeof(frame->reserved)))
 		return -EINVAL;
 
@@ -2922,6 +2992,10 @@ static int hermes_kms_acquire_frame(struct drm_device *drm, void *data,
 	frame->plane_count = output->framebuffer_plane_count;
 	memcpy(frame->pitch, output->framebuffer_pitch, sizeof(frame->pitch));
 	memcpy(frame->offset, output->framebuffer_offset, sizeof(frame->offset));
+	if (output->framebuffer_imported)
+		frame->flags |= HERMES_KMS_FRAME_IMPORTED;
+	memcpy(frame->exporter, output->framebuffer_exporter,
+	       sizeof(frame->exporter));
 	/*
 	 * Damage describes one transition only. A repeated acquire is an empty
 	 * change; a consecutive new sequence may use the latched clip. The first
@@ -3860,6 +3934,18 @@ static_assert(offsetof(struct drm_hermes_kms_status_v10_compat,
 static_assert(sizeof(struct drm_hermes_kms_acquire_frame_v10_compat) == 172);
 static_assert(offsetof(struct drm_hermes_kms_acquire_frame_v10_compat,
 		       reserved) == 124);
+/*
+ * The v10 reserved tails map onto what now follows bound_fd_count (status) and
+ * exporter (frame) in the native structures, word for word, as they do for an
+ * unmodified LP64 v10 client.
+ */
+static_assert(sizeof_field(struct drm_hermes_kms_status_v10_compat, reserved) ==
+	      sizeof(struct drm_hermes_kms_status) -
+	      offsetof(struct drm_hermes_kms_status, bound_fd_count));
+static_assert(sizeof_field(struct drm_hermes_kms_acquire_frame_v10_compat,
+			   reserved) ==
+	      sizeof(struct drm_hermes_kms_acquire_frame) -
+	      offsetof(struct drm_hermes_kms_acquire_frame, exporter));
 
 #define DRM_IOCTL_HERMES_KMS_GET_STATUS_V10_COMPAT \
 	DRM_IOR(DRM_COMMAND_BASE + DRM_HERMES_KMS_GET_STATUS, \
@@ -3886,7 +3972,18 @@ static long hermes_kms_compat_get_status(struct file *filp, unsigned long arg)
 	status32.session_id = status.session_id;
 	status32.owner_pid = status.owner_pid;
 	status32.reserved0 = status.reserved0;
-	memcpy(status32.reserved, status.reserved, sizeof(status32.reserved));
+	/*
+	 * The v10 tail was six reserved words. In the native structure the same
+	 * 48 bytes now start at bound_fd_count, which UAPI 13 took from the first
+	 * of them. Copy from there: compat clients see exactly what an unmodified
+	 * LP64 v10 client reads, and the copy never runs past the native
+	 * structure (copying 48 bytes from reserved did, by eight bytes of kernel
+	 * stack).
+	 */
+	memcpy(status32.reserved,
+	       (const u8 *)&status + offsetof(struct drm_hermes_kms_status,
+					      bound_fd_count),
+	       sizeof(status32.reserved));
 
 	if (copy_to_user(compat_ptr(arg), &status32, sizeof(status32)))
 		return -EFAULT;
@@ -3898,7 +3995,6 @@ static long hermes_kms_compat_acquire_frame(struct file *filp,
 {
 	struct drm_hermes_kms_acquire_frame_v10_compat frame32;
 	struct drm_hermes_kms_acquire_frame frame = { };
-	unsigned int i;
 	int ret;
 
 	if (copy_from_user(&frame32, compat_ptr(arg), sizeof(frame32)))
@@ -3906,8 +4002,13 @@ static long hermes_kms_compat_acquire_frame(struct file *filp,
 
 	frame.flags = frame32.flags;
 	frame.reserved0 = frame32.reserved0;
-	for (i = 0; i < ARRAY_SIZE(frame.reserved); i++)
-		frame.reserved[i] = frame32.reserved[i];
+	/*
+	 * The six v10 reserved words now hold exporter and reserved. Carry all
+	 * of them across so the native path rejects any non-zero input word.
+	 */
+	memcpy((u8 *)&frame + offsetof(struct drm_hermes_kms_acquire_frame,
+				       exporter),
+	       frame32.reserved, sizeof(frame32.reserved));
 
 	ret = drm_ioctl_kernel(filp, hermes_kms_ioctl_acquire_frame, &frame,
 			       DRM_RENDER_ALLOW);
@@ -4008,6 +4109,14 @@ static int hermes_kms_stats_show(struct seq_file *m, void *data)
 				   &output->frame_sequence));
 		seq_printf(m, "frame_update_count:    %llu\n",
 			   output->frame_update_count);
+		if (!output->framebuffer_id)
+			seq_puts(m, "framebuffer_origin:    none\n");
+		else if (output->framebuffer_imported)
+			seq_printf(m, "framebuffer_origin:    imported (%s)\n",
+				   output->framebuffer_exporter[0] ?
+				   output->framebuffer_exporter : "unknown");
+		else
+			seq_puts(m, "framebuffer_origin:    dumb\n");
 		seq_printf(m, "color_state_changes:   %llu\n",
 			   output->color_state_change_count);
 		seq_printf(m, "color_flags:           0x%x\n",

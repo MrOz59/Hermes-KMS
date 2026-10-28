@@ -84,7 +84,7 @@ or your own tool — can use it by talking the same UAPI, with no fork required:
    `DRM_IOCTL_VERSION` ioctl (or libdrm's `drmGetVersion()`); require the exact
    driver name `hermes-kms` before issuing any Hermes-KMS private ioctl. Private
    DRM command numbers are driver-local and are not safe device probes. Then use
-   `GET_VERSION` / `GET_CAPS`. The current interface is UAPI v14; require
+   `GET_VERSION` / `GET_CAPS`. The current interface is UAPI v15; require
    `HERMES_KMS_CAP_SESSION_TOKEN` before using the protected capture path, and
    `HERMES_KMS_CAP_SESSION_LIFECYCLE` before relying on token rotation or
    binding revocation.
@@ -656,7 +656,7 @@ name `hermes-kms`. Do not use a private ioctl as the initial probe: private DRM
 command numbers have meaning only after the core driver identity is known and
 can overlap with another driver's commands.
 
-The current interface is UAPI v14. Its ioctls are:
+The current interface is UAPI v15. Its ioctls are:
 
 - `DRM_IOCTL_HERMES_KMS_GET_VERSION`
 - `DRM_IOCTL_HERMES_KMS_GET_IDENTITY`
@@ -695,6 +695,18 @@ session token and revoke bindings without ending the session.
 whole `drm_hermes_kms_acquire_frame2` and set only `frame.flags` on input;
 `frame` and `color` describe one captured state. Check colour validity flags
 before interpreting the HDR blob. See [the HDR contract](docs/hdr-capture.md).
+`HERMES_KMS_CAP_FRAME_ORIGIN` (UAPI v15) means `GET_STATUS` and `ACQUIRE_FRAME`
+say where the scanout's storage came from. `STATUS_FRAMEBUFFER_IMPORTED` /
+`FRAME_IMPORTED` mark a buffer PRIME-imported from another device (the
+compositor rendered on a real GPU and scans out of that buffer);
+`framebuffer_exporter` / `exporter` name the module that exported it
+(`amdgpu`, `i915`, `xe`, `nvidia_drm`, ...). Clear means one of the driver's own
+system-memory dumb buffers. Both kinds may be linear, so the modifier alone
+cannot tell them apart, and some GPUs import them very differently. The name
+says who allocated the buffer, not where its memory lives. The words were
+reserved before, so the structures keep their size; the four bytes of
+`ACQUIRE_FRAME` that were implicit padding are now `reserved_alignment`, ignored
+on input.
 
 UAPI v11 advertises `HERMES_KMS_CAP_SESSION_TOKEN` and protects active output
 state, frame capture, waits and metrics with a generic session capability.
@@ -750,7 +762,8 @@ active session; it is intentionally off by default and is unsafe for normal use.
 - framebuffer width/height;
 - DRM fourcc format;
 - modifier;
-- per-plane pitch/offset.
+- per-plane pitch/offset;
+- whether the buffer is PRIME-imported, and its exporter (UAPI v15).
 
 `SET_OUTPUT` is an `IOWR` ioctl. On enable or disable it returns the applied
 mode, result flags, and the session ID owned by that fd. The controller should
