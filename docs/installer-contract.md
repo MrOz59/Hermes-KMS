@@ -1,9 +1,12 @@
 # Hermes ecosystem installer: Hermes-KMS package contract
 
-Hermes-KMS ships an independent kernel component. A future Hermes ecosystem
-installer should discover the Linux distribution, install the correct native
-package, verify the DKMS result and **only then** configure optional private
-session seats. It must not copy the kernel module or change display settings
+Hermes-KMS ships an independent kernel component. The planned ecosystem
+installer will live in the **[Hermes repository](https://github.com/MrOz59/Hermes)**,
+not in Hermes-KMS. This document is a **package and integration contract**, not
+an installer implementation or download link. The future Hermes installer
+should detect the Linux distribution, install the correct native package,
+verify the DKMS result and **only then** configure optional private session
+seats. It must not copy the kernel module or change display settings
 behind the package manager's back.
 
 ## Stable release assets (starting with v0.4.1)
@@ -113,9 +116,11 @@ the safe upgrade boundary.
 - Fedora: `packaging/rpm/hermes-kms.spec`, build with `rpmbuild` from the
   exact release commit archive.
 - Arch/CachyOS: `PKGBUILD`, with release CI pinning `#commit=<SHA>`.
-- CI validates each format independently. Pushing `v0.4.1` after all release
-  gates pass creates a **draft**, not an automatically published release.
+- CI validates each package format independently. The **published** v0.4.1
+  release contains the verified Arch, Debian/Ubuntu and Fedora packages,
+  source archive and SHA-256 checksums.
 
-The future Hermes installer may handle Hermes, Hestia, libvirtualhid and a
-Gamescope fork independently, but they must not become prerequisites of the
-kernel-only core driver package.
+The future **Hermes repository** installer may handle Hermes, Hestia,
+libvirtualhid and a Gamescope fork independently, but they must not become
+prerequisites of the kernel-only core driver package. No working ecosystem
+installer is included in the Hermes-KMS v0.4.1 assets.

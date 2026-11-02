@@ -1,0 +1,56 @@
+# Keep the text of the already-published GitHub release in sync with
+# docs/releases/v0.4.1.md. Does not retag, rebuild or modify release assets.
+name: Sync v0.4.1 release notes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/releases/v0.4.1.md
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-hermes-kms-v0.4.1-notes
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Update the published release description only
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const tag = 'v0.4.1';
+            const body = fs.readFileSync('docs/releases/v0.4.1.md', 'utf8');
+            if (!body.startsWith('# Hermes-KMS v0.4.1')) {
+              throw new Error('Unexpected release-notes document header');
+            }
+            const { data: release } = await github.rest.repos.getReleaseByTag({
+              owner, repo, tag,
+            });
+            if (release.draft || release.prerelease) {
+              throw new Error('Release is no longer a published stable release');
+            }
+            if (release.body === body) {
+              core.notice('Release notes already match the repository document');
+              return;
+            }
+            const { data: updated } = await github.rest.repos.updateRelease({
+              owner,
+              repo,
+              release_id: release.id,
+              body,
+            });
+            core.notice(`Updated release notes without changing assets: ${updated.html_url}`);
