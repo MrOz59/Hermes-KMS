@@ -33,6 +33,10 @@ UAPI remains **14**, unchanged from 0.4.0. This is a maintenance release.
 
 ### Packaging
 
+- Add native Fedora RPM and Ubuntu/Debian DEB packages for the DKMS core
+  driver and optional private-seat broker. Verify their source payloads,
+  dependencies and DKMS lifecycle hooks in CI and attach them to the
+  reviewable release draft with unified SHA-256 checksums.
 - Build both Arch/CachyOS split packages in CI, pin release builds to the exact
   source commit, validate the packaged DKMS source and ship source/recipe
   artifacts with SHA-256 checksums. A tag produces a draft release only after
