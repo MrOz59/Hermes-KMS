@@ -1,0 +1,121 @@
+# One-time publication workflow for v0.4.1.
+# The tag created with GITHUB_TOKEN does not trigger tag-push workflows, so
+# this workflow runs the same reusable CI and publishes its artifacts itself.
+name: Publish Hermes-KMS v0.4.1
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-v0.4.1.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-hermes-kms-v0.4.1
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify release version
+        run: bash scripts/check-release-version.sh v0.4.1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hermes-kms-release-assets
+          path: release-assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hermes-kms-deb-assets
+          path: release-assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hermes-kms-rpm-assets
+          path: release-assets
+
+      - name: Validate provenance and consolidated checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          test "$(cat SOURCE_COMMIT)" = "$GITHUB_SHA"
+          sha256sum --check SHA256SUMS
+          sha256sum --check DEB_SHA256SUMS
+          sha256sum --check RPM_SHA256SUMS
+          test "$(find . -maxdepth 1 -name '*.deb' | wc -l)" -eq 2
+          test "$(find . -maxdepth 1 -name '*.rpm' | wc -l)" -eq 2
+          test "$(find . -maxdepth 1 -name '*.pkg.tar.zst' | wc -l)" -eq 2
+          rm SHA256SUMS DEB_SHA256SUMS RPM_SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Create annotated tag, upload and publish verified release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const tag = 'v0.4.1';
+            const {owner, repo} = context.repo;
+            const sha = context.sha;
+            const source = fs.readFileSync('release-assets/SOURCE_COMMIT', 'utf8').trim();
+            if (source !== sha) throw new Error('Source commit and workflow SHA mismatch');
+
+            // Never silently overwrite an existing release or tag.
+            try {
+              const {data: release} = await github.rest.repos.getReleaseByTag({owner, repo, tag});
+              throw new Error(`Release already exists: ${release.html_url}`);
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            try {
+              await github.rest.git.getRef({owner, repo, ref: `tags/${tag}`});
+              throw new Error(`Tag ${tag} already exists; manual verification required`);
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
+            const {data: tagObject} = await github.rest.git.createTag({
+              owner, repo, tag, message: 'Hermes-KMS v0.4.1 maintenance release',
+              object: sha, type: 'commit',
+              tagger: {
+                name: 'github-actions[bot]',
+                email: '41898282+github-actions[bot]@users.noreply.github.com',
+                date: new Date().toISOString()
+              }
+            });
+            await github.rest.git.createRef({
+              owner, repo, ref: `refs/tags/${tag}`, sha: tagObject.sha
+            });
+
+            // Keep the release private until EVERY artifact has been uploaded.
+            const body = fs.readFileSync('docs/releases/v0.4.1.md', 'utf8');
+            const {data: release} = await github.rest.repos.createRelease({
+              owner, repo, tag_name: tag, target_commitish: sha,
+              name: 'Hermes-KMS v0.4.1', body, draft: true, prerelease: false
+            });
+            for (const name of fs.readdirSync('release-assets').sort()) {
+              await github.rest.repos.uploadReleaseAsset({
+                owner, repo, release_id: release.id, name,
+                data: fs.readFileSync(`release-assets/${name}`)
+              });
+            }
+            const {data: published} = await github.rest.repos.updateRelease({
+              owner, repo, release_id: release.id, draft: false, prerelease: false
+            });
+            core.notice(`Published ${tag}: ${published.html_url}`);
