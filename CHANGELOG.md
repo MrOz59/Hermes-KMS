@@ -47,6 +47,9 @@ UAPI remains **14**, unchanged from 0.4.0. This is a maintenance release.
 
 ### Fixed
 
+- Fix the 32-bit compat `GET_STATUS` path reading eight bytes beyond the
+  native kernel stack structure. Copy the 48-byte v10 tail beginning at
+  `bound_fd_count`, preserving the historical layout without a UAPI bump.
 - Build with the target kernel's `hrtimer_setup()` when `hrtimer_init()` is
   unavailable, including Linux 6.17/6.18 without the DRM-owned vblank timer.
   Older kernels retain the original initialization path (#12, @SOVLOOKUP).
