@@ -378,6 +378,7 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/check-release-version.sh
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           mkdir -p "$GITHUB_WORKSPACE/.rpmbuild"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
           git archive --format=tar --prefix=Hermes-KMS/ HEAD | \
             gzip -n > "$GITHUB_WORKSPACE/.rpmbuild/SOURCES/Hermes-KMS-0.4.1.tar.gz"
