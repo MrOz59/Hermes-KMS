@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+if [ "${1:-}" = configure ]; then
+    if [ -f /etc/udev/rules.d/90-hermes-kms-user.rules ] &&
+       grep -qx '# Managed by hermes-kms-setup. Grants one configured UID render-node access.' \
+           /etc/udev/rules.d/90-hermes-kms-user.rules; then
+        rm -f /etc/udev/rules.d/90-hermes-kms-user.rules
+    fi
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules || true
+        udevadm trigger --subsystem-match=drm --action=change || true
+    fi
+    printf '%s\n' 'If Hermes-KMS was already loaded, reboot before testing the new module.'
+fi
+#DEBHELPER#
+exit 0
