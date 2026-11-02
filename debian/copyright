@@ -1,0 +1,14 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Hermes-KMS
+Source: https://github.com/MrOz59/Hermes-KMS
+
+Files: *
+Copyright: Hermes-KMS contributors
+License: GPL-2.0-only
+ The driver is licensed under GPL-2.0-only. See the upstream LICENSE file,
+ distributed in /usr/share/doc/hermes-kms-dkms/copyright.
+
+Files: tools/hermes_session.h LICENSES/MIT.txt
+Copyright: Hermes-KMS contributors
+License: MIT
+ See LICENSES/MIT.txt in the upstream source.

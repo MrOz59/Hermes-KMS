@@ -27,12 +27,16 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
-## [0.4.1] - Unreleased
+## [0.4.1] - 2026-11-02
 
 UAPI remains **14**, unchanged from 0.4.0. This is a maintenance release.
 
 ### Packaging
 
+- Add native Fedora RPM and Ubuntu/Debian DEB packages for the DKMS core
+  driver and optional private-seat broker. Verify their source payloads,
+  dependencies and DKMS lifecycle hooks in CI and attach them to the
+  reviewable release draft with unified SHA-256 checksums.
 - Build both Arch/CachyOS split packages in CI, pin release builds to the exact
   source commit, validate the packaged DKMS source and ship source/recipe
   artifacts with SHA-256 checksums. A tag produces a draft release only after
@@ -47,6 +51,9 @@ UAPI remains **14**, unchanged from 0.4.0. This is a maintenance release.
 
 ### Fixed
 
+- Fix the 32-bit compat `GET_STATUS` path reading eight bytes beyond the
+  native kernel stack structure. Copy the 48-byte v10 tail beginning at
+  `bound_fd_count`, preserving the historical layout without a UAPI bump.
 - Build with the target kernel's `hrtimer_setup()` when `hrtimer_init()` is
   unavailable, including Linux 6.17/6.18 without the DRM-owned vblank timer.
   Older kernels retain the original initialization path (#12, @SOVLOOKUP).

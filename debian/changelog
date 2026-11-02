@@ -1,0 +1,7 @@
+hermes-kms (0.4.1-1) unstable; urgency=medium
+
+  * Native Debian/Ubuntu DKMS and optional private seat broker packages.
+  * Keep Hermes-KMS UAPI at version 14.
+  * Include read-only capture ACL, VT-free brokers and legacy 32-bit status fix.
+
+ -- MrOz59 <74338254+MrOz59@users.noreply.github.com>  Mon, 02 Nov 2026 00:00:00 +0000

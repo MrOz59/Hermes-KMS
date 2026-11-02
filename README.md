@@ -11,11 +11,11 @@ is not tied to it — any program that speaks its DRM ioctl UAPI can consume fra
 
 ## Current state
 
-This documentation describes the **0.4.1 release candidate**, prepared on
-2026-10-26, with unchanged **UAPI v14**. The latest published release is
-`v0.4.0`; see [the changelog](CHANGELOG.md) and the
-[0.4.1 release checklist](docs/releases/v0.4.1.md) for the pending fixes,
-validation and upgrade procedure.
+This documentation describes **v0.4.1**, released on 2026-11-02,
+with unchanged **UAPI v14**. See [the changelog](CHANGELOG.md) and the
+[0.4.1 release notes](docs/releases/v0.4.1.md) for fixes, package installation,
+and validation limits. CI builds passed, but not all GPU/HDR, reboot and
+multi-session runtime tests have been completed against the release artifacts.
 
 | Area | Implemented behavior and validation limits |
 | --- | --- |
@@ -306,6 +306,42 @@ The `-git` PKGBUILD fetches the default branch; it does not pin a release tag.
 Build optional diagnostic tools separately with `make tools`; the packages do
 not install the `hermes-kmsctl` executable. If the helper is missing, check
 `pacman -Q hermes-kms-seatd-git` and install the broker package above.
+
+### Native Fedora and Ubuntu packages (0.4.1+)
+
+The release also builds **native Fedora RPM** and **Ubuntu/Debian DEB**
+packages. Each distribution has a DKMS core package
+(`hermes-kms-dkms`) and an optional private-session broker
+(`hermes-kms-seatd`). Package versions and UAPI match the Arch release;
+neither host Hermes nor libvirtualhid is a dependency of the driver package.
+
+On Ubuntu/Debian, install the attached `.deb` files using `apt`:
+
+```bash
+sudo apt install ./hermes-kms-dkms_0.4.1-1_all.deb
+# Optional isolated session brokers:
+sudo apt install ./hermes-kms-seatd_0.4.1-1_all.deb
+```
+
+On **mutable** Fedora Workstation, use the RPMs matching your Fedora release:
+
+```bash
+sudo dnf install ./hermes-kms-dkms-0.4.1-1.fc44.noarch.rpm
+# Optional isolated session brokers:
+sudo dnf install ./hermes-kms-seatd-0.4.1-1.fc44.noarch.rpm
+```
+
+Install kernel headers/devel files **matching the target kernel** before the
+DKMS build. Confirm `dkms status -m hermes-kms` reports the module installed
+for that kernel and reboot after upgrading an already loaded driver. Missing
+headers, module signing under Secure Boot and package installation are separate
+checks. On Bazzite/bootc or other immutable images, use the image-based method
+below rather than a normal RPM/DKMS install.
+
+The package inventory, checksums, versioning, install gates and intended
+integration contract for a Hermes ecosystem installer are documented in
+[docs/installer-contract.md](docs/installer-contract.md). `make tools` builds
+optional diagnostics; the native DKMS packages do not bundle `hermes-kmsctl`.
 
 For a source installation, `sudo make dkms-install` installs the core policy.
 Use `sudo make INSTALL_BROKER=1 dkms-install` to install the optional private-seat

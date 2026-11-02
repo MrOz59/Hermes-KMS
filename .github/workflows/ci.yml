@@ -297,3 +297,130 @@ jobs:
           kver="$(make -s -C "$kdir" kernelrelease)"
           make -j2 KDIR="$kdir" KERNELRELEASE="$kver" modules
           test -f kernel/hermes-kms/hermes_kms.ko
+
+  native-deb-packages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Debian packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential debhelper dh-dkms dkms fakeroot
+
+      - name: Build the two native Ubuntu/Debian packages
+        run: |
+          bash scripts/check-release-version.sh
+          dpkg-buildpackage -b -us -uc
+          mkdir -p native-assets
+          cp ../hermes-kms-dkms_*.deb ../hermes-kms-seatd_*.deb native-assets/
+
+      - name: Validate Debian package contents and maintainer hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          core=(native-assets/hermes-kms-dkms_*.deb)
+          broker=(native-assets/hermes-kms-seatd_*.deb)
+          test "${#core[@]}" -eq 1
+          test "${#broker[@]}" -eq 1
+          version=$(bash scripts/check-release-version.sh)
+          core_dir=$(mktemp -d)
+          broker_dir=$(mktemp -d)
+          dpkg-deb -x "${core[0]}" "$core_dir"
+          dpkg-deb -x "${broker[0]}" "$broker_dir"
+          test -f "$core_dir/usr/src/hermes-kms-$version/dkms.conf"
+          grep -Fqx "PACKAGE_VERSION=\"$version\"" \
+            "$core_dir/usr/src/hermes-kms-$version/dkms.conf"
+          cmp kernel/hermes-kms/hermes_kms.c \
+            "$core_dir/usr/src/hermes-kms-$version/kernel/hermes-kms/hermes_kms.c"
+          test -f "$core_dir/usr/lib/udev/rules.d/72-hermes-kms-render-access.rules"
+          test -f "$core_dir/usr/include/drm/hermes_kms_drm.h"
+          test ! -e "$core_dir/usr/lib/systemd/system/hermes-kms-seatd@.service"
+          test -f "$broker_dir/usr/lib/systemd/system/hermes-kms-seatd@.service"
+          grep -Fq 'SEATD_VTBOUND=0' \
+            "$broker_dir/usr/lib/systemd/system/hermes-kms-seatd@.service"
+          test -x "$broker_dir/usr/lib/hermes-kms/hermes-kms-setup"
+          test ! -e "$broker_dir/usr/src"
+          dpkg-deb -f "${core[0]}" Depends | grep -q 'dkms'
+          dpkg-deb -f "${broker[0]}" Depends | grep -q 'hermes-kms-dkms'
+          control_dir=$(mktemp -d)
+          dpkg-deb -e "${core[0]}" "$control_dir"
+          grep -q 'dkms' "$control_dir/postinst"
+          cd native-assets
+          sha256sum -- *.deb > DEB_SHA256SUMS
+          sha256sum --check DEB_SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-kms-deb-assets
+          path: native-assets/*
+          if-no-files-found: error
+
+  native-rpm-packages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    container: fedora:44
+    steps:
+      - name: Install RPM packaging tools
+        run: dnf install -y rpm-build make git gcc
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Create source tarball from exact CI commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/check-release-version.sh
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p "$GITHUB_WORKSPACE/.rpmbuild"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          git archive --format=tar --prefix=Hermes-KMS/ HEAD | \
+            gzip -n > "$GITHUB_WORKSPACE/.rpmbuild/SOURCES/Hermes-KMS-0.4.1.tar.gz"
+
+      - name: Build both Fedora RPM packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          rpmbuild -bb \
+            --define "_topdir $GITHUB_WORKSPACE/.rpmbuild" \
+            packaging/rpm/hermes-kms.spec
+          mkdir -p native-assets
+          find .rpmbuild/RPMS -type f -name '*.rpm' -exec cp {} native-assets/ \;
+
+      - name: Validate RPM payload and DKMS lifecycle scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          core=(native-assets/hermes-kms-dkms-*.noarch.rpm)
+          broker=(native-assets/hermes-kms-seatd-*.noarch.rpm)
+          test "${#core[@]}" -eq 1
+          test "${#broker[@]}" -eq 1
+          rpm -qpl "${core[0]}" | grep -Fqx \
+            '/usr/src/hermes-kms-0.4.1/dkms.conf'
+          rpm -qpl "${core[0]}" | grep -Fqx \
+            '/usr/lib/udev/rules.d/72-hermes-kms-render-access.rules'
+          rpm -qpl "${broker[0]}" | grep -Fqx \
+            '/usr/lib/systemd/system/hermes-kms-seatd@.service'
+          if rpm -qpl "${broker[0]}" | grep -q '/usr/src/'; then
+            echo 'broker RPM unexpectedly contains DKMS sources' >&2
+            exit 1
+          fi
+          rpm -qp --requires "${core[0]}" | grep -q '^dkms'
+          rpm -qp --requires "${broker[0]}" | grep -q '^hermes-kms-dkms'
+          rpm -qp --scripts "${core[0]}" | grep -q 'dkms add'
+          cd native-assets
+          sha256sum -- *.rpm > RPM_SHA256SUMS
+          sha256sum --check RPM_SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-kms-rpm-assets
+          path: native-assets/*
+          if-no-files-found: error

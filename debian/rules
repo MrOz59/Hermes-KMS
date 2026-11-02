@@ -1,0 +1,25 @@
+#!/usr/bin/make -f
+# debhelper builds two architecture-independent packages. The DKMS integration
+# owns module registration/build/removal; never modprobe a live graphics driver
+# from a package maintainer script.
+export DH_VERBOSE=1
+
+%:
+	dh $@ --with dkms
+
+override_dh_auto_build:
+	:
+
+override_dh_auto_test:
+	:
+
+override_dh_auto_install:
+	set -eu; \
+	version="$$(bash scripts/check-release-version.sh)"; \
+	core="$(CURDIR)/debian/hermes-kms-dkms"; \
+	broker="$(CURDIR)/debian/hermes-kms-seatd"; \
+	source_dir="$$core/usr/src/hermes-kms-$$version"; \
+	install -dm0755 "$$source_dir"; \
+	cp -a Makefile dkms.conf include kernel "$$source_dir/"; \
+	$(MAKE) DESTDIR="$$core" install-core-configs install-uapi; \
+	$(MAKE) DESTDIR="$$broker" install-broker-configs
