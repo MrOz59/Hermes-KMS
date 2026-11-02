@@ -38,10 +38,26 @@ jobs:
           name: hermes-kms-release-assets
           path: release-assets
 
-      - name: Verify release assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: hermes-kms-deb-assets
+          path: release-assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hermes-kms-rpm-assets
+          path: release-assets
+
+      - name: Verify all distribution artifacts and generate unified checksums
         run: |
+          set -euo pipefail
           cd release-assets
           test "$(cat SOURCE_COMMIT)" = "$GITHUB_SHA"
+          sha256sum --check SHA256SUMS
+          sha256sum --check DEB_SHA256SUMS
+          sha256sum --check RPM_SHA256SUMS
+          rm DEB_SHA256SUMS RPM_SHA256SUMS SHA256SUMS
+          sha256sum -- * > SHA256SUMS
           sha256sum --check SHA256SUMS
 
       - name: Create reviewable draft and upload assets
