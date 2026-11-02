@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -40,6 +41,12 @@ jobs:
 
       - name: Run userspace regression checks
         run: make check check-hdr-build
+
+      - name: Check tag against the source version
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: bash scripts/check-release-version.sh "$RELEASE_TAG"
 
       - name: Check shell and packaged configuration syntax
         shell: bash
@@ -111,7 +118,96 @@ jobs:
       - name: Reject whitespace errors
         run: git diff --check
 
+  arch-packages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container: archlinux:base-devel
+    steps:
+      - name: Install packaging dependencies
+        run: pacman -Syu --noconfirm --needed git
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare exact-commit package sources
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          version=$(bash scripts/check-release-version.sh)
+          build_dir=$(mktemp -d /tmp/hermes-kms-packages.XXXXXX)
+          printf 'PACKAGE_BUILD_DIR=%s\n' "$build_dir" >> "$GITHUB_ENV"
+          cp PKGBUILD hermes-kms.install hermes-kms-core.install "$build_dir/"
+          sed -i "s|^source=.*|source=(\"git+https://github.com/MrOz59/Hermes-KMS.git#commit=$GITHUB_SHA\")|" \
+            "$build_dir/PKGBUILD"
+          # Seed makepkg's VCS cache with the checkout, including PR merge
+          # commits that are not reachable from the public default branch.
+          git clone --mirror . "$build_dir/Hermes-KMS"
+          git -C "$build_dir/Hermes-KMS" remote set-url origin \
+            https://github.com/MrOz59/Hermes-KMS.git
+          git -C "$build_dir/Hermes-KMS" cat-file -e "$GITHUB_SHA^{commit}"
+          mkdir -p release-assets
+          git archive --format=tar --prefix=Hermes-KMS/ HEAD |
+            gzip -n > "release-assets/hermes-kms-$version-source.tar.gz"
+          cp "$build_dir/PKGBUILD" release-assets/PKGBUILD
+          cp hermes-kms.install hermes-kms-core.install release-assets/
+          printf '%s\n' "$GITHUB_SHA" > release-assets/SOURCE_COMMIT
+          useradd --create-home builder
+          chown -R builder:builder "$build_dir"
+
+      - name: Build both split packages without root
+        shell: bash
+        run: |
+          # Runtime dependencies are checked in the package metadata below;
+          # building a DKMS source package does not install a host module.
+          runuser -u builder -- bash -c \
+            'cd "$1"; makepkg --holdver --nodeps --noconfirm' bash "$PACKAGE_BUILD_DIR"
+          cp "$PACKAGE_BUILD_DIR"/*.pkg.tar.zst release-assets/
+
+      - name: Validate package payloads and provenance
+        shell: bash
+        run: |
+          shopt -s nullglob
+          core=(release-assets/hermes-kms-dkms-git-*.pkg.tar.zst)
+          broker=(release-assets/hermes-kms-seatd-git-*.pkg.tar.zst)
+          test "${#core[@]}" -eq 1
+          test "${#broker[@]}" -eq 1
+          core_dir=$(mktemp -d)
+          broker_dir=$(mktemp -d)
+          bsdtar -xf "${core[0]}" -C "$core_dir"
+          bsdtar -xf "${broker[0]}" -C "$broker_dir"
+          package_version=$(sed -n 's/^pkgver = //p' "$core_dir/.PKGINFO")
+          grep -Fqx "pkgver = $package_version" "$broker_dir/.PKGINFO"
+          source_dir="$core_dir/usr/src/hermes-kms-${package_version%-*}"
+          test -f "$source_dir/kernel/hermes-kms/hermes_kms.c"
+          grep -Fqx "PACKAGE_VERSION=\"${package_version%-*}\"" "$source_dir/dkms.conf"
+          cmp kernel/hermes-kms/hermes_kms.c "$source_dir/kernel/hermes-kms/hermes_kms.c"
+          test -z "$(find "$source_dir" -type f \( -name '*.o' -o -name '*.ko' \) -print)"
+          test -f "$core_dir/usr/include/drm/hermes_kms_drm.h"
+          test -f "$core_dir/usr/include/hermes-kms/hermes_session.h"
+          test -x "$core_dir/usr/bin/hermes-kms-unload"
+          cmp hermes-kms-core.install "$core_dir/.INSTALL"
+          grep -Fqx 'depend = dkms' "$core_dir/.PKGINFO"
+          grep -Fqx 'depend = acl' "$core_dir/.PKGINFO"
+          test ! -e "$core_dir/usr/lib/systemd/system/hermes-kms-seatd@.service"
+          test ! -e "$broker_dir/usr/src"
+          test -x "$broker_dir/usr/lib/hermes-kms/hermes-kms-setup"
+          cmp hermes-kms.install "$broker_dir/.INSTALL"
+          grep -Fqx 'depend = hermes-kms-dkms-git' "$broker_dir/.PKGINFO"
+          grep -Fq 'SEATD_VTBOUND=0' "$broker_dir/usr/lib/systemd/system/hermes-kms-seatd@.service"
+          cd release-assets
+          sha256sum -- * > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-kms-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
   kernel-module:
+    needs: arch-packages
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     container: archlinux:base-devel
@@ -151,6 +247,23 @@ jobs:
         run: |
           make clean KDIR="$KDIR" KERNELRELEASE="$KERNELRELEASE"
           test ! -e kernel/hermes-kms/hermes_kms.ko
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hermes-kms-release-assets
+          path: release-assets
+
+      - name: Compile the shipped DKMS source payload
+        shell: bash
+        run: |
+          cd release-assets
+          sha256sum --check SHA256SUMS
+          package_dir=$(mktemp -d)
+          bsdtar -xf hermes-kms-dkms-git-*.pkg.tar.zst -C "$package_dir"
+          source_dirs=("$package_dir"/usr/src/hermes-kms-*)
+          test "${#source_dirs[@]}" -eq 1
+          make -C "${source_dirs[0]}" -j2 KDIR="$KDIR" KERNELRELEASE="$KERNELRELEASE" modules
+          test -s "${source_dirs[0]}/kernel/hermes-kms/hermes_kms.ko"
 
   kernel-module-ubuntu:
     runs-on: ubuntu-24.04

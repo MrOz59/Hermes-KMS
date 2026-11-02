@@ -1,6 +1,7 @@
 # Hermes-KMS roadmap
 
-This roadmap describes `main` (driver 0.4.0, UAPI v14), reviewed on 2026-10-25.
+This roadmap describes the 0.4.1 release candidate (UAPI v14), reviewed on
+2026-10-26. The latest published release is 0.4.0.
 Implemented driver features, VM coverage and end-to-end product validation are
 separate milestones. See [the changelog](../CHANGELOG.md) for release history.
 

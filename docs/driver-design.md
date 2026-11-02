@@ -5,7 +5,8 @@ reference consumer, but neither the capture interface nor its authorization
 model depends on that application, Steam, or any process name. It does not
 manage EVDI; EVDI remains a supported fallback for consumers that choose it.
 
-The current driver is 0.4.0 with UAPI v14. This document describes `main`;
+The release candidate is 0.4.1 with unchanged UAPI v14. This document describes
+the release preparation branch;
 [CHANGELOG.md](../CHANGELOG.md) distinguishes the latest tag from subsequent
 fixes. See [references.md](references.md) for upstream mechanisms and
 [configfs.md](configfs.md) for the complete per-card configuration interface.

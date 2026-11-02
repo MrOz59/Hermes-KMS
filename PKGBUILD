@@ -9,7 +9,7 @@
 pkgname=(hermes-kms-dkms-git hermes-kms-seatd-git)
 pkgbase=hermes-kms-git
 _pkgbase=hermes-kms
-pkgver=0.4.0
+pkgver=0.4.1
 pkgrel=1
 pkgdesc="Hermes-KMS zero-copy virtual display DRM/KMS driver (DKMS)"
 arch=('any')

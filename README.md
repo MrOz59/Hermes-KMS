@@ -11,10 +11,11 @@ is not tied to it — any program that speaks its DRM ioctl UAPI can consume fra
 
 ## Current state
 
-This documentation describes `main`, reviewed on 2026-10-25. The driver reports
-version **0.4.0** and **UAPI v14**; `main` also contains fixes made after the
-`v0.4.0` tag. Use [the changelog](CHANGELOG.md) to distinguish released changes
-from unreleased fixes.
+This documentation describes the **0.4.1 release candidate**, prepared on
+2026-10-26, with unchanged **UAPI v14**. The latest published release is
+`v0.4.0`; see [the changelog](CHANGELOG.md) and the
+[0.4.1 release checklist](docs/releases/v0.4.1.md) for the pending fixes,
+validation and upgrade procedure.
 
 | Area | Implemented behavior and validation limits |
 | --- | --- |
