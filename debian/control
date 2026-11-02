@@ -1,7 +1,7 @@
 Source: hermes-kms
 Section: kernel
 Priority: optional
-Maintainer: MrOz59 <https://github.com/MrOz59>
+Maintainer: MrOz59 <74338254+MrOz59@users.noreply.github.com>
 Build-Depends: debhelper-compat (= 13), dh-dkms
 Standards-Version: 4.6.2
 Homepage: https://github.com/MrOz59/Hermes-KMS
