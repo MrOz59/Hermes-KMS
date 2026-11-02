@@ -1,0 +1,28 @@
+Source: hermes-kms
+Section: kernel
+Priority: optional
+Maintainer: MrOz59 <https://github.com/MrOz59>
+Build-Depends: debhelper-compat (= 13), dh-dkms
+Standards-Version: 4.6.2
+Homepage: https://github.com/MrOz59/Hermes-KMS
+Rules-Requires-Root: no
+
+Package: hermes-kms-dkms
+Architecture: all
+Multi-Arch: foreign
+Depends: ${misc:Depends}, dkms, acl, kmod
+Recommends: build-essential, linux-headers-generic
+Description: Hermes-KMS virtual DRM/KMS capture driver (DKMS source)
+ Virtual display driver and public UAPI with DKMS integration, host access
+ policy and capture utilities. Builds for the installed kernel with matching
+ headers. The host connector is initially disabled until owned by a client.
+
+Package: hermes-kms-seatd
+Architecture: all
+Multi-Arch: foreign
+Depends: ${misc:Depends}, hermes-kms-dkms (= ${binary:Version}), seatd
+Suggests: polkitd
+Description: Optional private seat broker for Hermes-KMS isolated sessions
+ Creates private seatd instances for isolated DRM/KMS sessions. This package
+ depends on the matching Hermes-KMS DKMS source package and is not needed
+ for ordinary single-display capture.
