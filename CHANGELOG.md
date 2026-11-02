@@ -27,7 +27,7 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
-## [0.4.1] - Unreleased
+## [0.4.1] - 2026-11-02
 
 UAPI remains **14**, unchanged from 0.4.0. This is a maintenance release.
 
