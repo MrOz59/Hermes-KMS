@@ -331,11 +331,32 @@ podman build -t localhost/bazzite-hermes:latest -f packaging/bazzite/Containerfi
 sudo bootc switch --transport containers-storage localhost/bazzite-hermes:latest
 ```
 
+Build from the image the machine already runs: `rpm-ostree status` names it, for
+example `ghcr.io/ublue-os/bazzite:stable`. The Containerfile defaults to
+`ghcr.io/ublue-os/bazzite:latest`; pass `--build-arg BASE_TAG=…`, and
+`--build-arg BASE_IMAGE=…` for another variant such as
+`ghcr.io/ublue-os/bazzite-gnome`, to match it.
+
 Run the build and switch with access to the same Podman image store (for example,
 use `sudo podman build` if `sudo bootc` cannot see a rootless build). Reboot into
 the new image and the module autoloads. Rebuild and redeploy the derived image
 for kernel updates; publishing it once does not automatically track base-image
 changes. See the [bootc references](docs/references.md#installation).
+
+**Packages layered with `rpm-ostree install` do not carry over.** `bootc switch`
+deploys the image exactly as built, so a Hermes installed that way is gone after
+the reboot, without a warning. Layer it again on the new image and reboot once
+more:
+
+```bash
+rpm-ostree install ./hermes-*.rpm
+```
+
+Hermes opens the driver's render node through the udev `uaccess` rule, which
+grants it to the user logged in at the machine. Until someone logs in to the
+desktop, Hermes reports Hermes-KMS as unavailable; a machine meant to stream
+from boot needs automatic login.
+
 The Containerfile defaults to `WITH_SEAT_BROKER=1`; pass
 `--build-arg WITH_SEAT_BROKER=0` for core-only installation. After a broker-enabled
 installation, run the same setup helper to configure the private pool.
