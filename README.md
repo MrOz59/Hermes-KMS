@@ -302,7 +302,16 @@ sudo /usr/lib/hermes-kms/hermes-kms-setup configure --user auto
 
 The split packages are `hermes-kms-dkms-git` (module, core runtime policy and
 public headers) and `hermes-kms-seatd-git` (private brokers and setup helper).
-The `-git` PKGBUILD fetches the default branch; it does not pin a release tag.
+On this experimental branch, the `-git` PKGBUILD explicitly fetches
+`experimental/nvidia-zero-copy`; it does not pin a release tag. Older copies
+fetched the default branch even from an experimental checkout, so update the
+PKGBUILD before rebuilding for NVIDIA tests. Reboot after replacing an already
+loaded module, then run `make tools/hermes-kmsctl/hermes-kmsctl` and
+`./tools/hermes-kmsctl/hermes-kmsctl version` from this checkout. Expect
+`uapi_version=15`; that is the loaded interface, not just the installed package.
+Hermes' matching branch also needs CUDA support compiled in and an explicit
+environment switch for DMA-BUF capture with NVENC; follow its
+[NVIDIA tester quick start](https://github.com/MrOz59/Hermes/blob/experimental/nvidia-zero-copy/docs/experimental-nvidia.md#quick-start-for-testers).
 Build optional diagnostic tools separately with `make tools`; the packages do
 not install the `hermes-kmsctl` executable. If the helper is missing, check
 `pacman -Q hermes-kms-seatd-git` and install the broker package above.
@@ -934,3 +943,4 @@ MIT license in [LICENSES/MIT.txt](LICENSES/MIT.txt). An independently developed
 userspace project therefore does not have to become the Hermes application or
 adopt its application license merely because it issues the documented ioctls,
 includes the syscall-note UAPI, or reuses the MIT helper.
+
