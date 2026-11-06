@@ -26,6 +26,9 @@ validation and upgrade procedure.
 | Access and brokers | Capture opens use `O_RDONLY`; private seatd services run with `SEATD_VTBOUND=0` so they do not take over the host VT. |
 | NVIDIA | Current Hermes uses a CPU scanout copy with hardware conversion/encoding. The separate `experimental/nvidia-zero-copy` branch contains diagnostic experiments, not a validated replacement path. |
 
+For the experimental NVIDIA branch, see the
+[KWin 6.8 direct PRIME scanout investigation](docs/kwin-nvidia-prime-scanout.md).
+
 Documentation: [driver design](docs/driver-design.md),
 [configfs attributes and examples](docs/configfs.md),
 [HDR capture contract](docs/hdr-capture.md), [roadmap](docs/roadmap.md), and
