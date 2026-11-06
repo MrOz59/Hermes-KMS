@@ -331,6 +331,7 @@ struct hermes_kms_export_cache {
 	u64 clock;
 	u64 hits;
 	u64 misses;
+	u64 evictions;
 };
 
 struct hermes_kms_output {
@@ -2725,8 +2726,10 @@ hermes_kms_get_plane_dmabuf_locked(struct hermes_kms_export_cache *cache,
 
 	if (victim->dmabuf)
 		dma_buf_put(victim->dmabuf);
-	if (victim->obj)
+	if (victim->obj) {
+		cache->evictions++;
 		drm_gem_object_put(victim->obj);
+	}
 
 	/* One ref for the caller and one retained by the rotating-BO cache. */
 	get_dma_buf(dmabuf);
@@ -4222,6 +4225,8 @@ static int hermes_kms_stats_show(struct seq_file *m, void *data)
 			   output->frame_export_cache.hits);
 		seq_printf(m, "frame_export_misses:    %llu\n",
 			   output->frame_export_cache.misses);
+		seq_printf(m, "frame_export_evictions: %llu\n",
+			   output->frame_export_cache.evictions);
 		mutex_unlock(&output->export_lock);
 	}
 	return 0;
