@@ -207,6 +207,26 @@ static int print_version(int fd)
 	return 0;
 }
 
+/*
+ * Where a scanout's storage came from: "dumb" for the driver's own buffers,
+ * "imported:<exporter>" for a buffer PRIME-imported from another device, or
+ * "unavailable" on drivers without HERMES_KMS_CAP_FRAME_ORIGIN.
+ */
+static void print_origin(const char *key, bool supported, bool imported,
+			 const char *exporter, size_t exporter_len)
+{
+	size_t length = strnlen(exporter, exporter_len);
+
+	if (!supported)
+		printf("%s=unavailable\n", key);
+	else if (!imported)
+		printf("%s=dumb\n", key);
+	else if (!length)
+		printf("%s=imported:unknown\n", key);
+	else
+		printf("%s=imported:%.*s\n", key, (int)length, exporter);
+}
+
 static int print_caps(int fd)
 {
 	struct drm_hermes_kms_caps caps;
@@ -257,6 +277,10 @@ static int print_caps(int fd)
 	       (caps.flags & HERMES_KMS_CAP_SYNC_FILE) ? "true" : "false");
 	printf("dmabuf_export_planned=%s\n",
 	       (caps.flags & HERMES_KMS_CAP_DMABUF_EXPORT_PLANNED) ? "true" : "false");
+	printf("frame_color=%s\n",
+	       (caps.flags & HERMES_KMS_CAP_FRAME_COLOR) ? "true" : "false");
+	printf("frame_origin=%s\n",
+	       (caps.flags & HERMES_KMS_CAP_FRAME_ORIGIN) ? "true" : "false");
 
 	return 0;
 }
@@ -553,6 +577,9 @@ static int print_frame(int fd, int argc, char **argv)
 	printf("size=%ux%u\n", frame.width, frame.height);
 	printf("format=0x%08x\n", frame.format);
 	printf("modifier=0x%016llx\n", (unsigned long long)frame.modifier);
+	print_origin("origin", caps.flags & HERMES_KMS_CAP_FRAME_ORIGIN,
+		     frame.flags & HERMES_KMS_FRAME_IMPORTED, frame.exporter,
+		     sizeof(frame.exporter));
 	printf("plane_count=%u\n", frame.plane_count);
 	for (uint32_t i = 0; i < frame.plane_count && i < 4; i++) {
 		printf("plane_%u_pitch=%u\n", i, frame.pitch[i]);
@@ -599,12 +626,17 @@ static int print_frame(int fd, int argc, char **argv)
 static int print_status(int fd)
 {
 	struct drm_hermes_kms_status status;
+	struct drm_hermes_kms_caps caps;
+	bool origin_supported;
 
 	memset(&status, 0, sizeof(status));
 	if (ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_STATUS, &status) < 0) {
 		perror("GET_STATUS");
 		return 1;
 	}
+	memset(&caps, 0, sizeof(caps));
+	origin_supported = ioctl(fd, DRM_IOCTL_HERMES_KMS_GET_CAPS, &caps) == 0 &&
+			   (caps.flags & HERMES_KMS_CAP_FRAME_ORIGIN);
 
 	printf("flags=0x%016llx\n", (unsigned long long)status.flags);
 	printf("enabled=%s\n",
@@ -653,6 +685,13 @@ static int print_status(int fd)
 	printf("framebuffer_format=0x%08x\n", status.framebuffer_format);
 	printf("framebuffer_modifier=0x%016llx\n",
 	       (unsigned long long)status.framebuffer_modifier);
+	if (status.flags & HERMES_KMS_STATUS_FRAME_VALID)
+		print_origin("framebuffer_origin", origin_supported,
+			     status.flags & HERMES_KMS_STATUS_FRAMEBUFFER_IMPORTED,
+			     status.framebuffer_exporter,
+			     sizeof(status.framebuffer_exporter));
+	else
+		printf("framebuffer_origin=none\n");
 	printf("framebuffer_plane_count=%u\n", status.framebuffer_plane_count);
 	for (uint32_t i = 0; i < status.framebuffer_plane_count && i < 4; i++) {
 		printf("framebuffer_plane_%u_pitch=%u\n",

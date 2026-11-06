@@ -3,8 +3,8 @@
 # DKMS package for the Hermes-KMS virtual display driver. DKMS rebuilds the
 # module automatically for every installed kernel, the same way evdi-dkms does.
 #
-# This is a -git PKGBUILD: it builds from the latest commit on the default
-# branch. Once tagged releases exist, a versioned PKGBUILD can pin a tag.
+# This experimental -git PKGBUILD follows the NVIDIA branch explicitly.
+# Checking out this PKGBUILD must not silently build main without UAPI 15.
 
 pkgname=(hermes-kms-dkms-git hermes-kms-seatd-git)
 pkgbase=hermes-kms-git
@@ -16,7 +16,7 @@ arch=('any')
 url="https://github.com/MrOz59/Hermes-KMS"
 license=('GPL2' 'MIT')
 makedepends=('git')
-source=("git+https://github.com/MrOz59/Hermes-KMS.git")
+source=("git+https://github.com/MrOz59/Hermes-KMS.git#branch=experimental/nvidia-zero-copy")
 sha256sums=('SKIP')
 
 pkgver() {
@@ -67,3 +67,4 @@ package_hermes-kms-seatd-git() {
   install="${_pkgbase}.install"
   make DESTDIR="$pkgdir" install-broker-configs
 }
+

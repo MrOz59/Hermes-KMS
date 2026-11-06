@@ -23,3 +23,5 @@ tools/hermes-sysmem-import-check/hermes-sysmem-import-check
 tools/hermes-imported-scanout-test/hermes-imported-scanout-test
 tests/hdr-capture
 tools/hermes-hdr-metadata-test/hermes-hdr-metadata-test
+tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test
+tools/hermes-import-cache-check/hermes-import-cache-check

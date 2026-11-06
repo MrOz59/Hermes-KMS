@@ -16,9 +16,18 @@
 extern "C" {
 #endif
 
-#define HERMES_KMS_UAPI_VERSION 14
+#define HERMES_KMS_UAPI_VERSION 15
 
 #define HERMES_KMS_NAME_LEN 32
+/*
+ * Exporter of an imported scanout buffer (uapi >= 15): the kernel module that
+ * exported the DMA-BUF ("amdgpu", "i915", "xe", "nvidia_drm", ...), or the
+ * exporter's own name when it is built into the kernel. NUL-terminated and
+ * possibly truncated. It names who allocated the buffer, not where its memory
+ * lives: an exporter may place a buffer it shares with another device in
+ * system memory.
+ */
+#define HERMES_KMS_EXPORTER_NAME_LEN 16
 
 #define HERMES_KMS_CAP_VIRTUAL_OUTPUT		(1ULL << 0)
 #define HERMES_KMS_CAP_OUTPUT_CONTROL		(1ULL << 1)
@@ -52,6 +61,14 @@ extern "C" {
 #define HERMES_KMS_CAP_SESSION_LIFECYCLE	(1ULL << 17)
 /* ACQUIRE_FRAME2 returns colour state atomically with the captured buffer. */
 #define HERMES_KMS_CAP_FRAME_COLOR		(1ULL << 18)
+/*
+ * GET_STATUS and ACQUIRE_FRAME say whether the scanout is one of this driver's
+ * own dumb buffers or a buffer PRIME-imported from another device, and name
+ * that buffer's exporter (STATUS_FRAMEBUFFER_IMPORTED, FRAME_IMPORTED).
+ * Without this capability the two cannot be told apart from userspace: both may
+ * be linear.
+ */
+#define HERMES_KMS_CAP_FRAME_ORIGIN		(1ULL << 19)
 #define HERMES_KMS_CAP_DMABUF_EXPORT_PLANNED	(1ULL << 32)
 #define HERMES_KMS_CAP_ZERO_COPY_TARGET		(1ULL << 33)
 #define HERMES_KMS_CAP_WRITEBACK_CONNECTOR	(1ULL << 34)
@@ -64,6 +81,14 @@ extern "C" {
 #define HERMES_KMS_STATUS_DMABUF_EXPORT_READY	(1ULL << 4)
 #define HERMES_KMS_STATUS_SESSION_OWNED		(1ULL << 5)
 #define HERMES_KMS_STATUS_HOTPLUG_EVENTS_ENABLED (1ULL << 6)
+/*
+ * The latched framebuffer's first plane was PRIME-imported from another
+ * device's DMA-BUF (CAP_FRAME_ORIGIN): the compositor rendered on a real GPU
+ * and scans out of that buffer, and framebuffer_exporter names the exporter.
+ * Clear while a frame is valid means one of this driver's own system-memory
+ * dumb buffers.
+ */
+#define HERMES_KMS_STATUS_FRAMEBUFFER_IMPORTED	(1ULL << 7)
 
 #define HERMES_KMS_FRAME_REQUEST_DMABUF		(1ULL << 0)
 #define HERMES_KMS_FRAME_METADATA_VALID		(1ULL << 1)
@@ -80,6 +105,11 @@ extern "C" {
  * rect: [x1,x2) x [y1,y2); an empty rect means "no change".
  */
 #define HERMES_KMS_FRAME_DAMAGE_VALID		(1ULL << 6)
+/*
+ * STATUS_FRAMEBUFFER_IMPORTED for this frame, latched with the rest of its
+ * metadata (CAP_FRAME_ORIGIN); exporter names the exporter. Output only.
+ */
+#define HERMES_KMS_FRAME_IMPORTED		(1ULL << 7)
 
 #define HERMES_KMS_WAIT_FRAME_READY		(1ULL << 0)
 
@@ -171,7 +201,13 @@ struct drm_hermes_kms_status {
 	 * sees two is looking at a leak.
 	 */
 	__aligned_u64 bound_fd_count;
-	__aligned_u64 reserved[5];
+	/*
+	 * Exporter of an imported framebuffer (uapi >= 15, CAP_FRAME_ORIGIN);
+	 * empty for this driver's own buffers. Taken from reserved slots, so the
+	 * structure keeps its size.
+	 */
+	char framebuffer_exporter[HERMES_KMS_EXPORTER_NAME_LEN];
+	__aligned_u64 reserved[3];
 };
 
 struct drm_hermes_kms_identity {
@@ -252,7 +288,17 @@ struct drm_hermes_kms_acquire_frame {
 	__u32 damage_y1;
 	__u32 damage_x2;
 	__u32 damage_y2;
-	__aligned_u64 reserved[6];
+	/*
+	 * Names what was implicit padding before uapi 15. Ignored on input,
+	 * because older clients never had to clear it, and zero on output.
+	 */
+	__u32 reserved_alignment;
+	/*
+	 * Exporter of an imported frame (uapi >= 15, CAP_FRAME_ORIGIN). Output
+	 * only: like reserved, it must be zero on input.
+	 */
+	char exporter[HERMES_KMS_EXPORTER_NAME_LEN];
+	__aligned_u64 reserved[4];
 };
 
 /*
