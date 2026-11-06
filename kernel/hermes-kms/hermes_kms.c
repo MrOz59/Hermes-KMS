@@ -309,9 +309,28 @@ static unsigned int hermes_kms_live_device_count(void)
 /* Defined with the configfs subsystem, below the KMS and ioctl code. */
 static bool hermes_kms_dynamic_devices_available(void);
 
+/*
+ * Keep the compositor's rotating scanout BOs, not just the most recently
+ * exported one. A single-entry-per-plane cache re-exports A after an A/B/C
+ * sequence, changing the dma-buf inode on every frame. That defeats the
+ * consumer's persistent mmap/import caches and forces repeated page faults.
+ *
+ * Four entries cover common double/triple buffering; eviction and session
+ * teardown release both references. All access is under output->export_lock.
+ */
+#define HERMES_KMS_EXPORT_HISTORY 4
+
+struct hermes_kms_export_entry {
+	struct drm_gem_object *obj;
+	struct dma_buf *dmabuf;
+	u64 last_used;
+};
+
 struct hermes_kms_export_cache {
-	struct drm_gem_object *obj[4];
-	struct dma_buf *dmabuf[4];
+	struct hermes_kms_export_entry entries[4][HERMES_KMS_EXPORT_HISTORY];
+	u64 clock;
+	u64 hits;
+	u64 misses;
 };
 
 struct hermes_kms_output {
@@ -659,18 +678,24 @@ hermes_kms_unlock_scoped_output(struct hermes_kms_file *context,
 static void
 hermes_kms_drop_export_cache_locked(struct hermes_kms_export_cache *cache)
 {
-	unsigned int i;
+	unsigned int i, j;
 
-	for (i = 0; i < ARRAY_SIZE(cache->dmabuf); i++) {
-		if (cache->dmabuf[i]) {
-			dma_buf_put(cache->dmabuf[i]);
-			cache->dmabuf[i] = NULL;
-		}
-		if (cache->obj[i]) {
-			drm_gem_object_put(cache->obj[i]);
-			cache->obj[i] = NULL;
+	for (i = 0; i < ARRAY_SIZE(cache->entries); i++) {
+		for (j = 0; j < ARRAY_SIZE(cache->entries[i]); j++) {
+			struct hermes_kms_export_entry *entry = &cache->entries[i][j];
+
+			if (entry->dmabuf) {
+				dma_buf_put(entry->dmabuf);
+				entry->dmabuf = NULL;
+			}
+			if (entry->obj) {
+				drm_gem_object_put(entry->obj);
+				entry->obj = NULL;
+			}
+			entry->last_used = 0;
 		}
 	}
+	cache->clock = 0;
 }
 
 /*
@@ -2649,33 +2674,32 @@ hermes_kms_get_plane_dmabuf_locked(struct hermes_kms_export_cache *cache,
 {
 	struct drm_gem_object *obj;
 	struct dma_buf *dmabuf;
+	struct hermes_kms_export_entry *victim;
+	unsigned int j;
+
+	if (index >= ARRAY_SIZE(cache->entries))
+		return ERR_PTR(-EINVAL);
 
 	obj = drm_gem_fb_get_obj(fb, index);
 	if (!obj)
 		return ERR_PTR(-EINVAL);
 
-	if (cache->obj[index] == obj && cache->dmabuf[index]) {
-		get_dma_buf(cache->dmabuf[index]);
-		return cache->dmabuf[index];
+	/* Cache identity is the live GEM object, held by each entry. */
+	for (j = 0; j < ARRAY_SIZE(cache->entries[index]); j++) {
+		struct hermes_kms_export_entry *entry = &cache->entries[index][j];
+
+		if (entry->obj != obj || !entry->dmabuf)
+			continue;
+		get_dma_buf(entry->dmabuf);
+		entry->last_used = ++cache->clock;
+		cache->hits++;
+		return entry->dmabuf;
 	}
 
 	/*
-	 * The scanout object is not always one we allocated. A compositor that
-	 * renders on the real GPU can import that buffer into this device and
-	 * scan out of it directly, in which case gem_prime_import gives us a
-	 * shmem object with no shmem file behind it: import_attach is set and
-	 * obj->filp is NULL.
-	 *
-	 * Re-exporting such an object with drm_gem_prime_export() hands the
-	 * consumer a dma_buf whose pages cannot be pinned. The importing driver
-	 * discovers this only once it attaches - drm_gem_map_attach() ->
-	 * drm_gem_shmem_pin_locked() warns on drm_gem_is_imported(), then
-	 * drm_gem_get_pages() rejects the missing filp with -EINVAL - and the
-	 * failure surfaces far away as EGL_BAD_ALLOC out of eglCreateImage().
-	 *
-	 * Hand back the dma_buf it was imported from instead. That is the
-	 * buffer the GPU already understands, and the consumer imports it the
-	 * same way the compositor did.
+	 * A PRIME-imported scanout has no local shmem file behind its GEM
+	 * wrapper. Return the original exporter dma-buf unchanged, rather than
+	 * re-exporting a wrapper that cannot be pinned by the encoder.
 	 */
 	if (obj->import_attach) {
 		dmabuf = obj->import_attach->dmabuf;
@@ -2686,15 +2710,31 @@ hermes_kms_get_plane_dmabuf_locked(struct hermes_kms_export_cache *cache,
 			return dmabuf;
 	}
 
-	/* Replace the cache entry; the cache holds one reference to each object. */
-	if (cache->dmabuf[index])
-		dma_buf_put(cache->dmabuf[index]);
-	if (cache->obj[index])
-		drm_gem_object_put(cache->obj[index]);
+	/* Prefer an empty slot, otherwise evict the least recently used BO. */
+	victim = &cache->entries[index][0];
+	for (j = 0; j < ARRAY_SIZE(cache->entries[index]); j++) {
+		struct hermes_kms_export_entry *entry = &cache->entries[index][j];
+
+		if (!entry->obj) {
+			victim = entry;
+			break;
+		}
+		if (entry->last_used < victim->last_used)
+			victim = entry;
+	}
+
+	if (victim->dmabuf)
+		dma_buf_put(victim->dmabuf);
+	if (victim->obj)
+		drm_gem_object_put(victim->obj);
+
+	/* One ref for the caller and one retained by the rotating-BO cache. */
 	get_dma_buf(dmabuf);
 	drm_gem_object_get(obj);
-	cache->dmabuf[index] = dmabuf;
-	cache->obj[index] = obj;
+	victim->obj = obj;
+	victim->dmabuf = dmabuf;
+	victim->last_used = ++cache->clock;
+	cache->misses++;
 
 	return dmabuf;
 }
@@ -4170,7 +4210,19 @@ static int hermes_kms_stats_show(struct seq_file *m, void *data)
 			   output->output_enable_count);
 		seq_printf(m, "output_disable_count:  %llu\n",
 			   output->output_disable_count);
+		seq_printf(m, "framebuffer_id:         %u\n",
+			   output->framebuffer_id);
+		seq_printf(m, "framebuffer_generation: %llu\n",
+			   output->framebuffer_generation);
 		mutex_unlock(&output->state_lock);
+
+		/* Export cache is protected independently from the frame snapshot. */
+		mutex_lock(&output->export_lock);
+		seq_printf(m, "frame_export_hits:      %llu\n",
+			   output->frame_export_cache.hits);
+		seq_printf(m, "frame_export_misses:    %llu\n",
+			   output->frame_export_cache.misses);
+		mutex_unlock(&output->export_lock);
 	}
 	return 0;
 }

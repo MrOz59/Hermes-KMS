@@ -148,6 +148,33 @@ This is a historical reproduction, not a claim that every NVIDIA GPU/driver
 has the same defect; retest and record the exact kernel, driver, GPU, format,
 modifier and full-frame result before changing the fallback.
 
+### Rotating scanout exports and NVIDIA CPU-copy faults
+
+On RTX 5060 Ti / NVIDIA 615.78.08 / KWin 6.8.2, a live 2266x1488@60
+dumb-buffer stream produced about 201k minor faults/s with synchronous CUDA
+uploads, and about 399k with asynchronous uploads. Most occurred while
+`copy_rows` read a CPU mapping of the exported framebuffer, not during
+`ACQUIRE_FRAME`. The previously reported microsecond capture metric does
+not measure the memcpy.
+
+This experimental driver now retains an LRU of four exported GEM buffers
+**per plane**. Previously it retained only the last buffer, so a compositor
+cycling A/B/C could create a different DMA-BUF export each time A returned,
+even though A was unchanged. Reusing its export preserves the DMA-BUF identity
+needed by Hermes's persistent mmap cache. This is a plausible contributor to
+the observed per-frame faults, **not yet a hardware-confirmed fix**.
+
+To validate: compare the same resolution, FPS, and scene before/after this
+change. With debugfs mounted, read
+`/sys/kernel/debug/dri/<card-index>/hermes_kms_stats` and compare
+`frame_export_hits`, `frame_export_misses`, `framebuffer_generation` and
+`framebuffer_id`. A small number of initial misses followed by increasing
+hits indicates framebuffer reuse. Pair this with Hermes's opt-in
+`HERMES_KMS_CPU_COPY_DIAGNOSTICS=1` to measure mapping cache hits/misses,
+minor faults during memcpy and copy duration. If faults persist despite both
+caches hitting, investigate PTE invalidation / CPU-sync behavior separately;
+do not add speculative page pinning to the kernel driver.
+
 ### Narrowing it down
 
 2 MiB is also the size of a huge page, and whether the import works has so
