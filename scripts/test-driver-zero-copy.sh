@@ -592,7 +592,7 @@ load_isolated_module()
 
 unload_module()
 {
-	run_as_root rmmod hermes_kms || fail "could not unload hermes_kms; close any compositor/Apollo session holding it, then retry"
+	run_as_root rmmod hermes_kms || fail "could not unload hermes_kms; close any compositor/Hermes session holding it, then retry"
 	# Wait for the DRM nodes to drop before any reinsert.
 	for _ in $(seq 1 50); do
 		module_loaded || break

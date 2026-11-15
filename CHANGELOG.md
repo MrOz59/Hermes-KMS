@@ -27,6 +27,10 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Changed
+- Refer to Hermes consistently in the EGL/CUDA validation tool and driver test diagnostics.
+
+
 ## [0.4.1] - 2026-11-02
 
 UAPI remains **14**, unchanged from 0.4.0. This is a maintenance release.

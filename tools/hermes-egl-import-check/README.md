@@ -16,7 +16,7 @@ ACQUIRE_FRAME (DMA-BUF) -> wait on the exported sync file
   -> texture bind (OES, falling back to glEGLImageTargetTexStorageEXT)
   -> FBO readback (proves sampling)
   -> GL blit into an own texture -> cuGraphicsGLRegisterImage
-     (mirrors the Sunshine/Hermes CUDA converter flow)
+     (mirrors the Hermes CUDA converter flow)
 ```
 
 The tool follows the driver's synchronization contract: a successful
