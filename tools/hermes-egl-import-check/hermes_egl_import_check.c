@@ -6,7 +6,7 @@
 //   ACQUIRE_FRAME (DMA-BUF) -> wait on the exported sync file
 //     -> eglCreateImage(EGL_LINUX_DMA_BUF_EXT)
 //     -> glEGLImageTargetTexture2DOES -> FBO readback (proves sampling)
-//     -> cuGraphicsGLRegisterImage (proves the Sunshine/Hermes CUDA interop)
+//     -> cuGraphicsGLRegisterImage (proves the Hermes CUDA interop)
 //
 // This is the exact frame path Hermes uses for NVENC: the encoder imports the
 // captured DMA-BUF through EGL on the render GPU and maps the GL texture into
@@ -1026,8 +1026,8 @@ int main(int argc, char **argv)
 	}
 
 	// --- 6. Emulate the real encoder pipeline --------------------------------
-	// Hermes/Sunshine never hands the *imported* texture to CUDA. The GL
-	// converter (egl::sws_t) samples it into textures Sunshine allocated
+	// Hermes never hands the *imported* texture to CUDA. The GL
+	// converter (egl::sws_t) samples it into textures Hermes allocated
 	// itself, and only those are registered with CUDA. Reproduce that:
 	// blit imported -> own texture, then map the own texture into CUDA.
 	glGenTextures(1, &conv);

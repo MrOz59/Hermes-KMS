@@ -27,6 +27,9 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Changed
+- Refer to Hermes consistently in the EGL/CUDA validation tool and driver test diagnostics.
+
 ### Fixed
 
 - The module builds on Linux 7.4. That release removed `.reset` from
