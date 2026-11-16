@@ -14,6 +14,28 @@ hermes-kms-atomic-commit := $(shell grep -qs 'struct drm_atomic_commit {' \
 ccflags-y += -DHERMES_KMS_HAVE_DRM_ATOMIC_COMMIT=$(hermes-kms-atomic-commit)
 endif
 
+# Linux 7.3 gave struct drm_crtc_funcs and struct drm_plane_funcs an
+# atomic_create_state callback, and 7.4 removed their .reset in its favour:
+# drm_mode_config_reset() then builds CRTC and plane state only through the new
+# callback. Ask the target kernel's own headers whether each table declares it
+# instead of trusting LINUX_VERSION_CODE, so a tree that backported the
+# callback picks it too. Each header declares only its own function table, so
+# the member declaration identifies it. When a header is not readable from
+# here its flag is left undefined and hermes_kms.c falls back to the version.
+hermes-kms-crtc-h := $(srctree)/include/drm/drm_crtc.h
+ifneq ($(wildcard $(hermes-kms-crtc-h)),)
+hermes-kms-crtc-create-state := $(shell grep -qFs '(*atomic_create_state)' \
+	$(hermes-kms-crtc-h) && echo 1 || echo 0)
+ccflags-y += -DHERMES_KMS_HAVE_DRM_CRTC_ATOMIC_CREATE_STATE=$(hermes-kms-crtc-create-state)
+endif
+
+hermes-kms-plane-h := $(srctree)/include/drm/drm_plane.h
+ifneq ($(wildcard $(hermes-kms-plane-h)),)
+hermes-kms-plane-create-state := $(shell grep -qFs '(*atomic_create_state)' \
+	$(hermes-kms-plane-h) && echo 1 || echo 0)
+ccflags-y += -DHERMES_KMS_HAVE_DRM_PLANE_ATOMIC_CREATE_STATE=$(hermes-kms-plane-create-state)
+endif
+
 # The DRM-owned vblank timer helpers are absent from older LTS kernels (such
 # as Ubuntu 24.04's 6.8). Select the implementation from the target headers,
 # since distribution kernels can backport the helpers independently of version.

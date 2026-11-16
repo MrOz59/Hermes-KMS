@@ -98,6 +98,30 @@
 #define drm_atomic_commit drm_atomic_state
 #endif
 
+/*
+ * Linux 7.3 gave the CRTC and plane function tables an atomic_create_state
+ * callback, and 7.4 removed their .reset in its favour: drm_mode_config_reset()
+ * now builds CRTC and plane state only through atomic_create_state. On 7.3,
+ * which has both, it prefers .reset and falls back to the new callback, so
+ * either one works there.
+ *
+ * kbuild probes the target kernel's own drm_crtc.h and drm_plane.h and defines
+ * HERMES_KMS_HAVE_DRM_CRTC_ATOMIC_CREATE_STATE and
+ * HERMES_KMS_HAVE_DRM_PLANE_ATOMIC_CREATE_STATE, so a tree that backported the
+ * callback is detected as well; LINUX_VERSION_CODE is the fallback for when
+ * those headers could not be read. Headers without the callback keep the
+ * legacy .reset path. The connector is unaffected: it keeps .reset everywhere.
+ */
+#ifndef HERMES_KMS_HAVE_DRM_CRTC_ATOMIC_CREATE_STATE
+#define HERMES_KMS_HAVE_DRM_CRTC_ATOMIC_CREATE_STATE \
+	(LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0))
+#endif
+
+#ifndef HERMES_KMS_HAVE_DRM_PLANE_ATOMIC_CREATE_STATE
+#define HERMES_KMS_HAVE_DRM_PLANE_ATOMIC_CREATE_STATE \
+	(LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0))
+#endif
+
 #define HERMES_KMS_DRIVER_NAME "hermes-kms"
 #define HERMES_KMS_DRIVER_DESC "Hermes virtual KMS display"
 #define HERMES_KMS_DRIVER_DATE "20260625"
@@ -1557,7 +1581,7 @@ static void hermes_kms_disable_vblank(struct drm_crtc *crtc)
 static const struct drm_crtc_funcs hermes_kms_crtc_funcs = {
 	.set_config = drm_atomic_helper_set_config,
 	.page_flip = drm_atomic_helper_page_flip,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
+#if HERMES_KMS_HAVE_DRM_CRTC_ATOMIC_CREATE_STATE
 	.atomic_create_state = drm_atomic_helper_crtc_create_state,
 #else
 	.reset = drm_atomic_helper_crtc_reset,
@@ -1843,7 +1867,7 @@ static const struct drm_plane_funcs hermes_kms_plane_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane = drm_atomic_helper_disable_plane,
 	.destroy = drm_plane_cleanup,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
+#if HERMES_KMS_HAVE_DRM_PLANE_ATOMIC_CREATE_STATE
 	.atomic_create_state = drm_atomic_helper_plane_create_state,
 #else
 	.reset = drm_atomic_helper_plane_reset,
@@ -1936,7 +1960,7 @@ static const struct drm_plane_funcs hermes_kms_cursor_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane = drm_atomic_helper_disable_plane,
 	.destroy = drm_plane_cleanup,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
+#if HERMES_KMS_HAVE_DRM_PLANE_ATOMIC_CREATE_STATE
 	.atomic_create_state = drm_atomic_helper_plane_create_state,
 #else
 	.reset = drm_atomic_helper_plane_reset,

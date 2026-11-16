@@ -27,6 +27,25 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- The module builds on Linux 7.4. That release removed `.reset` from
+  `struct drm_crtc_funcs` and `struct drm_plane_funcs` in favour of the
+  `atomic_create_state` callback added in 7.3, and `drm_mode_config_reset()`
+  now builds CRTC and plane state only through the new callback, so DKMS failed
+  on the missing member and helpers (#23, @RealCortana).
+  - The CRTC and both planes use `drm_atomic_helper_crtc_create_state()` and
+    `drm_atomic_helper_plane_create_state()` where the target kernel has the
+    callback, and keep `drm_atomic_helper_*_reset()` where it does not. The
+    connector keeps `.reset` everywhere.
+  - Whether each table has the callback is decided by grepping the target
+    kernel's own `include/drm/drm_crtc.h` and `include/drm/drm_plane.h` from
+    kbuild rather than by comparing `LINUX_VERSION_CODE`, so a tree that
+    backported it builds too; the version comparison (7.3) is the fallback for
+    when those headers cannot be read. On 7.3, which has both callbacks,
+    `drm_mode_config_reset()` accepts either and the create-state helpers are
+    the same as in 7.4.
+
 ## [0.4.1] - 2026-11-02
 
 UAPI remains **14**, unchanged from 0.4.0. This is a maintenance release.
