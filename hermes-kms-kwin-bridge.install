@@ -1,0 +1,34 @@
+# Arch package hooks for hermes-kms-kwin-bridge-git.
+
+_hermes_kms_kwin_bridge_note() {
+  cat <<'NOTE'
+==> hermes-kms-kwin-bridge (experimental) is installed for KDE Plasma 6.8.
+    KWin loads it at the next login: log out and back in, or reboot.
+    Restarting the Hermes service does not reload the compositor.
+
+    Check it in the compositor's journal after logging in:
+      journalctl --user -b -u plasma-kwin_wayland.service | grep hermes-kms-kwin-bridge
+
+    Hermes must route NVENC by scanout origin:
+      HERMES_KMS_EXPERIMENTAL_NVENC_DMABUF=auto in hermes.service.
+    Zero-copy also needs the NVIDIA layouts on the virtual plane (without
+    them KWin double-copies on the GPU): tools/hermes-gpu-scanout-test
+    --list-modifiers (from a `make tools` build) suggests a
+    scanout_modifiers= value for /etc/modprobe.d/hermes-kms.conf.
+
+    Turn it off: systemctl --user edit plasma-kwin_wayland.service and set
+    Environment=HERMES_KMS_KWIN_BRIDGE=off, then log out and back in.
+NOTE
+}
+
+post_install() {
+  _hermes_kms_kwin_bridge_note
+}
+
+post_upgrade() {
+  _hermes_kms_kwin_bridge_note
+}
+
+post_remove() {
+  echo '==> KWin keeps the removed bridge loaded until the next login.'
+}

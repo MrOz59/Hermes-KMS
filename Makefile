@@ -49,12 +49,21 @@ EGL_CHECK_CUDA_LIBS :=
 endif
 CURSOR_PROBE_CFLAGS := $(shell pkg-config --cflags libdrm 2>/dev/null)
 CURSOR_PROBE_LIBS := $(shell pkg-config --libs libdrm 2>/dev/null)
+# The KWin render bridge needs libdrm's headers only: it links nothing but libc
+# and reaches libdrm/libgbm through the symbols kwin_wayland already loaded.
+KWIN_BRIDGE_CFLAGS := $(shell pkg-config --cflags libdrm 2>/dev/null)
+KWIN_BRIDGE := tools/hermes-kms-kwin-bridge/libhermes-kms-kwin-bridge.so
 UDEV_RULE_DIR ?= /etc/udev/rules.d
 SYSTEM_UDEV_RULE_DIR ?= /usr/lib/udev/rules.d
 PREFIX ?= /usr
 UAPI_INCLUDE_DIR ?= $(PREFIX)/include/drm
 HERMES_INCLUDE_DIR ?= $(PREFIX)/include/hermes-kms
 HERMES_LICENSE_DIR ?= $(PREFIX)/share/licenses/hermes-kms
+# glibc preloads into the capability-bearing kwin_wayland only from its trusted
+# system library directory (/usr/lib on Arch; /usr/lib64 or the multiarch
+# directory elsewhere).
+KWIN_BRIDGE_LIBDIR ?= $(PREFIX)/lib
+SYSTEMD_USER_UNIT_DIR ?= $(PREFIX)/lib/systemd/user
 
 DKMS_NAME := hermes-kms
 DKMS_VERSION := $(shell awk '/^#define HERMES_KMS_DRIVER_MAJOR/{maj=$$3} /^#define HERMES_KMS_DRIVER_MINOR/{min=$$3} /^#define HERMES_KMS_DRIVER_PATCH/{pat=$$3} END{print maj"."min"."pat}' kernel/hermes-kms/hermes_kms.c)
@@ -63,14 +72,73 @@ DKMS_SRC := /usr/src/$(DKMS_NAME)-$(DKMS_VERSION)
 .PHONY: all full check check-uapi check-session check-edid check-edid-conformity modules tools install-runtime-udev uninstall-runtime-udev install-core-configs install-broker-configs uninstall-core-configs uninstall-broker-configs \
 	install-dev-udev uninstall-dev-udev \
 	dkms-install dkms-uninstall modules-install install-configs \
-	install-uapi uninstall-uapi clean clean-tools
+	install-uapi uninstall-uapi clean clean-tools \
+	kwin-bridge install-kwin-bridge uninstall-kwin-bridge \
+	check-kwin-bridge check-kwin-bridge-policy
 
 all: modules
 
 # Opt in to developer diagnostics that need libdrm, VAAPI, GBM, EGL and GL.
 full: modules tools
 
-check: check-release-version check-uapi check-session check-edid check-edid-conformity
+check: check-release-version check-uapi check-session check-edid check-edid-conformity check-frame-verify check-gpu-pattern check-gpu-modifiers check-nvidia-version check-kwin-bridge-policy
+
+# Pure policy of the KWin render bridge (PCI selection, KWin release gate,
+# LD_PRELOAD cleanup); needs no GPU and no libdrm.
+check-kwin-bridge-policy:
+	@set -eu; \
+		test_tmp="$$(mktemp -d "$${TMPDIR:-/tmp}/hermes-kms-kwin-bridge-policy.XXXXXX")"; \
+		trap '$(RM) -r -- "$$test_tmp"' EXIT; \
+		trap 'exit 1' HUP INT TERM; \
+		$(CC) $(CFLAGS) -std=c11 -Werror -pedantic \
+			tests/kwin-bridge-policy.c -o "$$test_tmp/kwin-bridge-policy"; \
+		"$$test_tmp/kwin-bridge-policy"
+
+# The bridge end to end against fake libgbm/libdrm/libkwin, a fake kwin_wayland
+# and a fake sysfs tree. Needs libdrm's headers, no GPU and no compositor.
+check-kwin-bridge:
+	@test -n "$(KWIN_BRIDGE_CFLAGS)" || { printf 'missing libdrm pkg-config metadata\n' >&2; exit 1; }
+	@BRIDGE_CFLAGS='$(KWIN_BRIDGE_CFLAGS)' sh tests/kwin-bridge/run.sh '$(CC)'
+
+.PHONY: check-nvidia-version
+check-nvidia-version:
+	@set -eu; \
+		test_tmp="$$(mktemp -d "$${TMPDIR:-/tmp}/hermes-kms-nvidia-version.XXXXXX")"; \
+		trap '$(RM) -r -- "$$test_tmp"' EXIT; \
+		trap 'exit 1' HUP INT TERM; \
+		$(CC) $(CFLAGS) -std=c11 -Werror -pedantic \
+			tests/nvidia-version.c -o "$$test_tmp/nvidia-version"; \
+		"$$test_tmp/nvidia-version"
+
+.PHONY: check-gpu-modifiers
+check-gpu-modifiers:
+	@set -eu; \
+		test_tmp="$$(mktemp -d "$${TMPDIR:-/tmp}/hermes-kms-gpu-modifiers.XXXXXX")"; \
+		trap '$(RM) -r -- "$$test_tmp"' EXIT; \
+		trap 'exit 1' HUP INT TERM; \
+		$(CC) $(CFLAGS) -std=c11 -Werror -pedantic \
+			tests/gpu-modifiers.c -o "$$test_tmp/gpu-modifiers"; \
+		"$$test_tmp/gpu-modifiers"
+
+.PHONY: check-gpu-pattern
+check-gpu-pattern:
+	@set -eu; \
+		test_tmp="$$(mktemp -d "$${TMPDIR:-/tmp}/hermes-kms-gpu-pattern.XXXXXX")"; \
+		trap '$(RM) -r -- "$$test_tmp"' EXIT; \
+		trap 'exit 1' HUP INT TERM; \
+		$(CC) $(CFLAGS) -std=c11 -Werror -pedantic \
+			tests/gpu-pattern.c -o "$$test_tmp/gpu-pattern"; \
+		"$$test_tmp/gpu-pattern"
+
+.PHONY: check-frame-verify
+check-frame-verify:
+	@set -eu; \
+		test_tmp="$$(mktemp -d "$${TMPDIR:-/tmp}/hermes-kms-verify.XXXXXX")"; \
+		trap '$(RM) -r -- "$$test_tmp"' EXIT; \
+		trap 'exit 1' HUP INT TERM; \
+		$(CC) $(CFLAGS) -std=c11 -Werror -pedantic \
+			tests/frame-verify.c -o "$$test_tmp/frame-verify"; \
+		"$$test_tmp/frame-verify"
 
 .PHONY: check-release-version
 check-release-version:
@@ -299,8 +367,39 @@ tools: tools/hermes-kmsctl/hermes-kmsctl tools/hermes-kms-import-check/hermes-km
 	tools/hermes-egl-import-check/hermes-egl-import-check tools/hermes-egl-import-check/pitch-detect \
 	tools/hermes-sysmem-import-check/hermes-sysmem-import-check \
 	tools/hermes-imported-scanout-test/hermes-imported-scanout-test \
+	tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test \
+	tools/hermes-import-cache-check/hermes-import-cache-check \
 	tools/hermes-hdr-metadata-test/hermes-hdr-metadata-test \
-	tools/hermes-pixel-peek/hermes_pixel_peek tools/hermes-cursor-probe/hermes_cursor_probe
+	tools/hermes-pixel-peek/hermes_pixel_peek tools/hermes-cursor-probe/hermes_cursor_probe \
+	$(KWIN_BRIDGE)
+
+kwin-bridge: $(KWIN_BRIDGE)
+
+# -e: executing the installed (set-user-ID marked) library just exits.
+$(KWIN_BRIDGE): tools/hermes-kms-kwin-bridge/hermes_kms_kwin_bridge.c tools/hermes-kms-kwin-bridge/bridge_policy.h
+	@test -n "$(KWIN_BRIDGE_CFLAGS)" || { printf 'missing libdrm pkg-config metadata (headers only)\n' >&2; exit 1; }
+	$(CC) $(CFLAGS) -std=gnu11 -fPIC -fvisibility=hidden $(KWIN_BRIDGE_CFLAGS) \
+		-shared $(LDFLAGS) -Wl,-z,defs -Wl,-z,now -Wl,-z,relro \
+		-Wl,-e,hkb_exec_entry -o $@ $< -ldl -pthread
+
+# The set-user-ID bit is glibc's only accepted marker for LD_PRELOAD into a
+# file-capability program (kwin_wayland has cap_sys_nice); it is never run.
+install-kwin-bridge: $(KWIN_BRIDGE)
+	install -Dm4755 $(KWIN_BRIDGE) \
+		'$(DESTDIR)$(KWIN_BRIDGE_LIBDIR)/libhermes-kms-kwin-bridge.so'
+	install -Dm0644 packaging/systemd/user/plasma-kwin_wayland.service.d/60-hermes-kms-kwin-bridge.conf \
+		'$(DESTDIR)$(SYSTEMD_USER_UNIT_DIR)/plasma-kwin_wayland.service.d/60-hermes-kms-kwin-bridge.conf'
+	install -Dm0644 LICENSES/MIT.txt \
+		'$(DESTDIR)$(PREFIX)/share/licenses/hermes-kms-kwin-bridge/MIT.txt'
+	@printf 'installed the KWin render bridge; log out and back in (or reboot) so KWin loads it\n'
+
+uninstall-kwin-bridge:
+	$(RM) '$(DESTDIR)$(KWIN_BRIDGE_LIBDIR)/libhermes-kms-kwin-bridge.so'
+	$(RM) '$(DESTDIR)$(SYSTEMD_USER_UNIT_DIR)/plasma-kwin_wayland.service.d/60-hermes-kms-kwin-bridge.conf'
+	-rmdir '$(DESTDIR)$(SYSTEMD_USER_UNIT_DIR)/plasma-kwin_wayland.service.d'
+	$(RM) '$(DESTDIR)$(PREFIX)/share/licenses/hermes-kms-kwin-bridge/MIT.txt'
+	-rmdir '$(DESTDIR)$(PREFIX)/share/licenses/hermes-kms-kwin-bridge'
+	@printf 'removed the KWin render bridge; KWin keeps it until the next login\n'
 
 tools/hermes-kmsctl/hermes-kmsctl: tools/hermes-kmsctl/hermes_kmsctl.c tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) -o $@ $<
@@ -309,13 +408,21 @@ tools/hermes-kms-import-check/hermes-kms-import-check: tools/hermes-kms-import-c
 	@test -n "$(IMPORT_CHECK_LIBS)" || { printf 'missing libva/libva-drm/libdrm pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(IMPORT_CHECK_CFLAGS) -o $@ $< $(IMPORT_CHECK_LIBS)
 
-tools/hermes-egl-import-check/hermes-egl-import-check: tools/hermes-egl-import-check/hermes_egl_import_check.c tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h
+tools/hermes-egl-import-check/hermes-egl-import-check: tools/hermes-egl-import-check/hermes_egl_import_check.c tools/hermes-egl-import-check/frame_verify.h tools/hermes-gpu-scanout-test/pattern.h tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h tools/hermes_nvidia_version.h
 	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(EGL_CHECK_CFLAGS) $(EGL_CHECK_CUDA_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS) $(EGL_CHECK_CUDA_LIBS)
 
 tools/hermes-imported-scanout-test/hermes-imported-scanout-test: tools/hermes-imported-scanout-test/hermes_imported_scanout_test.c tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h
 	@test -n "$(CURSOR_PROBE_LIBS)" || { printf 'missing libdrm pkg-config metadata\n' >&2; exit 1; }
 	$(CC) $(CFLAGS) $(UAPI_CFLAGS) $(CURSOR_PROBE_CFLAGS) -o $@ $< $(CURSOR_PROBE_LIBS)
+
+tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test: tools/hermes-gpu-scanout-test/hermes_gpu_scanout_test.c tools/hermes-gpu-scanout-test/modifiers.h tools/hermes-gpu-scanout-test/pattern.h tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h tools/hermes_nvidia_version.h
+	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }
+	$(CC) $(CFLAGS) -std=c11 -Werror $(UAPI_CFLAGS) $(EGL_CHECK_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS)
+
+tools/hermes-import-cache-check/hermes-import-cache-check: tools/hermes-import-cache-check/hermes_import_cache_check.c tools/hermes-gpu-scanout-test/modifiers.h tools/hermes-gpu-scanout-test/pattern.h tools/hermes_nvidia_version.h
+	@test -n "$(EGL_CHECK_LIBS)" || { printf 'missing libdrm/gbm/egl/gl pkg-config metadata\n' >&2; exit 1; }
+	$(CC) $(CFLAGS) -std=c11 -Werror $(EGL_CHECK_CFLAGS) -o $@ $< $(EGL_CHECK_LIBS)
 
 tools/hermes-hdr-metadata-test/hermes-hdr-metadata-test: tools/hermes-hdr-metadata-test/hermes_hdr_metadata_test.c tools/hermes_session.h include/uapi/drm/hermes_kms_drm.h
 	@test -n "$(CURSOR_PROBE_LIBS)" || { printf 'missing libdrm pkg-config metadata\n' >&2; exit 1; }
@@ -425,9 +532,12 @@ clean-tools:
 	$(RM) tools/hermes-egl-import-check/pitch-detect
 	$(RM) tools/hermes-sysmem-import-check/hermes-sysmem-import-check
 	$(RM) tools/hermes-imported-scanout-test/hermes-imported-scanout-test
+	$(RM) tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test
+	$(RM) tools/hermes-import-cache-check/hermes-import-cache-check
 	$(RM) tools/hermes-hdr-metadata-test/hermes-hdr-metadata-test
 	$(RM) tools/hermes-pixel-peek/hermes_pixel_peek
 	$(RM) tools/hermes-cursor-probe/hermes_cursor_probe
+	$(RM) $(KWIN_BRIDGE)
 
 clean: clean-tools
 	@if [ -f '$(KDIR)/Makefile' ]; then \

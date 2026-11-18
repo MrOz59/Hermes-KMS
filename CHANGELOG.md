@@ -27,6 +27,43 @@ subject to change between minor releases.
 
 ## [Unreleased]
 
+UAPI **15** on the `experimental/nvidia-zero-copy` branch.
+
+### Added
+
+- Experimental KWin render bridge (`libhermes-kms-kwin-bridge.so`, package
+  `hermes-kms-kwin-bridge-git`, `make kwin-bridge install-kwin-bridge`). A
+  preload for `kwin_wayland`, installed with a `plasma-kwin_wayland.service`
+  drop-in, that gives a Hermes-KMS card a GBM allocator on the NVIDIA render
+  node and answers `GpuManager::compatibleRenderDevice()` for it with the
+  NVIDIA RenderDevice. KWin 6.8 then renders the virtual output into NVIDIA
+  scanout buffers and PRIME-imports them, instead of reading every frame back
+  into a dumb buffer, so Hermes's origin-aware NVENC route can import it. It
+  links only libc, enables itself only inside `kwin_wayland` with a reviewed
+  `libkwin.so.6.8.*`, keeps dumb buffers on the card, routes primary nodes
+  only, and stays inert elsewhere; `HERMES_KMS_KWIN_BRIDGE=off|force` and
+  `HERMES_KMS_KWIN_RENDER_PCI` control it. The approach follows Vibepollo's
+  KWin GPU interposer (Nonary/libvirtualdisplay, MIT).
+  `make check-kwin-bridge` tests it against fake libgbm, libdrm and libkwin;
+  real NVIDIA + KWin 6.8 validation is still pending. See
+  [docs/kwin-render-bridge.md](docs/kwin-render-bridge.md).
+- `HERMES_KMS_CAP_FRAME_ORIGIN`: `GET_STATUS` and `ACQUIRE_FRAME` report
+  whether the scanout is a PRIME-imported buffer and which module exported it
+  (`STATUS_FRAMEBUFFER_IMPORTED`, `FRAME_IMPORTED`, `framebuffer_exporter`,
+  `exporter`), taken from reserved words. A linear GPU-origin scanout can now be
+  told from a system-memory dumb buffer. `hermes-kmsctl`, debugfs and the
+  first-scanout log show it, and `hermes-gpu-scanout-test` requires it on a
+  driver that advertises the capability.
+- `hermes-egl-import-check`, `hermes-gpu-scanout-test` and
+  `hermes-import-cache-check` print the loaded NVIDIA kernel module's version
+  and flavour (open or proprietary) with every report.
+
+### Fixed
+
+- The 32-bit compat `GET_STATUS` path copied its 48-byte reserved tail from a
+  40-byte field, reading eight bytes past the native structure on the kernel
+  stack. It now copies the words an LP64 client of the same UAPI sees.
+
 ## [0.4.1] - Unreleased
 
 UAPI remains **14**, unchanged from 0.4.0. This is a maintenance release.

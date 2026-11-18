@@ -28,7 +28,7 @@
 	_Static_assert((unsigned long)(name) == (value), \
 		       "unexpected encoded ioctl value: " #name)
 
-_Static_assert(HERMES_KMS_UAPI_VERSION == 14,
+_Static_assert(HERMES_KMS_UAPI_VERSION == 15,
 	       "update the ABI test when intentionally changing the UAPI");
 
 /*
@@ -72,6 +72,14 @@ _Static_assert(HERMES_KMS_CAP_SESSION_TOKEN == (1ULL << 14),
 	       "session-token capability bit moved");
 _Static_assert(HERMES_KMS_CAP_CURSOR_CAPTURE == (1ULL << 15),
 	       "cursor-capture capability bit moved");
+_Static_assert(HERMES_KMS_CAP_FRAME_ORIGIN == (1ULL << 19),
+	       "frame-origin capability bit moved");
+_Static_assert(HERMES_KMS_STATUS_FRAMEBUFFER_IMPORTED == (1ULL << 7),
+	       "framebuffer-imported status bit moved");
+_Static_assert(HERMES_KMS_FRAME_IMPORTED == (1ULL << 7),
+	       "frame-imported flag moved");
+_Static_assert(HERMES_KMS_EXPORTER_NAME_LEN == 16,
+	       "exporter name length changed");
 _Static_assert(HERMES_KMS_SESSION_ACCESS_GET_TOKEN == 1,
 	       "GET_TOKEN operation moved");
 _Static_assert(HERMES_KMS_SESSION_ACCESS_BIND == 2,
@@ -99,7 +107,8 @@ ASSERT_OFFSET(struct drm_hermes_kms_status, framebuffer_modifier, 136);
 ASSERT_OFFSET(struct drm_hermes_kms_status, session_id, 144);
 ASSERT_OFFSET(struct drm_hermes_kms_status, owner_pid, 152);
 ASSERT_OFFSET(struct drm_hermes_kms_status, bound_fd_count, 160);
-ASSERT_OFFSET(struct drm_hermes_kms_status, reserved, 168);
+ASSERT_OFFSET(struct drm_hermes_kms_status, framebuffer_exporter, 168);
+ASSERT_OFFSET(struct drm_hermes_kms_status, reserved, 184);
 
 ASSERT_SIZE(struct drm_hermes_kms_identity, 144);
 ASSERT_OFFSET(struct drm_hermes_kms_identity, connector_id, 96);
@@ -122,7 +131,9 @@ ASSERT_OFFSET(struct drm_hermes_kms_acquire_frame, offset, 68);
 ASSERT_OFFSET(struct drm_hermes_kms_acquire_frame, dma_buf_fd, 84);
 ASSERT_OFFSET(struct drm_hermes_kms_acquire_frame, sync_file_fd, 100);
 ASSERT_OFFSET(struct drm_hermes_kms_acquire_frame, damage_x1, 108);
-ASSERT_OFFSET(struct drm_hermes_kms_acquire_frame, reserved, 128);
+ASSERT_OFFSET(struct drm_hermes_kms_acquire_frame, reserved_alignment, 124);
+ASSERT_OFFSET(struct drm_hermes_kms_acquire_frame, exporter, 128);
+ASSERT_OFFSET(struct drm_hermes_kms_acquire_frame, reserved, 144);
 
 ASSERT_SIZE(struct drm_hermes_kms_wait_frame, 96);
 ASSERT_OFFSET(struct drm_hermes_kms_wait_frame, timeout_ms, 40);
