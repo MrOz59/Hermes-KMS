@@ -27,7 +27,11 @@ validation and upgrade procedure.
 | NVIDIA | Current Hermes uses a CPU scanout copy with hardware conversion/encoding. The separate `experimental/nvidia-zero-copy` branch contains diagnostic experiments, not a validated replacement path. |
 
 For the experimental NVIDIA branch, see the
-[KWin 6.8 direct PRIME scanout investigation](docs/kwin-nvidia-prime-scanout.md).
+[KWin 6.8 direct PRIME scanout investigation](docs/kwin-nvidia-prime-scanout.md)
+and the optional [KWin render bridge](docs/kwin-render-bridge.md)
+(`hermes-kms-kwin-bridge-git`), which lets KWin 6.8 render the virtual output
+on the NVIDIA GPU and scan it out by PRIME import instead of a CPU-copied dumb
+buffer. It is experimental and not yet validated on real hardware.
 
 Documentation: [driver design](docs/driver-design.md),
 [configfs attributes and examples](docs/configfs.md),

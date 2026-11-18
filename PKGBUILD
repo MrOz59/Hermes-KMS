@@ -6,7 +6,7 @@
 # This experimental -git PKGBUILD follows the NVIDIA branch explicitly.
 # Checking out this PKGBUILD must not silently build main without UAPI 15.
 
-pkgname=(hermes-kms-dkms-git hermes-kms-seatd-git)
+pkgname=(hermes-kms-dkms-git hermes-kms-seatd-git hermes-kms-kwin-bridge-git)
 pkgbase=hermes-kms-git
 _pkgbase=hermes-kms
 pkgver=0.4.1
@@ -15,7 +15,7 @@ pkgdesc="Hermes-KMS zero-copy virtual display DRM/KMS driver (DKMS)"
 arch=('any')
 url="https://github.com/MrOz59/Hermes-KMS"
 license=('GPL2' 'MIT')
-makedepends=('git')
+makedepends=('git' 'libdrm')
 source=("git+https://github.com/MrOz59/Hermes-KMS.git#branch=experimental/nvidia-zero-copy")
 sha256sums=('SKIP')
 
@@ -31,6 +31,12 @@ pkgver() {
   printf '%s.r%s.g%s' "$_ver" \
     "$(git rev-list --count HEAD)" \
     "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "$srcdir/Hermes-KMS"
+  # Only the optional KWin bridge is compiled here; DKMS builds the module.
+  make kwin-bridge
 }
 
 package_hermes-kms-dkms-git() {
@@ -68,3 +74,13 @@ package_hermes-kms-seatd-git() {
   make DESTDIR="$pkgdir" install-broker-configs
 }
 
+package_hermes-kms-kwin-bridge-git() {
+  cd "$srcdir/Hermes-KMS"
+
+  pkgdesc="Experimental KWin 6.8 bridge: render Hermes-KMS outputs on the NVIDIA GPU for zero-copy capture"
+  arch=('x86_64')
+  license=('MIT')
+  depends=('hermes-kms-dkms-git' 'kwin' 'glibc')
+  install="${_pkgbase}-kwin-bridge.install"
+  make DESTDIR="$pkgdir" install-kwin-bridge
+}

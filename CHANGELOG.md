@@ -31,6 +31,22 @@ UAPI **15** on the `experimental/nvidia-zero-copy` branch.
 
 ### Added
 
+- Experimental KWin render bridge (`libhermes-kms-kwin-bridge.so`, package
+  `hermes-kms-kwin-bridge-git`, `make kwin-bridge install-kwin-bridge`). A
+  preload for `kwin_wayland`, installed with a `plasma-kwin_wayland.service`
+  drop-in, that gives a Hermes-KMS card a GBM allocator on the NVIDIA render
+  node and answers `GpuManager::compatibleRenderDevice()` for it with the
+  NVIDIA RenderDevice. KWin 6.8 then renders the virtual output into NVIDIA
+  scanout buffers and PRIME-imports them, instead of reading every frame back
+  into a dumb buffer, so Hermes's origin-aware NVENC route can import it. It
+  links only libc, enables itself only inside `kwin_wayland` with a reviewed
+  `libkwin.so.6.8.*`, keeps dumb buffers on the card, routes primary nodes
+  only, and stays inert elsewhere; `HERMES_KMS_KWIN_BRIDGE=off|force` and
+  `HERMES_KMS_KWIN_RENDER_PCI` control it. The approach follows Vibepollo's
+  KWin GPU interposer (Nonary/libvirtualdisplay, MIT).
+  `make check-kwin-bridge` tests it against fake libgbm, libdrm and libkwin;
+  real NVIDIA + KWin 6.8 validation is still pending. See
+  [docs/kwin-render-bridge.md](docs/kwin-render-bridge.md).
 - `HERMES_KMS_CAP_FRAME_ORIGIN`: `GET_STATUS` and `ACQUIRE_FRAME` report
   whether the scanout is a PRIME-imported buffer and which module exported it
   (`STATUS_FRAMEBUFFER_IMPORTED`, `FRAME_IMPORTED`, `framebuffer_exporter`,
