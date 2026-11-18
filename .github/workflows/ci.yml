@@ -94,6 +94,11 @@ jobs:
       - name: Run userspace regression checks
         run: make check check-hdr-build
 
+      - name: Exercise the KWin render bridge against fake libgbm, libdrm and libkwin
+        run: |
+          make check-kwin-bridge
+          make check-kwin-bridge CC=clang || test ! -x "$(command -v clang)"
+
       - name: Check shell and packaged configuration syntax
         shell: bash
         run: |
@@ -104,6 +109,7 @@ jobs:
           bash -n "${shell_files[@]}"
           bash -n PKGBUILD
           dash -n scripts/hermes-kms-setup
+          dash -n tests/kwin-bridge/run.sh
           xmllint --noout packaging/polkit/io.github.mroz59.hermes-kms.policy
           udevadm verify udev/72-hermes-kms-session-seats.rules
           udevadm verify udev/72-hermes-kms-render-access.rules
@@ -154,6 +160,21 @@ jobs:
               $(pkg-config --cflags libdrm) \
               -x c++ -c -o "$RUNNER_TEMP/installed-header-cxx.o" -
 
+      - name: Smoke-test the staged KWin render bridge
+        run: |
+          make install-kwin-bridge DESTDIR="$RUNNER_TEMP/bridge-stage"
+          lib="$RUNNER_TEMP/bridge-stage/usr/lib/libhermes-kms-kwin-bridge.so"
+          test -u "$lib"
+          test -f "$RUNNER_TEMP/bridge-stage/usr/lib/systemd/user/plasma-kwin_wayland.service.d/60-hermes-kms-kwin-bridge.conf"
+          test -f "$RUNNER_TEMP/bridge-stage/usr/share/licenses/hermes-kms-kwin-bridge/MIT.txt"
+          # libc only: a set-user-ID program that preloads it gains no libraries.
+          test "$(readelf -d "$lib" | grep -c '(NEEDED)')" = 1
+          readelf -d "$lib" | grep -q 'Shared library: \[libc.so.6\]'
+          # Executing the library directly must exit 1 without running anything.
+          status=0; "$lib" || status=$?; test "$status" = 1
+          make uninstall-kwin-bridge DESTDIR="$RUNNER_TEMP/bridge-stage"
+          test ! -e "$lib"
+
       - name: Clean every build product
         run: |
           make clean-tools
@@ -162,6 +183,7 @@ jobs:
           test ! -e tools/hermes-imported-scanout-test/hermes-imported-scanout-test
           test ! -e tools/hermes-gpu-scanout-test/hermes-gpu-scanout-test
           test ! -e tools/hermes-import-cache-check/hermes-import-cache-check
+          test ! -e tools/hermes-kms-kwin-bridge/libhermes-kms-kwin-bridge.so
 
       - name: Reject whitespace errors
         run: git diff --check

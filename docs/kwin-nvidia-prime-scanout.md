@@ -4,6 +4,15 @@ Status: **research / proposed compositor work**. This document does not
 enable zero-copy in KWin and is not a claim that any change to KWin has
 been built, tested, or merged.
 
+Update: the [KWin render bridge](kwin-render-bridge.md) reaches the same
+result as the proposal below without modifying KWin. It routes the Hermes-KMS
+card's GBM allocator to the NVIDIA render node and answers
+`GpuManager::compatibleRenderDevice()` for the card with the NVIDIA
+RenderDevice, so KWin selects `MultiGpuImportMode::None` (given the NVIDIA
+layouts in `scanout_modifiers=`, as in the test below) and imports its own
+NVIDIA scanout buffers through `DrmGpu::importBuffer`. It is experimental and
+awaits validation on the hardware described below.
+
 ## Confirmed behavior on RTX 5060 Ti
 
 The 2026-11-06 RTX 5060 Ti (GB206) / NVIDIA Open 615.78.08 /
